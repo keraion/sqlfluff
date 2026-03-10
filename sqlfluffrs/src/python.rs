@@ -1,6 +1,13 @@
 use pyo3::prelude::*;
 use sqlfluffrs_lexer::{PyLexer, PySQLLexError};
-use sqlfluffrs_parser::{PyMatchResult, PyNode, PyParseError, PyParser, RsParseError};
+use sqlfluffrs_parser::{
+    PyMatchResult, PyNode,
+    PyParseError, PyParser, RsParseError,
+};
+use sqlfluffrs_rules::{
+    rs_respace_node, rs_respace_node_with_config, rs_respace_with_config_obj,
+    rs_make_reflow_config, PyLintViolation, PyReflowConfig, PyReflowSequence,
+};
 use sqlfluffrs_python::marker::PyPositionMarker;
 use sqlfluffrs_python::templater::{
     fileslice::{PyRawFileSlice, PyTemplatedFileSlice},
@@ -30,5 +37,13 @@ fn sqlfluffrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParseError>()?;
     // Add custom exception
     m.add("RsParseError", m.py().get_type::<RsParseError>())?;
+    // Reflow / respace classes
+    m.add_class::<PyLintViolation>()?;
+    m.add_class::<PyReflowConfig>()?;
+    m.add_class::<PyReflowSequence>()?;
+    m.add_function(wrap_pyfunction!(rs_respace_node, m)?)?;
+    m.add_function(wrap_pyfunction!(rs_respace_node_with_config, m)?)?;
+    m.add_function(wrap_pyfunction!(rs_make_reflow_config, m)?)?;
+    m.add_function(wrap_pyfunction!(rs_respace_with_config_obj, m)?)?;
     Ok(())
 }

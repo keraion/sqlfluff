@@ -1,0 +1,13 @@
+[package]
+name = "sqlfluffrs_rules"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+log = "0.4.28"
+sqlfluffrs_types = { path = "../sqlfluffrs_types" }
+sqlfluffrs_parser = { path = "../sqlfluffrs_parser" }
+pyo3 = { version = "0.26.0", optional = true }
+
+[features]
+python = ["pyo3", "sqlfluffrs_parser/python"]

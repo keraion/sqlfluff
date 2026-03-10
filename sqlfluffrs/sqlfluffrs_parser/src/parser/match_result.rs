@@ -468,34 +468,14 @@ impl MatchResult {
         positions.sort();
 
         for pos in positions {
-            // PYTHON PARITY: Fill gap with raw tokens - any segments between child matches
-            // should be included unchanged (this captures whitespace/comments between code)
+            // PYTHON PARITY: Fill gap with all tokens between child matches.
+            // Meta tokens become Node::Meta, non-meta become Node::Raw.
+            // This matches Python's `result_segments += segments[max_idx:idx]`
+            // which includes ALL segments (including meta) in gap-fill.
             if pos > current_idx {
                 for idx in current_idx..pos {
                     if idx < tokens.len() {
-                        let tok = &tokens[idx];
-                        // Skip meta tokens (EOF, Indent, Dedent, etc.) - they should
-                        // not be gap-filled as raw nodes into the AST.
-                        if tok.is_meta {
-                            continue;
-                        }
-                        let raw = tok.raw().to_string();
-
-                        // Gap-fill tokens always use their own token class/type.
-                        // Using the parent's segment_type (e.g. "file") would be
-                        // incorrect and produces wrong YAML output.
-                        let segment_class = tok.class_name.clone();
-                        let segment_type = tok.token_type.clone();
-
-                        // Create Raw node from token
-                        result_nodes.push(Node::Raw {
-                            segment_class,
-                            segment_type,
-                            raw,
-                            pos_marker: tok.pos_marker.clone(),
-                            instance_types: tok.instance_types.clone(),
-                            segment_kwargs: RawSegmentKwargs::default(),
-                        });
+                        result_nodes.push(token_to_node(&tokens[idx]));
                     }
                 }
                 current_idx = pos;
@@ -530,30 +510,12 @@ impl MatchResult {
         }
 
         // PYTHON PARITY: If we finish processing triggers and there are still tokens
-        // left in the matched_slice, add them too (captures trailing whitespace/comments)
+        // left in the matched_slice, add them too (captures trailing whitespace/comments).
+        // Include ALL tokens (meta and non-meta) to match Python's gap-fill behavior.
         if current_idx < self.matched_slice.end {
             for idx in current_idx..self.matched_slice.end {
                 if idx < tokens.len() {
-                    let tok = &tokens[idx];
-                    // Skip meta tokens (EOF, Indent, Dedent, etc.)
-                    if tok.is_meta {
-                        continue;
-                    }
-                    let raw = tok.raw().to_string();
-
-                    // Gap-fill tokens always use their own token class/type.
-                    let segment_class = tok.class_name.clone();
-                    let segment_type = tok.token_type.clone();
-
-                    // Create Raw node from token
-                    result_nodes.push(Node::Raw {
-                        segment_class,
-                        segment_type,
-                        raw,
-                        pos_marker: tok.pos_marker.clone(),
-                        instance_types: tok.instance_types.clone(),
-                        segment_kwargs: RawSegmentKwargs::default(),
-                    });
+                    result_nodes.push(token_to_node(&tokens[idx]));
                 }
             }
         }
@@ -588,7 +550,24 @@ impl MatchResult {
         }
     }
 
-    pub fn apply_as_root(self, tokens: &[Token]) -> Node {
+    /// Build a root `Node::Segment` (FileSegment) from this match result,
+    /// optionally prepending `leading` and appending `trailing` non-code
+    /// tokens as direct children of the root.
+    ///
+    /// This is the single entry-point for constructing the Rust AST node
+    /// that is attached to the Python segment tree for Rust-side linting.
+    ///
+    /// * `tokens` — the code-only token slice that match indices refer to.
+    /// * `leading` — non-code tokens before the first code token (e.g.
+    ///   leading whitespace/newlines).  Pass `&[]` when there are none.
+    /// * `trailing` — non-code tokens after the last code token (e.g.
+    ///   trailing newline + end_of_file).  Pass `&[]` when there are none.
+    pub fn apply_as_root(
+        self,
+        tokens: &[Token],
+        leading: &[Token],
+        trailing: &[Token],
+    ) -> Node {
         let file_mr = MatchResult {
             matched_slice: 0..tokens.len(),
             matched_class: Some(MatchedClass::root()),
@@ -602,7 +581,22 @@ impl MatchResult {
                 root_node.len()
             );
         }
-        root_node.first().cloned().unwrap_or_default()
+        let mut root = root_node.first().cloned().unwrap_or_default();
+
+        // Prepend leading and append trailing token-derived children.
+        if let Node::Segment { children, .. } = &mut root {
+            if !trailing.is_empty() {
+                children.extend(trailing.iter().map(token_to_node));
+            }
+            if !leading.is_empty() {
+                let leading_nodes: Vec<Node> = leading.iter().map(token_to_node).collect();
+                let mut new_children = leading_nodes;
+                new_children.extend(children.drain(..));
+                *children = new_children;
+            }
+        }
+
+        root
     }
 
     pub fn stringify(&self, indent: usize) -> String {
@@ -666,6 +660,37 @@ fn get_point_pos_at_token_idx(tokens: &[Token], idx: usize) -> Option<PositionMa
             .map(|pm| pm.end_point_marker())
     } else {
         None
+    }
+}
+
+/// Convert a single Token into a Node suitable for use as a trailing child.
+///
+/// Meta tokens (is_meta=true) become `Node::Meta` using the token_type to
+/// determine the variant.  All other tokens become `Node::Raw`.
+fn token_to_node(tok: &Token) -> Node {
+    if tok.is_meta {
+        let meta_type = match tok.token_type.as_str() {
+            "end_of_file" => MetaType::EndOfFile,
+            "indent" => MetaType::Indent { is_implicit: false },
+            "dedent" => MetaType::Dedent { is_implicit: false },
+            "template_loop" => MetaType::TemplateLoop,
+            // Fallback: treat any other meta token as EndOfFile so it still
+            // terminates inline respace checks correctly.
+            _ => MetaType::EndOfFile,
+        };
+        Node::Meta {
+            meta_type,
+            pos_marker: tok.pos_marker.clone(),
+        }
+    } else {
+        Node::Raw {
+            segment_class: tok.class_name.clone(),
+            segment_type: tok.token_type.clone(),
+            raw: tok.raw.to_string(),
+            pos_marker: tok.pos_marker.clone(),
+            instance_types: tok.instance_types.clone(),
+            segment_kwargs: RawSegmentKwargs::default(),
+        }
     }
 }
 

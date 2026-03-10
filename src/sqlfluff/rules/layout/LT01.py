@@ -4,7 +4,7 @@ from typing import Optional
 
 from sqlfluff.core.rules import BaseRule, LintResult, RuleContext
 from sqlfluff.core.rules.crawlers import RootOnlyCrawler
-from sqlfluff.utils.reflow.sequence import ReflowSequence
+from sqlfluff.utils.reflow import RustReflowSequence
 
 
 class Rule_LT01(BaseRule):
@@ -67,5 +67,8 @@ class Rule_LT01(BaseRule):
 
     def _eval(self, context: RuleContext) -> Optional[list[LintResult]]:
         """Unnecessary whitespace."""
-        sequence = ReflowSequence.from_root(context.segment, config=context.config)
-        return sequence.respace().get_results()
+        return (
+            RustReflowSequence.from_root(context.segment, config=context.config)
+            .respace()
+            .get_results()
+        )
