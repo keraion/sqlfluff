@@ -116,6 +116,13 @@ class RsToken:
     ) -> "RsToken": ...
 
 class RsNode: ...
+class RsReflowConfig: ...
+
+class RsLintViolation:
+    anchor_idx: int
+    fix_type: str
+    edit_text: Optional[str]
+    description: str
 
 class RsSQLLexerError:
     desc: str
@@ -197,3 +204,9 @@ class RsParser:
     def parse_match_result_from_tokens(
         self, tokens: List[RsToken]
     ) -> RsMatchResult: ...
+
+def rs_make_reflow_config(layout_dict: dict[str, Any]) -> RsReflowConfig: ...
+def rs_respace_with_config_obj(
+    rs_node: object,
+    config: RsReflowConfig,
+) -> list[RsLintViolation]: ...
