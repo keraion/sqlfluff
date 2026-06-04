@@ -253,10 +253,26 @@ try:
                         if _end_idx < len(segments)
                         else []
                     )
+                    # Pass the dialect name so the Rust side can enrich each
+                    # node's class_types with its produced class's full
+                    # inheritance hierarchy (e.g. ``word`` for keywords), keeping
+                    # is_type() in parity with Python's class_types.
+                    dialect_name = self.config.get("dialect")
                     result._rs_node = rs_match.apply_as_node(
                         tokens,
                         leading=leading_tokens,
                         trailing=trailing_tokens,
+                        dialect=dialect_name,
+                    )
+                    # Build the mutable arena tree (RsTree) used by the
+                    # Rust-backed RsSegment facade for linting/fixing. Same
+                    # tokens/leading/trailing as the node above so navigation
+                    # matches Python's raw_segments ordering exactly.
+                    result._rs_tree = rs_match.apply_as_tree(
+                        tokens,
+                        leading=leading_tokens,
+                        trailing=trailing_tokens,
+                        dialect=dialect_name,
                     )
                 except Exception:  # pragma: no cover
                     # Non-critical: if node building fails, rules fall back to Python
@@ -266,6 +282,7 @@ try:
                         " caused it."
                     )
                     result._rs_node = None
+                    result._rs_tree = None
 
                 if parse_statistics:  # pragma: no cover
                     print(

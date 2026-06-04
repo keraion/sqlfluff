@@ -448,6 +448,55 @@ impl Node {
         }
     }
 
+    /// Enrich every Raw/Segment node's ``class_types`` with the authoritative
+    /// hierarchy of its produced Python class, looked up by class name from the
+    /// dialect's generated ``CLASS_TYPES_BY_NAME`` table.
+    ///
+    /// The per-grammar codegen tables under-populate the inherited hierarchy for
+    /// nodes reached via ``Ref`` (e.g. a keyword's ``word``/``raw``/``base``).
+    /// This post-pass recovers them — keyed by the produced class name, which is
+    /// always correct — so Rust-side ``is_type`` matches Python's
+    /// ``RawSegment.class_types`` (``instance_types | class._class_types``).
+    pub fn enrich_class_types(&mut self, dialect: sqlfluffrs_dialects::Dialect) {
+        fn merge(class_types: &mut Vec<String>, authoritative: &[&'static str]) {
+            for t in authoritative {
+                if !class_types.iter().any(|x| x == t) {
+                    class_types.push((*t).to_string());
+                }
+            }
+        }
+        match self {
+            Node::Raw {
+                segment_class,
+                class_types,
+                ..
+            } => {
+                if let Some(auth) = dialect.get_class_types(segment_class) {
+                    merge(class_types, auth);
+                }
+            }
+            Node::Segment {
+                segment_class,
+                class_types,
+                children,
+                ..
+            } => {
+                if let Some(auth) = dialect.get_class_types(segment_class) {
+                    merge(class_types, auth);
+                }
+                for c in children.iter_mut() {
+                    c.enrich_class_types(dialect);
+                }
+            }
+            Node::Unparsable { children, .. } => {
+                for c in children.iter_mut() {
+                    c.enrich_class_types(dialect);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Check if this node is of a specific type (including class_types for Raw and Segment nodes).
     ///
     /// For Raw nodes this mirrors ``RawSegment.is_type()`` (checks ``instance_types``

@@ -149,6 +149,25 @@ class SegmentMetaclass(type, Matchable):
         class_dict["_class_types"] = frozenset(_iter_base_types(added_type, bases))
         return cast(type["BaseSegment"], type.__new__(mcs, name, bases, class_dict))
 
+    def __instancecheck__(cls, instance: Any) -> bool:
+        """Resolve ``isinstance`` for Rust-backed ``RsSegment`` facades.
+
+        The Rust-backed facade duck-types ``BaseSegment`` but does not inherit
+        from it, so ``isinstance(rs, SomeSegment)`` would normally be False.
+        Resolve it against the segment's runtime type set instead: an
+        ``RsSegment`` is an instance of ``cls`` iff its ``is_type`` matches
+        ``cls.type`` (which folds in the full inheritance hierarchy).
+
+        The native check is tried first so real ``BaseSegment`` instances keep
+        the fast path; the facade branch only runs for actual ``RsSegment``s.
+        """
+        if type.__instancecheck__(cls, instance):
+            return True
+        if type(instance).__name__ == "RsSegment":
+            seg_type = getattr(cls, "type", None)
+            return bool(seg_type) and instance.is_type(seg_type)
+        return False
+
 
 class BaseSegment(metaclass=SegmentMetaclass):
     """The base segment element.
@@ -288,6 +307,10 @@ class BaseSegment(metaclass=SegmentMetaclass):
         # This is set on the root FileSegment by the Rust parser for efficient
         # rule evaluation, but isn't needed after pickling.
         s.pop("_rs_node", None)
+        # Remove _rs_tree if present - RsTree (arena) objects can't be pickled.
+        # Set on the root FileSegment by the Rust parser to back the RsSegment
+        # facade; not needed after pickling (rebuilt on the next parse).
+        s.pop("_rs_tree", None)
         return s
 
     def __setstate__(self, state: dict[str, Any]) -> None:

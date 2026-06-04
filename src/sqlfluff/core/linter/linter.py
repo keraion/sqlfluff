@@ -538,6 +538,23 @@ class Linter:
                     disable=progress_bar_configuration.disable_progress_bar,
                 )
 
+                # Optionally run the rule crawl on the Rust-backed RsSegment
+                # facade instead of the Python BaseSegment tree. Lint-only for
+                # now (the facade is read-only); gated behind SQLFLUFF_RS_SEGMENTS
+                # and only when the Rust arena tree was built for this parse.
+                crawl_tree: BaseSegment = tree
+                if not fix:
+                    from sqlfluff.core.parser.segments.rs_segment import (
+                        RsSegment,
+                        rs_segments_enabled,
+                        set_crawl_dialect,
+                    )
+
+                    rs_tree = getattr(tree, "_rs_tree", None)
+                    if rs_segments_enabled() and rs_tree is not None:
+                        set_crawl_dialect(config.get("dialect_obj"))
+                        crawl_tree = RsSegment(rs_tree.root)
+
                 for crawler in progress_bar_crawler:
                     # Performance: After first loop pass, skip rules that don't
                     # do fixes. Any results returned won't be seen by the user
@@ -559,15 +576,47 @@ class Linter:
                     # edit and create are list of tuples. The first element is
                     # the "anchor", the segment to look for either to edit or to
                     # insert BEFORE. The second is the element to insert or create.
-                    linting_errors, _, fixes, _ = crawler.crawl(
-                        tree,
-                        dialect=config.get("dialect_obj"),
-                        fix=fix,
-                        templated_file=templated_file,
-                        ignore_mask=ignore_mask,
-                        fname=fname,
-                        config=config,
-                    )
+                    if crawl_tree is tree:
+                        linting_errors, _, fixes, _ = crawler.crawl(
+                            tree,
+                            dialect=config.get("dialect_obj"),
+                            fix=fix,
+                            templated_file=templated_file,
+                            ignore_mask=ignore_mask,
+                            fname=fname,
+                            config=config,
+                        )
+                    else:
+                        # Run on the Rust-backed facade, but treat it as a strict
+                        # optimization: on ANY failure, fall back to the canonical
+                        # Python tree so results can never be worse than pure
+                        # Python.
+                        try:
+                            linting_errors, _, fixes, _ = crawler.crawl(
+                                crawl_tree,
+                                dialect=config.get("dialect_obj"),
+                                fix=fix,
+                                templated_file=templated_file,
+                                ignore_mask=ignore_mask,
+                                fname=fname,
+                                config=config,
+                                reraise=True,
+                            )
+                        except Exception:  # noqa: BLE001
+                            linter_logger.warning(
+                                f"Rule {crawler.code} failed on the Rust-backed "
+                                f"tree for {fname!r}; falling back to Python.",
+                                exc_info=True,
+                            )
+                            linting_errors, _, fixes, _ = crawler.crawl(
+                                tree,
+                                dialect=config.get("dialect_obj"),
+                                fix=fix,
+                                templated_file=templated_file,
+                                ignore_mask=ignore_mask,
+                                fname=fname,
+                                config=config,
+                            )
                     if is_first_linter_pass():
                         initial_linting_errors += linting_errors
 

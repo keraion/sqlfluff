@@ -111,6 +111,14 @@ class TableBuilder:
         self.segment_class_types_sparse: List[Tuple[int, int, int]] = []
         # Flat array of string indices for segment_class_types values
         self.segment_class_types_data: List[int] = []
+        # Global map of produced segment class name -> sorted ``_class_types``.
+        # Unlike ``segment_class_types_sparse`` (keyed by grammar_id), this is
+        # keyed by the produced Python class name so that match paths which only
+        # know the produced class — notably the Ref-combining path for
+        # ``Ref.keyword(...)`` — can recover the full inherited hierarchy
+        # (e.g. ``word`` for ``KeywordSegment``).  Emitted as
+        # ``CLASS_TYPES_BY_NAME`` and consumed when materialising the node tree.
+        self.class_types_by_name: Dict[str, List[str]] = {}
 
         # Deduplication maps
         self.string_to_id: Dict[str, int] = {}
@@ -149,6 +157,22 @@ class TableBuilder:
         for ct in class_types:
             ct_id = self._add_string(ct)
             self.segment_class_types_data.append(ct_id)
+
+    def _record_class_types_by_name(self, cls) -> None:
+        """Record a produced segment class's full ``_class_types`` by name.
+
+        Populates ``class_types_by_name`` (class name -> sorted ``_class_types``)
+        for any ``BaseSegment`` subclass that a grammar can produce — Segment
+        classes, Ref targets, and the ``raw_class`` of raw parsers.
+        """
+        if not (isinstance(cls, type) and issubclass(cls, BaseSegment)):
+            return
+        name = cls.__name__
+        if name in self.class_types_by_name:
+            return
+        class_types = sorted(getattr(cls, "_class_types", frozenset()))
+        if class_types:
+            self.class_types_by_name[name] = class_types
 
     def _add_regex(self, pattern: str) -> int:
         """Add regex pattern to table (deduplicated). Returns regex_id."""
@@ -299,6 +323,7 @@ class TableBuilder:
                 # Store _class_types hierarchy for Rust is_type() parity
                 class_types = sorted(getattr(grammar, "_class_types", frozenset()))
                 self._register_segment_class_types(grammar_id, class_types)
+                self._record_class_types_by_name(grammar)
             # If this grammar is a Ref to a named segment, attempt to resolve
             # the referenced name to a Segment class in the dialect library
             # and use that class's `type` and `__name__` attributes. This covers
@@ -327,6 +352,7 @@ class TableBuilder:
                                 getattr(target, "_class_types", frozenset())
                             )
                             self._register_segment_class_types(grammar_id, class_types)
+                            self._record_class_types_by_name(target)
                 except Exception:
                     # Be conservative: if lookup fails, leave as NONE
                     pass
@@ -921,6 +947,7 @@ class TableBuilder:
         raw_class_types = sorted(grammar.raw_class._class_types)
         self.aux_data.append(len(raw_class_types))
         self.aux_data.extend(self._add_string(t) for t in raw_class_types)
+        self._record_class_types_by_name(grammar.raw_class)
 
         # Generate hint for StringParser (matches exact string)
         hint_id = self._add_simple_hint(grammar, parse_context)
@@ -986,6 +1013,7 @@ class TableBuilder:
         raw_class_types = sorted(grammar.raw_class._class_types)
         self.aux_data.append(len(raw_class_types))
         self.aux_data.extend(self._add_string(t) for t in raw_class_types)
+        self._record_class_types_by_name(grammar.raw_class)
 
         comment = f'TypedParser("{grammar.template}")'
 
@@ -1056,6 +1084,7 @@ class TableBuilder:
         raw_class_types = sorted(grammar.raw_class._class_types)
         self.aux_data.append(len(raw_class_types))
         self.aux_data.extend(self._add_string(t) for t in raw_class_types)
+        self._record_class_types_by_name(grammar.raw_class)
 
         comment = f"MultiStringParser({templates_count} templates)"
 
@@ -1125,6 +1154,7 @@ class TableBuilder:
         raw_class_types = sorted(grammar.raw_class._class_types)
         self.aux_data.append(len(raw_class_types))
         self.aux_data.extend(self._add_string(t) for t in raw_class_types)
+        self._record_class_types_by_name(grammar.raw_class)
 
         comment = "RegexParser"
 
@@ -1738,6 +1768,24 @@ def generate_parser_table_driven(dialect: str):
     print("    match name {")
     for name, segment_type in sorted(segment_types):
         print(f'        "{name}" => Some("{segment_type}"),')
+    print("        _ => None,")
+    print("    }")
+    print("}")
+    print()
+
+    # Generate produced-class -> full _class_types mapping.  Keyed by the
+    # produced Python class name so any match path that knows the produced
+    # class (e.g. the Ref-combining path for keywords) can recover the full
+    # inherited hierarchy (e.g. ``word`` for ``KeywordSegment``).
+    print(
+        f"pub fn get_{dialect.lower()}_class_types(name: &str) "
+        "-> Option<&'static [&'static str]> {"
+    )
+    print("    match name {")
+    for name in sorted(builder.class_types_by_name):
+        cts = builder.class_types_by_name[name]
+        cts_lit = ", ".join(f'"{ct}"' for ct in cts)
+        print(f'        "{name}" => Some(&[{cts_lit}]),')
     print("        _ => None,")
     print("    }")
     print("}")

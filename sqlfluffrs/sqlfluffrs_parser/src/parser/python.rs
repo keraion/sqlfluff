@@ -423,21 +423,49 @@ impl PyMatchResult {
     /// tokens to the root.
     ///
     /// This is the single PyO3 entry-point for node construction.
-    #[pyo3(signature = (tokens, leading=vec![], trailing=vec![]))]
+    #[pyo3(signature = (tokens, leading=vec![], trailing=vec![], dialect=None))]
     fn apply_as_node(
         &self,
         tokens: Vec<PyToken>,
         leading: Vec<PyToken>,
         trailing: Vec<PyToken>,
+        dialect: Option<&str>,
     ) -> PyNode {
         let rust_leading: Vec<Token> = leading.into_iter().map(|t| t.into()).collect();
         let rust_tokens: Vec<Token> = tokens.into_iter().map(|t| t.into()).collect();
         let rust_trailing: Vec<Token> = trailing.into_iter().map(|t| t.into()).collect();
-        let node = self
+        let mut node = self
             .0
             .clone()
             .apply_as_root(&rust_tokens, &rust_leading, &rust_trailing);
+        if let Some(d) = dialect.and_then(|d| Dialect::from_str(d).ok()) {
+            node.enrich_class_types(d);
+        }
         PyNode(node)
+    }
+
+    /// Build the full AST as an `RsTree` (mutable arena) from this MatchResult
+    /// and tokens — the navigable, id-addressable tree used by the Rust-backed
+    /// `RsSegment` façade for linting/fixing.  Same inputs as `apply_as_node`.
+    #[pyo3(signature = (tokens, leading=vec![], trailing=vec![], dialect=None))]
+    fn apply_as_tree(
+        &self,
+        tokens: Vec<PyToken>,
+        leading: Vec<PyToken>,
+        trailing: Vec<PyToken>,
+        dialect: Option<&str>,
+    ) -> super::arena_py::PyTree {
+        let rust_leading: Vec<Token> = leading.into_iter().map(|t| t.into()).collect();
+        let rust_tokens: Vec<Token> = tokens.into_iter().map(|t| t.into()).collect();
+        let rust_trailing: Vec<Token> = trailing.into_iter().map(|t| t.into()).collect();
+        let mut node = self
+            .0
+            .clone()
+            .apply_as_root(&rust_tokens, &rust_leading, &rust_trailing);
+        if let Some(d) = dialect.and_then(|d| Dialect::from_str(d).ok()) {
+            node.enrich_class_types(d);
+        }
+        super::arena_py::PyTree::new(super::arena::Arena::from_node(&node))
     }
 }
 

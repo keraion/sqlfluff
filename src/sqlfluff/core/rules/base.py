@@ -496,6 +496,7 @@ class BaseRule(metaclass=RuleMetaclass):
         ignore_mask: Optional["IgnoreMask"],
         fname: Optional[str],
         config: "FluffConfig",
+        reraise: bool = False,
     ) -> tuple[
         list[SQLLintError],
         tuple[RawSegment, ...],
@@ -503,6 +504,12 @@ class BaseRule(metaclass=RuleMetaclass):
         Optional[dict[str, Any]],
     ]:
         """Run the rule on a given tree.
+
+        If ``reraise`` is set, unexpected exceptions raised while evaluating the
+        rule propagate instead of being recorded as violations. This lets the
+        caller run the rule on an experimental (e.g. Rust-backed) tree and fall
+        back to the canonical Python tree on any failure, so the faster path can
+        never produce worse results than pure Python.
 
         Returns:
             A tuple of (vs, raw_stack, fixes, memory)
@@ -531,6 +538,10 @@ class BaseRule(metaclass=RuleMetaclass):
             # Any exception at this point would halt the linter and
             # cause the user to get no results
             except Exception as e:
+                # When requested, let the caller handle the failure (e.g. to
+                # fall back from an experimental tree to the Python tree).
+                if reraise:
+                    raise
                 # If a filename is present, include it in the critical exception.
                 self.logger.critical(
                     (
