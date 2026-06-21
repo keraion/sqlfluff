@@ -519,20 +519,40 @@ impl Parser<'_> {
             // collapsing what used to be the same Done/Push block repeated per variant. Terminal
             // variants never enter WaitingForChild.
             let result = match &frame.context {
-                FrameContext::OneOf(_) => {
-                    markers::OneOf::waiting_for_child(self, frame, child_node, child_end_pos, stack)?
-                }
+                FrameContext::OneOf(_) => markers::OneOf::waiting_for_child(
+                    self,
+                    frame,
+                    child_node,
+                    child_end_pos,
+                    stack,
+                )?,
                 FrameContext::Sequence(_) => markers::Sequence::waiting_for_child(
-                    self, frame, child_node, child_end_pos, stack,
+                    self,
+                    frame,
+                    child_node,
+                    child_end_pos,
+                    stack,
                 )?,
                 FrameContext::Delimited(_) => markers::Delimited::waiting_for_child(
-                    self, frame, child_node, child_end_pos, stack,
+                    self,
+                    frame,
+                    child_node,
+                    child_end_pos,
+                    stack,
                 )?,
                 FrameContext::Bracketed(_) => markers::Bracketed::waiting_for_child(
-                    self, frame, child_node, child_end_pos, stack,
+                    self,
+                    frame,
+                    child_node,
+                    child_end_pos,
+                    stack,
                 )?,
                 FrameContext::AnyNumberOf(_) => markers::AnyNumberOf::waiting_for_child(
-                    self, frame, child_node, child_end_pos, stack,
+                    self,
+                    frame,
+                    child_node,
+                    child_end_pos,
+                    stack,
                 )?,
                 FrameContext::Ref(_) => {
                     markers::Ref::waiting_for_child(self, frame, child_node, child_end_pos, stack)?
@@ -610,7 +630,10 @@ impl Parser<'_> {
                 markers::AnyNumberOf::combining(self, frame, stack)
             }
             GrammarVariant::Ref => markers::Ref::combining(self, frame, stack),
-            _ => unimplemented!("Combining not implemented for grammar variant: {:?}", variant),
+            _ => unimplemented!(
+                "Combining not implemented for grammar variant: {:?}",
+                variant
+            ),
         }
     }
 

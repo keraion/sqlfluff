@@ -101,23 +101,41 @@ pub(crate) mod markers {
         (@stack stack $stack:ident) => { $stack };
     }
 
-    marker!(OneOf, initial = handle_oneof_initial,
-        waiting = handle_oneof_waiting_for_child (stack),
-        combining = handle_oneof_combining (stack));
-    marker!(Sequence, initial = handle_sequence_initial,
-        waiting = handle_sequence_waiting_for_child (stack),
-        combining = handle_sequence_combining (stack));
-    marker!(Delimited, initial = handle_delimited_initial,
-        waiting = handle_delimited_waiting_for_child (stack),
-        combining = handle_delimited_combining (stack));
-    marker!(Bracketed, initial = handle_bracketed_initial,
-        waiting = handle_bracketed_waiting_for_child (stack),
-        combining = handle_bracketed_combining (stack));
-    marker!(AnyNumberOf, initial = handle_anynumberof_initial,
-        waiting = handle_anynumberof_waiting_for_child (stack),
-        combining = handle_anynumberof_combining (stack));
+    marker!(
+        OneOf,
+        initial = handle_oneof_initial,
+        waiting = handle_oneof_waiting_for_child(stack),
+        combining = handle_oneof_combining(stack)
+    );
+    marker!(
+        Sequence,
+        initial = handle_sequence_initial,
+        waiting = handle_sequence_waiting_for_child(stack),
+        combining = handle_sequence_combining(stack)
+    );
+    marker!(
+        Delimited,
+        initial = handle_delimited_initial,
+        waiting = handle_delimited_waiting_for_child(stack),
+        combining = handle_delimited_combining(stack)
+    );
+    marker!(
+        Bracketed,
+        initial = handle_bracketed_initial,
+        waiting = handle_bracketed_waiting_for_child(stack),
+        combining = handle_bracketed_combining(stack)
+    );
+    marker!(
+        AnyNumberOf,
+        initial = handle_anynumberof_initial,
+        waiting = handle_anynumberof_waiting_for_child(stack),
+        combining = handle_anynumberof_combining(stack)
+    );
     // Ref's waiting/combining handlers don't take the frame stack.
-    marker!(Ref, initial = handle_ref_initial,
-        waiting = handle_ref_waiting_for_child (),
-        combining = handle_ref_combining ());
+    marker!(
+        Ref,
+        initial = handle_ref_initial,
+        waiting = handle_ref_waiting_for_child(),
+        combining = handle_ref_combining()
+    );
 }
