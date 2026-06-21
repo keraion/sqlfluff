@@ -2,6 +2,7 @@ pub mod anynumberof;
 pub mod bracketed;
 pub mod contexts;
 pub mod delimited;
+pub(crate) mod dispatch;
 pub mod frame;
 pub mod iterative;
 mod match_algorithms;

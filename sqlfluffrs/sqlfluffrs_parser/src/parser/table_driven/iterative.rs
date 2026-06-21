@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::parser::{
     cache::TableCacheKey,
+    table_driven::dispatch::{markers, CompoundGrammar},
     table_driven::frame::{TableFrameResult, TableParseFrame, TableParseFrameStack},
     table_driven::parity,
     FrameContext, FrameState, MatchResult, Node, ParseError, Parser,
@@ -363,6 +364,12 @@ impl Parser<'_> {
     }
 
     /// Dispatch handler for table-driven Initial state.
+    ///
+    /// One flat `match` on `GrammarVariant` — a single jump table on the hottest path
+    /// (terminal/leaf grammars are the most frequent match). Compound variants forward through
+    /// the [`CompoundGrammar`] markers; terminal variants match synchronously inline and store
+    /// their result for the parent. Keeping both in one match (rather than dispatching compound
+    /// and terminal separately) avoids a second switch on the terminal path.
     pub fn handle_initial(
         &mut self,
         frame: TableParseFrame,
@@ -372,8 +379,7 @@ impl Parser<'_> {
         use sqlfluffrs_types::GrammarVariant;
 
         let grammar_id = frame.grammar_id;
-        let inst = self.grammar_ctx.inst(grammar_id);
-        let variant = inst.variant;
+        let variant = self.grammar_ctx.inst(grammar_id).variant;
 
         vdebug!(
             "Table-driven Initial: frame_id={}, grammar_id={}, variant={:?}",
@@ -389,16 +395,17 @@ impl Parser<'_> {
         self.pos = frame.pos;
 
         match variant {
-            GrammarVariant::OneOf => self.handle_oneof_initial(frame, stack),
-            GrammarVariant::Sequence => self.handle_sequence_initial(frame, stack),
-            GrammarVariant::Delimited => self.handle_delimited_initial(frame, stack),
-            GrammarVariant::Bracketed => self.handle_bracketed_initial(frame, stack),
+            // Compound variants: forward through the CompoundGrammar markers.
+            GrammarVariant::OneOf => markers::OneOf::initial(self, frame, stack),
+            GrammarVariant::Sequence => markers::Sequence::initial(self, frame, stack),
+            GrammarVariant::Delimited => markers::Delimited::initial(self, frame, stack),
+            GrammarVariant::Bracketed => markers::Bracketed::initial(self, frame, stack),
+            // AnySetOf shares AnyNumberOf semantics.
             GrammarVariant::AnyNumberOf | GrammarVariant::AnySetOf => {
-                // AnySetOf currently delegates to AnyNumberOf semantics in table-driven handlers
-                self.handle_anynumberof_initial(frame, stack)
+                markers::AnyNumberOf::initial(self, frame, stack)
             }
-            GrammarVariant::Ref => self.handle_ref_initial(frame, stack),
-            // Terminal/simple variants should be handled synchronously here
+            GrammarVariant::Ref => markers::Ref::initial(self, frame, stack),
+            // Terminal/leaf variants match synchronously here.
             GrammarVariant::StringParser => {
                 // Synchronous match: call the table-driven string parser and store result for parent
                 let res = self.handle_string_parser(grammar_id);
@@ -436,10 +443,10 @@ impl Parser<'_> {
             GrammarVariant::Meta => {
                 let res = self.handle_meta(grammar_id);
                 let parent_frame = stack.last_mut().unwrap();
-                let variant = self.grammar_ctx.inst(parent_frame.grammar_id).variant;
+                let parent_variant = self.grammar_ctx.inst(parent_frame.grammar_id).variant;
                 log::warn!(
                     "Meta grammar should be consumed by a sequence or bracketed, not matched in {:?}:{} for Meta {:?}",
-                    variant,
+                    parent_variant,
                     parent_frame.grammar_id.0,
                     frame.grammar_id.0
 
@@ -464,7 +471,7 @@ impl Parser<'_> {
     /// Dispatch handler for WaitingForChild state.
     fn handle_waiting_for_child(
         &mut self,
-        mut frame: TableParseFrame,
+        frame: TableParseFrame,
         stack: &mut TableParseFrameStack,
         iteration_count: usize,
     ) -> Result<TableFrameResult, ParseError> {
@@ -506,91 +513,38 @@ impl Parser<'_> {
             // This prevents interference between speculative parses while still preventing duplicates
             // in the final committed AST.
 
-            match &mut frame.context {
+            // Dispatch on the context tag we already hold (one match, like the baseline) — this
+            // resume runs once per child completion. Each compound handler folds the child result
+            // and returns Done or Push(updated_frame); the wrapper below applies that uniformly,
+            // collapsing what used to be the same Done/Push block repeated per variant. Terminal
+            // variants never enter WaitingForChild.
+            let result = match &frame.context {
                 FrameContext::OneOf(_) => {
-                    match self.handle_oneof_waiting_for_child(
-                        frame,
-                        child_node,
-                        child_end_pos,
-                        stack,
-                    )? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
+                    markers::OneOf::waiting_for_child(self, frame, child_node, child_end_pos, stack)?
                 }
-                FrameContext::Sequence(_) => {
-                    match self.handle_sequence_waiting_for_child(
-                        frame,
-                        child_node,
-                        child_end_pos,
-                        stack,
-                    )? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
-                }
+                FrameContext::Sequence(_) => markers::Sequence::waiting_for_child(
+                    self, frame, child_node, child_end_pos, stack,
+                )?,
+                FrameContext::Delimited(_) => markers::Delimited::waiting_for_child(
+                    self, frame, child_node, child_end_pos, stack,
+                )?,
+                FrameContext::Bracketed(_) => markers::Bracketed::waiting_for_child(
+                    self, frame, child_node, child_end_pos, stack,
+                )?,
+                FrameContext::AnyNumberOf(_) => markers::AnyNumberOf::waiting_for_child(
+                    self, frame, child_node, child_end_pos, stack,
+                )?,
                 FrameContext::Ref(_) => {
-                    match self.handle_ref_waiting_for_child(frame, child_node, child_end_pos)? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
+                    markers::Ref::waiting_for_child(self, frame, child_node, child_end_pos, stack)?
                 }
-                FrameContext::Delimited(_) => {
-                    match self.handle_delimited_waiting_for_child(
-                        frame,
-                        child_node,
-                        child_end_pos,
-                        stack,
-                    )? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
+                FrameContext::None => {
+                    unimplemented!("WaitingForChild for grammar type: {:?}", frame.grammar_id)
                 }
-                FrameContext::Bracketed(_) => {
-                    match self.handle_bracketed_waiting_for_child(
-                        frame,
-                        child_node,
-                        child_end_pos,
-                        stack,
-                    )? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
-                }
-                FrameContext::AnyNumberOf(_) => {
-                    match self.handle_anynumberof_waiting_for_child(
-                        frame,
-                        child_node,
-                        child_end_pos,
-                        stack,
-                    )? {
-                        TableFrameResult::Done => {}
-                        TableFrameResult::Push(updated_frame) => {
-                            stack.push(updated_frame);
-                        }
-                    }
-                    Ok(TableFrameResult::Done)
-                }
-                _ => {
-                    // TODO: Handle other grammar types
-                    unimplemented!("WaitingForChild for grammar type: {:?}", frame.grammar_id);
-                }
+            };
+            if let TableFrameResult::Push(updated_frame) = result {
+                stack.push(updated_frame);
             }
+            Ok(TableFrameResult::Done)
         } else {
             // Child result not found yet - push frame back onto stack and continue
             let last_child_frame_id = frame.context.last_child_frame_id();
@@ -636,8 +590,7 @@ impl Parser<'_> {
         use sqlfluffrs_types::GrammarVariant;
 
         let grammar_id = frame.grammar_id;
-        let inst = self.grammar_ctx.inst(grammar_id);
-        let variant = inst.variant;
+        let variant = self.grammar_ctx.inst(grammar_id).variant;
 
         vdebug!(
             "Table-driven Combining: frame_id={}, grammar_id={}, variant={:?}",
@@ -646,22 +599,18 @@ impl Parser<'_> {
             variant
         );
 
+        // One match on variant (like the baseline), forwarding through the CompoundGrammar
+        // markers. Terminal/simple variants never reach Combining.
         match variant {
-            GrammarVariant::OneOf => self.handle_oneof_combining(frame, stack),
-            GrammarVariant::Sequence => self.handle_sequence_combining(frame, stack),
-            GrammarVariant::Delimited => self.handle_delimited_combining(frame, stack),
-            GrammarVariant::Bracketed => self.handle_bracketed_combining(frame, stack),
+            GrammarVariant::OneOf => markers::OneOf::combining(self, frame, stack),
+            GrammarVariant::Sequence => markers::Sequence::combining(self, frame, stack),
+            GrammarVariant::Delimited => markers::Delimited::combining(self, frame, stack),
+            GrammarVariant::Bracketed => markers::Bracketed::combining(self, frame, stack),
             GrammarVariant::AnyNumberOf | GrammarVariant::AnySetOf => {
-                self.handle_anynumberof_combining(frame, stack)
+                markers::AnyNumberOf::combining(self, frame, stack)
             }
-            GrammarVariant::Ref => self.handle_ref_combining(frame),
-            _ => {
-                // Combining should not be reached for terminal/simple variants
-                unimplemented!(
-                    "Combining not implemented for grammar variant: {:?}",
-                    variant
-                );
-            }
+            GrammarVariant::Ref => markers::Ref::combining(self, frame, stack),
+            _ => unimplemented!("Combining not implemented for grammar variant: {:?}", variant),
         }
     }
 

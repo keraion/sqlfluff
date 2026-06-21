@@ -48,12 +48,26 @@ for terminal parsers. Each named state struct holds what its handler needs betwe
 (e.g. `OneOfState::longest_match`); `as_*_mut()` accessors on `FrameContext` return the
 typed `&mut *State` for one variant.
 
-Dispatch is a static `match` on `GrammarVariant` — a jump table — at `*_initial`,
-`*_waiting_for_child`, and `*_combining`, with one handler module per variant under
-[`table_driven/`](sqlfluffrs_parser/src/parser/table_driven/). Keep it static: a trait
-object here costs a vtable load per transition on the hottest path.
-Bracketed and Delimited additionally dispatch their `WaitingForChild` resume on the
-sub-state enum (`BracketedPhase` / `DelimitedPhase`) to one method per phase.
+**Compound vs terminal.** A *compound* grammar (OneOf, Sequence, Delimited, Bracketed,
+AnyNumberOf, Ref) drives child parses and walks the full `Initial → WaitingForChild →
+Combining` lifecycle; *terminal* grammars (StringParser, Token, Meta, …) match in one step
+and never enter `WaitingForChild`/`Combining`. The
+[`CompoundGrammar`](sqlfluffrs_parser/src/parser/table_driven/dispatch.rs) trait names those
+three lifecycle steps and is implemented by one zero-sized marker per compound variant; each
+marker is a thin forwarder to that variant's `handle_<variant>_<phase>` method (one module per
+variant under [`table_driven/`](sqlfluffrs_parser/src/parser/table_driven/)).
+
+Dispatch is a static `match` — a jump table — at each of the three lifecycle sites in
+`iterative.rs`, forwarding to the `CompoundGrammar` markers. Each site keeps the *same dispatch
+shape the per-variant handlers had before the trait was introduced*, so the markers add no hot
+branching: `Initial` and `Combining` match on `GrammarVariant` (`AnySetOf` shares the
+`AnyNumberOf` arm); `WaitingForChild` matches on the in-hand `FrameContext` tag (no grammar-table
+re-read — it runs once per child completion). Adding a compound variant touches its handler
+module, a marker, and one arm in each dispatcher. Keep dispatch static: the markers are concrete
+zero-sized types and their forwarders are `#[inline(always)]`, so they compile to the same jump
+table as a direct call; a `dyn` trait object would instead cost a vtable load per transition on
+the hottest path. Bracketed and Delimited additionally dispatch their `WaitingForChild` resume on
+the sub-state enum (`BracketedPhase` / `DelimitedPhase`) to one method per phase.
 
 **Results hand-off.** A frame doesn't return to its parent directly. When a child reaches
 `Complete`, the loop writes `(Arc<MatchResult>, end_pos, element_key)` into
