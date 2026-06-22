@@ -204,7 +204,7 @@ impl Parser<'_> {
                         }
                     }
                 }
-                FrameState::WaitingForChild { .. } => {
+                FrameState::WaitingForChild => {
                     match self.handle_waiting_for_child(frame, &mut stack, iteration_count)? {
                         TableFrameResult::Done => continue,
                         TableFrameResult::Push(updated_frame) => {
@@ -370,7 +370,7 @@ impl Parser<'_> {
     /// the [`CompoundGrammar`] markers; terminal variants match synchronously inline and store
     /// their result for the parent. Keeping both in one match (rather than dispatching compound
     /// and terminal separately) avoids a second switch on the terminal path.
-    pub fn handle_initial(
+    pub(crate) fn handle_initial(
         &mut self,
         frame: TableParseFrame,
         stack: &mut TableParseFrameStack,

@@ -126,13 +126,12 @@ impl Parser<'_> {
             segment_type: this_type,
             saved_pos: child_start_pos,
             last_child_frame_id: Some(stack.frame_id_counter),
-            child_grammar_id,
             match_result: Arc::new(MatchResult::empty_at(start_pos)),
         });
 
         // CRITICAL: Set parent frame state to WaitingForChild so it will
         // retrieve the child result on the next iteration
-        frame.state = FrameState::WaitingForChild { child_index: 0 };
+        frame.state = FrameState::WaitingForChild;
 
         // Combine the Ref's local terminators with the parent terminators so
         // the referenced child parsing respects both sets (parity with Arc path)
@@ -159,7 +158,7 @@ impl Parser<'_> {
             child_start_pos
         );
 
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle Ref WaitingForChild state using table-driven approach

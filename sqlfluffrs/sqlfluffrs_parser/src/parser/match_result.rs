@@ -713,7 +713,7 @@ impl MatchResult {
 
 /// Build a `SegmentKwargs` from a lexer `Token` and an instance token type.
 /// This centralizes token-to-segment kwargs mapping used by table-driven parsers.
-pub fn segment_kwargs_from_token(
+pub(crate) fn segment_kwargs_from_token(
     tok: &Token,
     token_type: &str,
     instance_types: Option<Vec<String>>,

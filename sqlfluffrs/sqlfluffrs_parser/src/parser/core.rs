@@ -44,15 +44,60 @@ fn read_string_ids_from_aux(
         .collect()
 }
 
-/// A checkpoint in the collection history that tracks which tokens were collected
-/// at a specific point. Used for backtracking.
-#[derive(Debug, Clone)]
-pub struct CollectionCheckpoint {
-    /// Frame ID associated with this checkpoint
-    pub frame_id: usize,
-    /// Token positions that were marked as collected at this checkpoint
-    pub positions: Vec<usize>,
+/// Diagnostic counters accumulated during a parse.
+///
+/// Pure instrumentation: nothing here affects parse results, so every field is a
+/// `Cell<usize>` updated through `&self`. Grouped into one struct to keep the
+/// `Parser` struct focused on parsing state and to expose the counters as a unit
+/// via [`Parser::diagnostics`] rather than field-by-field across the FFI boundary.
+#[derive(Debug, Default)]
+pub(crate) struct ParserMetrics {
+    /// Number of `prune_options` calls.
+    pub pruning_calls: std::cell::Cell<usize>,
+    /// Total options considered across all prune calls.
+    pub pruning_total: std::cell::Cell<usize>,
+    /// Options kept after pruning.
+    pub pruning_kept: std::cell::Cell<usize>,
+    /// Options that had a simple hint.
+    pub pruning_hinted: std::cell::Cell<usize>,
+    /// Options that returned None (too complex to hint).
+    pub pruning_complex: std::cell::Cell<usize>,
+    /// Match attempts (mirrors Python's `longest_match` accounting).
+    pub match_attempts: std::cell::Cell<usize>,
+    /// Successful matches.
+    pub match_successes: std::cell::Cell<usize>,
+    /// Early exits taken on an already-complete match.
+    pub complete_match_early_exits: std::cell::Cell<usize>,
+    /// Terminator checks performed.
+    pub terminator_checks: std::cell::Cell<usize>,
+    /// Terminator hits (early exits caused by a terminator).
+    pub terminator_hits: std::cell::Cell<usize>,
 }
+
+impl ParserMetrics {
+    /// Snapshot the counters as a name -> value map (for debug/FFI reporting).
+    fn as_map(&self) -> std::collections::HashMap<String, usize> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("pruning_calls".to_string(), self.pruning_calls.get());
+        m.insert("pruning_total".to_string(), self.pruning_total.get());
+        m.insert("pruning_kept".to_string(), self.pruning_kept.get());
+        m.insert("pruning_hinted".to_string(), self.pruning_hinted.get());
+        m.insert("pruning_complex".to_string(), self.pruning_complex.get());
+        m.insert("match_attempts".to_string(), self.match_attempts.get());
+        m.insert("match_successes".to_string(), self.match_successes.get());
+        m.insert(
+            "complete_match_early_exits".to_string(),
+            self.complete_match_early_exits.get(),
+        );
+        m.insert(
+            "terminator_checks".to_string(),
+            self.terminator_checks.get(),
+        );
+        m.insert("terminator_hits".to_string(), self.terminator_hits.get());
+        m
+    }
+}
+
 /// The main parser struct that holds parsing state and provides parsing methods.
 pub struct Parser<'a> {
     pub simple_hint_cache: hashbrown::HashMap<u64, Option<SimpleHint>>,

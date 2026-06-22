@@ -169,7 +169,7 @@ impl Parser<'_> {
             return Ok(stack.complete_frame_empty(&frame));
         }
 
-        frame.state = FrameState::WaitingForChild { child_index: 0 };
+        frame.state = FrameState::WaitingForChild;
 
         // Store context with max_times config and pruned element list
         frame.context = FrameContext::AnyNumberOf(AnyNumberOfState {
@@ -216,7 +216,7 @@ impl Parser<'_> {
         }
 
         // Push parent then child (parent.last_child_frame_id was set in context)
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle AnyNumberOf WaitingForChild state using table-driven approach
@@ -317,7 +317,7 @@ impl Parser<'_> {
         // Update last_child_frame_id
         ctx.last_child_frame_id = Some(stack.frame_id_counter);
 
-        Ok(stack.push_child_and_wait(frame, child_frame, next_element_idx))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Process the longest match after all candidates are tried
@@ -483,7 +483,7 @@ impl Parser<'_> {
         ctx.last_child_frame_id = Some(stack.frame_id_counter);
 
         // Update frame state
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle AnyNumberOf Combining state using table-driven approach

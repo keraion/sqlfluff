@@ -132,8 +132,9 @@ impl Parser<'_> {
         }
 
         // Track match attempts (like Python's longest_match - each option is an attempt)
-        self.match_attempts
-            .set(self.match_attempts.get() + pruned_children.len());
+        self.metrics
+            .match_attempts
+            .set(self.metrics.match_attempts.get() + pruned_children.len());
 
         // Save first child before moving pruned_children into context
         let first_child = pruned_children[0];
@@ -146,7 +147,6 @@ impl Parser<'_> {
 
         // Store context for WaitingForChild state (move pruned_children, no clone)
         frame.context = FrameContext::OneOf(OneOfState {
-            grammar_id,
             pruned_children,
             post_skip_pos,
             longest_match: None,
@@ -176,7 +176,7 @@ impl Parser<'_> {
         );
 
         // Transition: push child and wait
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle OneOf WaitingForChild state using table-driven approach
@@ -269,8 +269,9 @@ impl Parser<'_> {
                 max_idx
             );
             // Track early exit for stats
-            self.complete_match_early_exits
-                .set(self.complete_match_early_exits.get() + 1);
+            self.metrics
+                .complete_match_early_exits
+                .set(self.metrics.complete_match_early_exits.get() + 1);
             *longest_match = Some((child_match_rc, consumed, current_child));
             // Skip directly to Combining state
             frame.state = FrameState::Combining;
@@ -341,7 +342,7 @@ impl Parser<'_> {
                 next_child.0
             );
 
-            frame.state = FrameState::WaitingForChild { child_index: 0 };
+            frame.state = FrameState::WaitingForChild;
 
             // Build child frame using same table_terminators as parent
             let child_frame = TableParseFrame::new_child(
@@ -399,7 +400,9 @@ impl Parser<'_> {
         let result_match = if let Some((best_match, best_consumed, _best_child_id)) = longest_match
         {
             // Track successful match (like Python's longest_match returning a match)
-            self.match_successes.set(self.match_successes.get() + 1);
+            self.metrics
+                .match_successes
+                .set(self.metrics.match_successes.get() + 1);
             self.pos = post_skip_pos + best_consumed;
 
             best_match

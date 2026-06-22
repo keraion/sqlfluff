@@ -151,7 +151,7 @@ impl Parser<'_> {
         );
 
         // Match the first child
-        Ok(stack.push_child_and_wait(frame, child_frame, current_element_idx))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Helper function to buffer trailing meta elements starting from current_element_idx

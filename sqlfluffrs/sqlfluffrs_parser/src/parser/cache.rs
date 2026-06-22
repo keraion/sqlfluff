@@ -50,10 +50,10 @@ use crate::vdebug;
 /// calculation via trim_to_terminator(), so their effect is already captured.
 /// This dramatically improves cache hit rates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableCacheKey {
-    pub pos: usize,
-    pub grammar_id: u32,
-    pub max_idx: usize,
+pub(crate) struct TableCacheKey {
+    pub(crate) pos: usize,
+    pub(crate) grammar_id: u32,
+    pub(crate) max_idx: usize,
 }
 
 impl TableCacheKey {
@@ -62,7 +62,7 @@ impl TableCacheKey {
     /// PYTHON PARITY: terminators and terminator_hash_cache parameters are now
     /// ignored - we only use (pos, grammar_id, max_idx) just like Python uses
     /// (raw, loc, type, max_idx). The max_idx already encodes terminator effects.
-    pub fn new(pos: usize, grammar_id: GrammarId, max_idx: usize) -> Self {
+    pub(crate) fn new(pos: usize, grammar_id: GrammarId, max_idx: usize) -> Self {
         TableCacheKey {
             pos,
             grammar_id: grammar_id.0,
@@ -74,20 +74,20 @@ impl TableCacheKey {
 /// Cache value for table-driven parser
 /// - MatchResult: The lazy parse result (can be converted to Node via apply())
 /// - usize: End position after parsing
-pub type TableCacheValue = (Arc<MatchResult>, usize);
+pub(crate) type TableCacheValue = (Arc<MatchResult>, usize);
 
 /// Parse result cache for table-driven parser
 ///
 /// This cache is optimized for the table-driven parser which uses GrammarId
 /// instead of Arc<Grammar>. The key is much simpler and faster to compute.
-pub struct TableParseCache {
+pub(crate) struct TableParseCache {
     cache: HashMap<TableCacheKey, TableCacheValue>,
     hits: usize,
     misses: usize,
 }
 
 impl TableParseCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         TableParseCache {
             cache: HashMap::new(),
             hits: 0,
@@ -96,7 +96,7 @@ impl TableParseCache {
     }
 
     /// Check cache for a result
-    pub fn get(&mut self, key: &TableCacheKey) -> Option<&TableCacheValue> {
+    pub(crate) fn get(&mut self, key: &TableCacheKey) -> Option<&TableCacheValue> {
         match self.cache.get(key) {
             Some(result) => {
                 self.hits += 1;
@@ -122,7 +122,7 @@ impl TableParseCache {
     }
 
     /// Store a result in cache
-    pub fn put(&mut self, key: TableCacheKey, result: TableCacheValue) {
+    pub(crate) fn put(&mut self, key: TableCacheKey, result: TableCacheValue) {
         vdebug!(
             "TableCache INSERT at pos {} (grammar_id: {}, max_idx: {})",
             key.pos,
@@ -132,7 +132,7 @@ impl TableParseCache {
         self.cache.insert(key, result);
     }
 
-    pub fn hit_rate(&self) -> f64 {
+    pub(crate) fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
             0.0
@@ -141,26 +141,18 @@ impl TableParseCache {
         }
     }
 
-    pub fn stats(&self) -> (usize, usize, f64) {
+    pub(crate) fn stats(&self) -> (usize, usize, f64) {
         (self.hits, self.misses, self.hit_rate())
     }
 
-    pub fn clear(&mut self) {
-        self.cache.clear();
-        self.hits = 0;
-        self.misses = 0;
-    }
-
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.cache.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
-    }
-
-    /// Iterate over cache entries (for analysis/debugging)
-    pub fn iter(&self) -> impl Iterator<Item = (&TableCacheKey, &TableCacheValue)> {
+    /// Iterate over cache entries (for analysis/debugging). Only the Python bindings'
+    /// grammar-count probe consumes this, so it's gated to avoid a dead-code warning elsewhere.
+    #[cfg(feature = "python")]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&TableCacheKey, &TableCacheValue)> {
         self.cache.iter()
     }
 }

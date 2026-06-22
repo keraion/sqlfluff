@@ -270,7 +270,7 @@ impl Parser<'_> {
             );
 
             *last_child_frame_id = Some(stack.frame_id_counter);
-            return Ok(stack.push_child_and_wait(frame, close_frame, 0));
+            return Ok(stack.push_child_and_wait(frame, close_frame));
         } else {
             // Start with the first non-Meta content element
             vdebug!(
@@ -299,7 +299,7 @@ impl Parser<'_> {
             *parse_mode_override, // Pass override to content
         );
         *last_child_frame_id = Some(stack.frame_id_counter);
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle the child result while in [`BracketedPhase::MatchingContent`]:
@@ -419,7 +419,7 @@ impl Parser<'_> {
                     *parse_mode_override, // Pass override to content
                 );
                 *last_child_frame_id = Some(stack.frame_id_counter);
-                return Ok(stack.push_child_and_wait(frame, child_frame, 0));
+                return Ok(stack.push_child_and_wait(frame, child_frame));
             }
             // All remaining content elements were Meta - fall through to MatchingClose
         }
@@ -513,7 +513,7 @@ impl Parser<'_> {
                 None, // No override for closing bracket
             );
             *last_child_frame_id = Some(stack.frame_id_counter);
-            Ok(stack.push_child_and_wait(frame, child_frame, 0))
+            Ok(stack.push_child_and_wait(frame, child_frame))
         }
     }
 
@@ -670,7 +670,7 @@ fn initialize_bracketed_frame(
     all_terminators: &[GrammarId],
 ) {
     // Update frame with Bracketed context
-    frame.state = FrameState::WaitingForChild { child_index: 0 };
+    frame.state = FrameState::WaitingForChild;
     frame.context = FrameContext::Bracketed(BracketedState {
         grammar_id,
         phase: BracketedPhase::MatchingOpen,

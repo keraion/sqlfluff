@@ -4,11 +4,8 @@ use std::sync::Arc;
 
 use crate::parser::{FrameContext, FrameState, MatchResult};
 
-#[cfg(feature = "verbose-debug")]
-use crate::vdebug;
-
 /// Result of frame processing - either finished or needs to push frame back
-pub enum TableFrameResult {
+pub(crate) enum TableFrameResult {
     /// Frame processing is complete, don't push back
     Done,
     /// Frame needs to be pushed back with updated state
@@ -16,7 +13,7 @@ pub enum TableFrameResult {
 }
 
 /// Stack structure for managing ParseFrames and related state
-pub struct TableParseFrameStack {
+pub(crate) struct TableParseFrameStack {
     stack: Vec<TableParseFrame>,
     /// Completed-child results, keyed by `frame_id`.
     ///
@@ -30,8 +27,8 @@ pub struct TableParseFrameStack {
     ///   `working_idx`/`matched_idx`).
     /// - `element_key`: optional per-element identity (set by OneOf, consumed by
     ///   AnyNumberOf for `max_times_per_element` accounting); `None` otherwise.
-    pub results: hashbrown::HashMap<usize, (Arc<MatchResult>, usize, Option<u64>)>,
-    pub frame_id_counter: usize,
+    pub(crate) results: hashbrown::HashMap<usize, (Arc<MatchResult>, usize, Option<u64>)>,
+    pub(crate) frame_id_counter: usize,
     // Add any additional state fields here as needed
 }
 
@@ -42,7 +39,7 @@ impl Default for TableParseFrameStack {
 }
 
 impl TableParseFrameStack {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         TableParseFrameStack {
             stack: Vec::new(),
             results: hashbrown::HashMap::new(),
@@ -50,31 +47,27 @@ impl TableParseFrameStack {
         }
     }
 
-    pub fn push(&mut self, frame: TableParseFrame) {
+    pub(crate) fn push(&mut self, frame: TableParseFrame) {
         self.stack.push(frame);
     }
 
-    pub fn pop(&mut self) -> Option<TableParseFrame> {
+    pub(crate) fn pop(&mut self) -> Option<TableParseFrame> {
         self.stack.pop()
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.stack.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
-    }
-
-    pub fn last_mut(&mut self) -> Option<&mut TableParseFrame> {
+    pub(crate) fn last_mut(&mut self) -> Option<&mut TableParseFrame> {
         self.stack.last_mut()
     }
 
-    pub fn iter(&'_ self) -> std::slice::Iter<'_, TableParseFrame> {
+    pub(crate) fn iter(&'_ self) -> std::slice::Iter<'_, TableParseFrame> {
         self.stack.iter()
     }
 
-    pub fn increment_frame_id_counter(&mut self) {
+    pub(crate) fn increment_frame_id_counter(&mut self) {
         self.frame_id_counter += 1;
     }
 
@@ -123,9 +116,8 @@ impl TableParseFrameStack {
         &mut self,
         mut parent: TableParseFrame,
         child: TableParseFrame,
-        child_index: usize,
     ) -> TableFrameResult {
-        parent.state = FrameState::WaitingForChild { child_index };
+        parent.state = FrameState::WaitingForChild;
         self.push(parent);
         self.push(child);
         self.increment_frame_id_counter();
@@ -178,7 +170,7 @@ impl TableParseFrameStack {
 
     /// Update the last_child_frame_id for the parent frame on the stack
     /// Returns true if the update succeeded, false if parent wasn't found or had wrong context type
-    pub fn update_parent_last_child_id(
+    pub(crate) fn update_parent_last_child_id(
         &mut self,
         context_type: GrammarVariant,
         child_frame_id: usize,
@@ -194,7 +186,7 @@ impl TableParseFrameStack {
     /// Push a child frame onto the stack and update parent's last_child_frame_id
     /// Also pushes the parent frame back onto the stack first (for use in WaitingForChild handlers)
     /// Returns the new frame_id_counter value
-    pub fn push_child_and_update_parent(
+    pub(crate) fn push_child_and_update_parent(
         &mut self,
         mut parent_frame: TableParseFrame,
         child_frame: TableParseFrame,
@@ -213,34 +205,9 @@ impl TableParseFrameStack {
         self.push(child_frame);
     }
 
-    /// Specialized version for Sequence that also updates current_element_idx
-    pub fn push_sequence_child_and_update_parent(
-        &mut self,
-        mut parent_frame: TableParseFrame,
-        child_frame: TableParseFrame,
-        next_element_idx: usize,
-    ) {
-        let child_id = child_frame.frame_id;
-
-        // Update parent's last_child_frame_id AND current_element_idx BEFORE pushing
-        #[cfg(feature = "verbose-debug")]
-        let parent_id = parent_frame.frame_id;
-        if let FrameContext::Sequence(state) = &mut parent_frame.context {
-            vdebug!("DEBUG: push_sequence_child_and_update_parent (table) - parent {}, child {}, setting last_child_frame_id to {}",
-                parent_id, child_id, child_id);
-            state.last_child_frame_id = Some(child_id);
-            state.current_element_idx = next_element_idx;
-        }
-
-        // Push parent and child
-        self.push(parent_frame);
-        self.increment_frame_id_counter();
-        self.push(child_frame);
-    }
-
     /// Update Sequence parent on stack and push child (for WaitingForChild state)
     /// Assumes parent is already on the stack
-    pub fn update_sequence_parent_and_push_child(
+    pub(crate) fn update_sequence_parent_and_push_child(
         &mut self,
         child_frame: TableParseFrame,
         next_element_idx: usize,
@@ -254,9 +221,7 @@ impl TableParseFrameStack {
                 state.current_element_idx = next_element_idx;
             }
             // CRITICAL: Set parent state to WaitingForChild so it knows to process child result
-            parent_frame.state = FrameState::WaitingForChild {
-                child_index: next_element_idx,
-            };
+            parent_frame.state = FrameState::WaitingForChild;
         }
 
         // Increment counter and push child
@@ -274,48 +239,48 @@ impl TableParseFrameStack {
 /// where each frame represents parsing a particular grammar element at a
 /// specific position in the token stream.
 #[derive(Debug, Clone)]
-pub struct TableParseFrame {
+pub(crate) struct TableParseFrame {
     /// Unique ID for this frame
-    pub frame_id: usize,
+    pub(crate) frame_id: usize,
     /// Table-driven grammar ID (for gradual migration to table-based parsing)
-    pub grammar_id: GrammarId,
+    pub(crate) grammar_id: GrammarId,
     /// Position in token stream
-    pub pos: usize,
+    pub(crate) pos: usize,
     /// When Some, this frame uses table-driven parsing
     /// Table-driven terminators (parallel to terminators field)
     /// SmallVec avoids heap allocation for common case of 0-4 terminators
-    pub table_terminators: SmallVec<[GrammarId; 4]>,
+    pub(crate) table_terminators: SmallVec<[GrammarId; 4]>,
     /// Current state of this frame
-    pub state: FrameState,
+    pub(crate) state: FrameState,
     /// Additional context depending on grammar type
-    pub context: FrameContext,
+    pub(crate) context: FrameContext,
     /// The ceiling inherited from the parent (simulates Python's
     /// `segments[:max_idx]` slicing): if `Some(n)`, this frame may not match
     /// past `n`. This is the *input* bound, set when the frame is created.
-    pub parent_max_idx: Option<usize>,
+    pub(crate) parent_max_idx: Option<usize>,
     /// The frame's *own* effective ceiling, computed in `Initial` from its
     /// terminators, parse mode, and `parent_max_idx` (see
     /// [`crate::parser::helpers::Parser::calculate_max_idx`]).
     /// `None` until the handler computes it. This — not `parent_max_idx` — is
     /// the authoritative bound used during matching and as part of the cache
     /// key, so cache checks and stores stay consistent.
-    pub calculated_max_idx: Option<usize>,
+    pub(crate) calculated_max_idx: Option<usize>,
     /// Where this frame's match ended, set when transitioning to `Complete`.
     /// Authoritative result extent; mirrored into the `results` map's `end_pos`.
-    pub end_pos: Option<usize>,
+    pub(crate) end_pos: Option<usize>,
     /// Element key for this match (used by AnyNumberOf to track per-element counts)
     /// Set by OneOf when storing its result, propagated to parent via results map
-    pub element_key: Option<u64>,
+    pub(crate) element_key: Option<u64>,
     /// Parse mode override for this frame. When Some, this overrides the grammar's native parse_mode.
     /// Used by Bracketed to force content to use GREEDY mode when the Bracketed itself is GREEDY.
     /// This matches Python behavior where Bracketed(parse_mode=GREEDY) inherits from Sequence
     /// and passes its parse_mode to all content elements.
-    pub parse_mode_override: Option<ParseMode>,
+    pub(crate) parse_mode_override: Option<ParseMode>,
 }
 
 impl TableParseFrame {
     /// Create a new table-driven child frame
-    pub fn new_child(
+    pub(crate) fn new_child(
         frame_id: usize,
         grammar_id: GrammarId,
         pos: usize,

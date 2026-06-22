@@ -172,7 +172,7 @@ impl Parser<'_> {
         });
 
         // Push child to match element(s).
-        Ok(stack.push_child_and_wait(frame, child_frame, 0))
+        Ok(stack.push_child_and_wait(frame, child_frame))
     }
 
     /// Handle Delimited WaitingForChild state using table-driven approach
@@ -375,7 +375,7 @@ impl Parser<'_> {
             None, // Don't constrain delimiter by max_idx
         );
 
-        frame.state = FrameState::WaitingForChild { child_index: 0 };
+        frame.state = FrameState::WaitingForChild;
 
         stack.push_child_and_update_parent(frame, delimiter_frame, GrammarVariant::Delimited);
         Ok(TableFrameResult::Done)
@@ -435,7 +435,7 @@ impl Parser<'_> {
                     Some(current_max_idx),
                 );
 
-                frame.state = FrameState::WaitingForChild { child_index: 0 };
+                frame.state = FrameState::WaitingForChild;
 
                 stack.push_child_and_update_parent(frame, element_frame, GrammarVariant::Delimited);
                 return Ok(TableFrameResult::Done);
@@ -623,7 +623,7 @@ impl Parser<'_> {
             Some(*max_idx), // Use recalculated max_idx
         );
 
-        frame.state = FrameState::WaitingForChild { child_index: 0 };
+        frame.state = FrameState::WaitingForChild;
 
         stack.push_child_and_update_parent(frame, element_frame, GrammarVariant::Delimited);
         Ok(TableFrameResult::Done)
