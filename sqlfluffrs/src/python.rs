@@ -41,5 +41,9 @@ fn sqlfluffrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::engine_entry::engine_render_string,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::engine_entry::engine_parse_to_tree,
+        m
+    )?)?;
     Ok(())
 }
