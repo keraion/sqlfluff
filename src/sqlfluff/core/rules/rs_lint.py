@@ -154,20 +154,30 @@ class RsSegment:
     ``RawSegment`` for fix construction, but the arena itself is never mutated.
     """
 
-    __slots__ = ("_h", "_segments", "__weakref__")
+    # `_uid` caches the node uuid (fetched once for interning) so __hash__/uuid
+    # avoid an FFI call; `_ct` caches class_types (an interned wrapper is stable,
+    # so the arena node's type set never changes under it) so is_type/class_types
+    # become Python set operations instead of per-call FFI — the hot path in
+    # rule crawling.
+    __slots__ = ("_h", "_uid", "_segments", "_ct", "__weakref__")
     _h: Any
+    _uid: int
     _segments: Optional[tuple["RsSegment", ...]]
+    _ct: Optional[frozenset[str]]
 
     def __new__(cls, handle: Any) -> "RsSegment":
         # Intern by node uuid so the same node returns the same object (identity
         # stability). Field init happens here, not __init__, because __init__
         # still runs when __new__ returns a cached instance.
-        obj = _INTERN.get(handle.uuid)
+        uid = handle.uuid
+        obj = _INTERN.get(uid)
         if obj is None:
             obj = object.__new__(cls)
             obj._h = handle
+            obj._uid = uid
             obj._segments = None
-            _INTERN[handle.uuid] = obj
+            obj._ct = None
+            _INTERN[uid] = obj
         return obj
 
     def __init__(self, handle: Any) -> None:
@@ -176,14 +186,18 @@ class RsSegment:
 
     # -- identity ------------------------------------------------------------
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, RsSegment) and self._h == other._h
+        # Interning makes same-node wrappers identical; uuid compare covers the
+        # rare case where a wrapper was GC'd and re-created for the same node.
+        return self is other or (
+            isinstance(other, RsSegment) and self._uid == other._uid
+        )
 
     def __hash__(self) -> int:
-        return hash(self._h)
+        return self._uid
 
     @property
     def uuid(self) -> int:
-        return self._h.uuid
+        return self._uid
 
     # -- payload -------------------------------------------------------------
     @property
@@ -273,11 +287,21 @@ class RsSegment:
         return self._h.type
 
     def is_type(self, *seg_type: str) -> bool:
-        return self._h.is_type(list(seg_type))
+        # Membership in cached class_types — verified equivalent to the arena's
+        # is_type (class_types already includes the structural hierarchy).
+        ct = self._ct
+        if ct is None:
+            ct = self._ct = frozenset(self._h.class_types())
+        if len(seg_type) == 1:  # hot path — most callers pass one type
+            return seg_type[0] in ct
+        return not ct.isdisjoint(seg_type)
 
     @property
     def class_types(self) -> frozenset[str]:
-        return frozenset(self._h.class_types())
+        ct = self._ct
+        if ct is None:
+            ct = self._ct = frozenset(self._h.class_types())
+        return ct
 
     @property
     def instance_types(self) -> tuple[str, ...]:
