@@ -231,6 +231,26 @@ class RsSegment:
         return frozenset(self._h.descendant_type_set())
 
     @property
+    def direct_descendant_type_set(self) -> set[str]:
+        # Union of the class_types of the *direct* children (BaseSegment parity).
+        result: set[str] = set()
+        for seg in self.segments:
+            result.update(seg.class_types)
+        return result
+
+    @property
+    def can_start_end_non_code(self) -> bool:
+        # Class attribute in BaseSegment; only FileSegment + UnparsableSegment
+        # set it True.
+        return self.is_type("file", "unparsable")
+
+    @property
+    def source_fixes(self) -> list[Any]:
+        # Arena nodes come straight from a parse and carry no prior source fixes
+        # (matches a freshly-parsed native segment's empty list).
+        return []
+
+    @property
     def is_code(self) -> bool:
         return self._h.is_code
 
