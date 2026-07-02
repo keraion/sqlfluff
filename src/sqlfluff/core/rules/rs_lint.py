@@ -180,9 +180,9 @@ class RsSegment:
             _INTERN[uid] = obj
         return obj
 
-    def __init__(self, handle: Any) -> None:
-        # No-op: see __new__ (must not clobber a cached instance's state).
-        pass
+    # No __init__: all state is set in __new__. Defining a no-op __init__ would
+    # add a Python-frame dispatch to every wrapper creation (the hot path); with
+    # __new__ overridden and no __init__, object.__init__ ignores the argument.
 
     # -- identity ------------------------------------------------------------
     def __eq__(self, other: object) -> bool:
