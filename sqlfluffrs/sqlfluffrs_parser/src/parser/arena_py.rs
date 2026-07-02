@@ -51,9 +51,11 @@ impl PyTree {
     }
 
     fn handle(&self, node: NodeId) -> PyHandle {
+        let uuid = self.inner.lock().unwrap().uuid(node);
         PyHandle {
             inner: self.inner.clone(),
             node,
+            uuid,
         }
     }
 }
@@ -90,18 +92,31 @@ impl PyTree {
 pub struct PyHandle {
     inner: ArenaRef,
     node: NodeId,
+    // Cached node uuid so uuid()/__hash__/__eq__ (very hot during rule crawling)
+    // are field reads, not per-call arena locks. Populated once at handle
+    // creation; wrap_many amortizes the lock over a whole navigation result.
+    uuid: u128,
 }
 
 impl PyHandle {
     fn wrap(&self, node: NodeId) -> PyHandle {
+        let uuid = self.inner.lock().unwrap().uuid(node);
         PyHandle {
             inner: self.inner.clone(),
             node,
+            uuid,
         }
     }
 
     fn wrap_many(&self, ids: Vec<NodeId>) -> Vec<PyHandle> {
-        ids.into_iter().map(|n| self.wrap(n)).collect()
+        let arena = self.inner.lock().unwrap();
+        ids.into_iter()
+            .map(|n| PyHandle {
+                inner: self.inner.clone(),
+                node: n,
+                uuid: arena.uuid(n),
+            })
+            .collect()
     }
 }
 
@@ -111,24 +126,18 @@ impl PyHandle {
 
     #[getter]
     fn uuid(&self) -> u128 {
-        self.inner.lock().unwrap().uuid(self.node)
+        self.uuid
     }
 
     fn __eq__(&self, other: &PyHandle) -> bool {
-        // Same arena + same uuid.  (Handles into different arenas are never
-        // equal even if uuids collided, which they don't in practice.)
-        // Lock once: `Mutex` is not re-entrant, so comparing two handles into
-        // the same arena must not take the lock twice.
-        if !Arc::ptr_eq(&self.inner, &other.inner) {
-            return false;
-        }
-        let arena = self.inner.lock().unwrap();
-        arena.uuid(self.node) == arena.uuid(other.node)
+        // Same arena + same (cached) uuid. Handles into different arenas are
+        // never equal even if uuids collided, which they don't in practice.
+        Arc::ptr_eq(&self.inner, &other.inner) && self.uuid == other.uuid
     }
 
     fn __hash__(&self) -> u64 {
-        // Lower 64 bits of the uuid; matches the façade's `__hash__`.
-        self.inner.lock().unwrap().uuid(self.node) as u64
+        // Lower 64 bits of the (cached) uuid; matches the façade's `__hash__`.
+        self.uuid as u64
     }
 
     // -- payload -------------------------------------------------------------
