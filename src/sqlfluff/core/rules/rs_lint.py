@@ -770,6 +770,23 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
             edits.append((sl.start, sl.stop, "", 2))
         else:
             return None
+    # Native applies fixes to the tree hierarchically: deleting a parent segment
+    # removes its children too. In source coordinates a `delete` range therefore
+    # subsumes any nested edit — e.g. AL07 deletes an `alias_expression` while
+    # also "replacing" the alias identifier inside it. Drop non-delete edits
+    # fully contained in a delete's range so they don't conflict / double-apply.
+    delete_ranges = [(a, b) for (a, b, r, _rk) in edits if b > a and r == ""]
+    if delete_ranges:
+        edits = [
+            e
+            for e in edits
+            if (e[2] == "" and e[1] > e[0])  # keep the deletes themselves
+            or e[1] == e[0]  # keep zero-width inserts (create_before/after)
+            or not any(
+                da <= e[0] and e[1] <= db and (da, db) != (e[0], e[1])
+                for (da, db) in delete_ranges
+            )
+        ]
     # Reconstruct left-to-right in ORIGINAL coordinates (a naive per-edit
     # ``out[:start] + repl + out[stop:]`` shifts later edits' positions and
     # corrupts adjacent edits at the same offset).
