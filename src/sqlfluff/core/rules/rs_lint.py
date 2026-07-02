@@ -751,13 +751,16 @@ def facade_violations(
         return None
     dialect_obj = config.get("dialect_obj")
     root = RsSegment(rst.root)
+    # The engine's TemplatedFile — required by rules that read raw_slices /
+    # source_str (e.g. CV10) and for correct source-position mapping.
+    templated_file = rst.templated_file
     out: list[Any] = []
     for rule in rules:
         lints, _, _, _ = rule.crawl(
             tree=root,
             dialect=dialect_obj,
             fix=False,
-            templated_file=None,
+            templated_file=templated_file,
             ignore_mask=None,
             fname=fname,
             config=config,
@@ -808,7 +811,7 @@ def facade_fix_loop(
                     tree=RsSegment(rst.root),
                     dialect=dialect_obj,
                     fix=True,
-                    templated_file=None,
+                    templated_file=rst.templated_file,
                     ignore_mask=None,
                     fname=fname,
                     config=config,
