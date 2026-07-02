@@ -244,7 +244,9 @@ def get_aliases_from_select(
     if not fc:
         # If there's no from clause then just abort.
         return None, None
-    assert isinstance(fc, (FromClauseSegment, JoinClauseSegment))
+    # Duck-type-safe check: works for both a native ``BaseSegment`` and the
+    # Rust-arena ``RsSegment`` façade (which is not an instance of these classes).
+    assert fc.is_type(FromClauseSegment.type, JoinClauseSegment.type)
     dialect_name = dialect.name if dialect else None
     aliases = get_from_clause_aliases(fc, dialect_name)
 
