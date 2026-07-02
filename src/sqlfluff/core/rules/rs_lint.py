@@ -405,9 +405,16 @@ class RsSegment:
     def iter_segments(
         self, expanding: Any = None, pass_through: bool = False
     ) -> Iterator["RsSegment"]:
-        # Minimal: yield direct children (no meta-expansion), sufficient for the
-        # rules currently covered.
-        return iter(self.segments)
+        # Faithful port of BaseSegment.iter_segments: expand children whose type
+        # is in `expanding` (e.g. recurse into bracketed to reach a nested
+        # SELECT), carrying `expanding` deeper only when pass_through is set.
+        for s in self.segments:
+            if expanding and s.is_type(*expanding):
+                yield from s.iter_segments(
+                    expanding=expanding if pass_through else None
+                )
+            else:
+                yield s
 
     # -- fix support ---------------------------------------------------------
     def edit(self, raw: Optional[str] = None, source_fixes: Any = None) -> Any:
