@@ -186,6 +186,13 @@ class RsSegment:
         # A ``TemplateSegment`` (placeholder) attribute; ``None`` otherwise.
         return self._h.block_type()
 
+    @property
+    def block_uuid(self) -> Optional[int]:
+        # A ``TemplateSegment`` (placeholder) attribute used by reflow reindent
+        # to group template-block indents.  Native stores a ``uuid.UUID``; the
+        # arena exposes it as an int (hashable + truthy), ``None`` otherwise.
+        return self._h.block_uuid()
+
     def normalize(self, value: Optional[str] = None) -> str:
         # Mirrors ``RawSegment.normalize`` (parser/segments/raw.py): quote-strip
         # via ``quoted_value`` then apply ``escape_replacements``.
@@ -565,15 +572,34 @@ class RsSegment:
             )
         return new_segment
 
-    def edit(self, raw: Optional[str] = None, source_fixes: Any = None) -> Any:
-        """Return a real ``RawSegment`` for a fix's replacement text.
+    def edit(
+        self,
+        raw: Optional[str] = None,
+        source_fixes: Any = None,
+        source_str: Optional[str] = None,
+    ) -> Any:
+        """Return a real segment for a fix's replacement text.
 
         The arena is not mutated; the returned segment only carries the new raw
-        + this node's position, which is all the source-patch fixer needs.
+        (or, for a placeholder edit, the new source_str) + this node's position,
+        which is all the source-patch fixer needs. Mirrors ``RawSegment.edit`` and
+        ``TemplateSegment.edit``: when ``source_str`` is given we're editing a
+        template placeholder, so return a ``TemplateSegment``.
         """
         from sqlfluff.core.parser import RawSegment
 
-        return RawSegment(raw=raw, pos_marker=self.pos_marker)
+        if source_str is not None:
+            from sqlfluff.core.parser.segments.meta import TemplateSegment
+
+            return TemplateSegment(
+                pos_marker=self.pos_marker,
+                source_str=source_str,
+                block_type=self.block_type or "",
+                source_fixes=source_fixes,
+            )
+        return RawSegment(
+            raw=raw, pos_marker=self.pos_marker, source_fixes=source_fixes
+        )
 
     def __getattr__(self, name: str) -> Any:
         # Only fires for BaseSegment API the façade doesn't implement yet. Raising
