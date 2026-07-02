@@ -287,6 +287,26 @@ class RsSegment:
     def get_raw_segments(self) -> list[RsSegment]:
         return self.raw_segments
 
+    def select_children(
+        self,
+        start_seg: Optional["RsSegment"] = None,
+        stop_seg: Optional["RsSegment"] = None,
+        select_if: Any = None,
+        loop_while: Any = None,
+    ) -> list[RsSegment]:
+        # Port of BaseSegment.select_children; index() relies on __eq__ (uuid)
+        # + interning, so start/stop segments match by node identity.
+        segs = self.segments
+        start_index = segs.index(start_seg) if start_seg else -1
+        stop_index = segs.index(stop_seg) if stop_seg else len(segs)
+        buff = []
+        for seg in segs[start_index + 1 : stop_index]:
+            if loop_while and not loop_while(seg):
+                break
+            if not select_if or select_if(seg):
+                buff.append(seg)
+        return buff
+
     @property
     def raw_segments_with_ancestors(
         self,
