@@ -550,11 +550,13 @@ impl<'a> Parser<'a> {
                 if let Some(grammar_tc) = grammar_trim_chars {
                     segment_kwargs.trim_chars = Some(grammar_tc);
                 }
+                let class_type = self.dialect.get_segment_type(raw_class).map(Cow::Borrowed);
                 let result = MatchResult {
                     matched_slice: token_pos..token_pos + 1,
                     matched_class: Some(MatchedClass {
                         class_name: Cow::Borrowed(raw_class),
                         segment_type: Some(Cow::Borrowed(token_type)),
+                        class_type,
                         segment_kwargs,
                     }),
                     ..Default::default()
@@ -779,6 +781,7 @@ impl<'a> Parser<'a> {
                     matched_class: Some(MatchedClass {
                         class_name: Cow::Borrowed(raw_class),
                         segment_type: Some(Cow::Owned(effective_segment_type.clone())),
+                        class_type: class_type.map(Cow::Borrowed),
                         segment_kwargs,
                     }),
                     ..Default::default()
@@ -937,11 +940,13 @@ impl<'a> Parser<'a> {
                 if let Some(grammar_tc) = grammar_trim_chars {
                     segment_kwargs.trim_chars = Some(grammar_tc);
                 }
+                let class_type = self.dialect.get_segment_type(raw_class).map(Cow::Borrowed);
                 let result = MatchResult {
                     matched_slice: token_pos..token_pos + 1,
                     matched_class: Some(MatchedClass {
                         class_name: Cow::Borrowed(raw_class),
                         segment_type: Some(Cow::Borrowed(token_type)),
+                        class_type,
                         segment_kwargs,
                     }),
                     ..Default::default()
@@ -1236,11 +1241,13 @@ impl<'a> Parser<'a> {
                     if let Some(grammar_tc) = grammar_trim_chars {
                         segment_kwargs.trim_chars = Some(grammar_tc);
                     }
+                    let class_type = self.dialect.get_segment_type(&raw_class).map(Cow::Borrowed);
                     let result = MatchResult {
                         matched_slice: token_pos..token_pos + 1,
                         matched_class: Some(MatchedClass {
                             class_name: Cow::Owned(raw_class.clone()),
                             segment_type: Some(Cow::Owned(token_type.clone())),
+                            class_type,
                             segment_kwargs,
                         }),
                         ..Default::default()
@@ -1640,6 +1647,9 @@ impl<'a> Parser<'a> {
             matched_class: Some(MatchedClass {
                 class_name: Cow::Borrowed("SymbolSegment"),
                 segment_type: Some(Cow::Borrowed(start_bracket_type)),
+                // SymbolSegment's class-level type; the instance override is the
+                // bracket kind (e.g. `start_square_bracket`).
+                class_type: Some(Cow::Borrowed("symbol")),
                 segment_kwargs: SegmentKwargs {
                     instance_types: Some(vec![start_bracket_type.to_string()]),
                     ..Default::default()
@@ -1691,6 +1701,9 @@ impl<'a> Parser<'a> {
             matched_class: Some(MatchedClass {
                 class_name: Cow::Borrowed("SymbolSegment"),
                 segment_type: Some(Cow::Borrowed(end_bracket_type)),
+                // SymbolSegment's class-level type; the instance override is the
+                // bracket kind (e.g. `end_square_bracket`).
+                class_type: Some(Cow::Borrowed("symbol")),
                 segment_kwargs: SegmentKwargs {
                     instance_types: Some(vec![end_bracket_type.to_string()]),
                     ..Default::default()

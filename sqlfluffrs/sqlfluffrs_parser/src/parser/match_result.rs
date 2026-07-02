@@ -62,6 +62,14 @@ impl Default for SegmentKwargs {
 pub struct MatchedClass {
     pub class_name: Cow<'static, str>,
     pub segment_type: Option<Cow<'static, str>>,
+    /// Class-level type of the matched segment class (mirrors native
+    /// ``BaseSegment.type`` — the concrete class's ``type`` attr), as opposed to
+    /// ``segment_type`` which holds the per-instance override (``get_type()``).
+    /// Only meaningful for the base-parser single-token raw path where an
+    /// instance override makes the two differ (e.g. class ``symbol`` vs. the
+    /// ``star`` instance).  ``None`` means "unknown" — callers fall back to
+    /// ``segment_type``.
+    pub class_type: Option<Cow<'static, str>>,
     pub segment_kwargs: SegmentKwargs,
 }
 
@@ -70,6 +78,7 @@ impl MatchedClass {
         MatchedClass {
             class_name: Cow::Borrowed("Root"),
             segment_type: Some(Cow::Borrowed("file")),
+            class_type: Some(Cow::Borrowed("file")),
             segment_kwargs: SegmentKwargs {
                 class_types: Some(vec!["base".to_string(), "file".to_string()]),
                 ..Default::default()
@@ -81,6 +90,7 @@ impl MatchedClass {
         MatchedClass {
             class_name: Cow::Borrowed("UnparsableSegment"),
             segment_type: Some(Cow::Borrowed("unparsable")),
+            class_type: Some(Cow::Borrowed("unparsable")),
             segment_kwargs: SegmentKwargs {
                 parse_error: Some((message.to_string(), error_pos)),
                 class_types: Some(vec!["base".to_string(), "unparsable".to_string()]),
@@ -243,6 +253,7 @@ impl MatchResult {
             Some(MatchedClass {
                 class_name: Cow::Borrowed("BracketedSegment"),
                 segment_type: Some(Cow::Borrowed("bracketed")),
+                class_type: Some(Cow::Borrowed("bracketed")),
                 segment_kwargs: SegmentKwargs {
                     class_types: Some(vec!["base".to_string(), "bracketed".to_string()]),
                     ..Default::default()
@@ -594,6 +605,18 @@ impl MatchResult {
                         .or_else(|| instance_types.first().map(|s| Cow::Owned(s.clone())))
                         .unwrap_or(Cow::Borrowed("raw"));
 
+                    // Class-level type of the matched segment class (native
+                    // `.type`).  `segment_type`/`effective_segment_type` above is
+                    // the per-instance override (`get_type()`); when a parser
+                    // assigns an instance type (e.g. `star`) the class type
+                    // (`symbol`) differs and is carried on `match_class.class_type`
+                    // (resolved from the raw_class name in `core.rs`).  Fall back
+                    // to the instance type when unknown.
+                    let effective_class_type: Cow<'static, str> = match_class
+                        .class_type
+                        .clone()
+                        .unwrap_or_else(|| effective_segment_type.clone());
+
                     let raw_class_ct = match_class.segment_kwargs.class_types.unwrap_or_default();
 
                     let quoted_value =
@@ -615,6 +638,7 @@ impl MatchResult {
                     return vec![Node::new_raw_with_class_types(
                         match_class.class_name,
                         effective_segment_type,
+                        effective_class_type,
                         raw,
                         pos_marker,
                         instance_types,
@@ -667,9 +691,14 @@ impl MatchResult {
                         .segment_type
                         .clone()
                         .unwrap_or(Cow::Borrowed("raw"));
+                    // RawSegment-subclass collapse (e.g. `DivBinaryOperatorSegment`)
+                    // carries no instance override (instance_types is empty below),
+                    // so the class-level type equals `segment_type`.
+                    let class_type = segment_type.clone();
                     return vec![Node::Raw {
                         segment_class: match_class.class_name,
                         segment_type,
+                        class_type,
                         raw,
                         pos_marker,
                         // Mirror Python: a freshly-built RawSegment subclass has no
@@ -897,6 +926,10 @@ fn token_to_node(tok: &Token) -> Node {
         Node::new_raw_with_class_types(
             tok.class_name.clone(),
             segment_type,
+            // The lexer token's `token_type` is the class-level type (e.g.
+            // "comment"/"literal"/"symbol"), while `instance_types` carries the
+            // per-instance override.  A gap-filled leaf keeps its lexer class.
+            tok.token_type.clone(),
             tok.raw().to_owned(),
             tok.pos_marker.clone(),
             tok.instance_types.clone(),
