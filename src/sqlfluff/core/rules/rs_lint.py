@@ -717,7 +717,12 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
     (templated) region or an unsupported edit type — signalling the caller to
     leave those to the Python path.
     """
-    edits: list[tuple[int, int, str]] = []
+    # (start, stop, repl, rank). `rank` breaks ties between edits at the SAME
+    # start offset, matching the order native reconstructs from the tree:
+    # create_after (0) attaches to the segment ending at the offset, so it comes
+    # before create_before (1, attaches to the segment starting there), which
+    # comes before replace/delete (2, modifies the segment starting there).
+    edits: list[tuple[int, int, str, int]] = []
     for fx in fixes:
         pm = fx.anchor.pos_marker
         if pm is None:
@@ -747,28 +752,38 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
             if src_fixes:
                 for sfx in src_fixes:
                     ssl = sfx.source_slice
-                    edits.append((ssl.start, ssl.stop, sfx.edit))
+                    edits.append((ssl.start, ssl.stop, sfx.edit, 2))
             elif et == "create_before":
-                edits.append((sl.start, sl.start, repl))
+                edits.append((sl.start, sl.start, repl, 1))
             elif et == "create_after":
-                edits.append((sl.stop, sl.stop, repl))
+                edits.append((sl.stop, sl.stop, repl, 0))
             else:
                 return None
             continue
         if et == "replace":
-            edits.append((sl.start, sl.stop, repl))
+            edits.append((sl.start, sl.stop, repl, 2))
         elif et == "create_before":
-            edits.append((sl.start, sl.start, repl))
+            edits.append((sl.start, sl.start, repl, 1))
         elif et == "create_after":
-            edits.append((sl.stop, sl.stop, repl))
+            edits.append((sl.stop, sl.stop, repl, 0))
         elif et == "delete":
-            edits.append((sl.start, sl.stop, ""))
+            edits.append((sl.start, sl.stop, "", 2))
         else:
             return None
-    out = source
-    for start, stop, repl in sorted(edits, key=lambda t: t[0], reverse=True):
-        out = out[:start] + repl + out[stop:]
-    return out
+    # Reconstruct left-to-right in ORIGINAL coordinates (a naive per-edit
+    # ``out[:start] + repl + out[stop:]`` shifts later edits' positions and
+    # corrupts adjacent edits at the same offset).
+    edits.sort(key=lambda e: (e[0], e[3], e[1]))
+    out_parts: list[str] = []
+    pos = 0
+    for start, stop, repl, _rank in edits:
+        if start < pos:  # genuinely overlapping edits — can't apply safely
+            return None
+        out_parts.append(source[pos:start])
+        out_parts.append(repl)
+        pos = stop
+    out_parts.append(source[pos:])
+    return "".join(out_parts)
 
 
 def facade_violations(
