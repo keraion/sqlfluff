@@ -767,6 +767,50 @@ impl Arena {
         }
         steps
     }
+
+    /// Bulk equivalent of `path_to(root, leaf)` for every leaf under `root`, in a
+    /// single DFS (O(n) total) instead of O(leaves * depth) separate walks. Each
+    /// returned entry is `(leaf, path_from_root_to_leaf)`, where the path matches
+    /// `path_to(root, leaf)` exactly. This is the reflow hot path
+    /// (`raw_segments_with_ancestors` / `DepthMap`).
+    pub(crate) fn raw_segments_with_ancestors(&self, root: NodeId) -> Vec<(NodeId, Vec<PathStep>)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<PathStep> = Vec::new();
+        self.rwa_dfs(root, &mut stack, &mut out);
+        out
+    }
+
+    fn rwa_dfs(
+        &self,
+        node: NodeId,
+        stack: &mut Vec<PathStep>,
+        out: &mut Vec<(NodeId, Vec<PathStep>)>,
+    ) {
+        let kids: Vec<NodeId> = self.children(node).to_vec();
+        if kids.is_empty() {
+            out.push((node, stack.clone()));
+            return;
+        }
+        // Same PathStep shape as path_to: the ancestor `node`, the descended
+        // child index, the child count, and the code-child indices of `node`.
+        let code_idxs: Vec<usize> = kids
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| self.is_code(s))
+            .map(|(i, _)| i)
+            .collect();
+        let len = kids.len();
+        for (i, &child) in kids.iter().enumerate() {
+            stack.push(PathStep {
+                node,
+                idx: i,
+                len,
+                code_idxs: code_idxs.clone(),
+            });
+            self.rwa_dfs(child, stack, out);
+            stack.pop();
+        }
+    }
 }
 
 fn meta_type_str(meta_type: &MetaType) -> &'static str {

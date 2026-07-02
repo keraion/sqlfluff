@@ -159,11 +159,12 @@ class RsSegment:
     # so the arena node's type set never changes under it) so is_type/class_types
     # become Python set operations instead of per-call FFI — the hot path in
     # rule crawling.
-    __slots__ = ("_h", "_uid", "_segments", "_ct", "__weakref__")
+    __slots__ = ("_h", "_uid", "_segments", "_ct", "_rwa", "__weakref__")
     _h: Any
     _uid: int
     _segments: Optional[tuple["RsSegment", ...]]
     _ct: Optional[frozenset[str]]
+    _rwa: Optional[list[tuple["RsSegment", list[Any]]]]
 
     def __new__(cls, handle: Any) -> "RsSegment":
         # Intern by node uuid so the same node returns the same object (identity
@@ -177,6 +178,7 @@ class RsSegment:
             obj._uid = uid
             obj._segments = None
             obj._ct = None
+            obj._rwa = None
             _INTERN[uid] = obj
         return obj
 
@@ -412,10 +414,26 @@ class RsSegment:
     def raw_segments_with_ancestors(
         self,
     ) -> list[tuple[RsSegment, list[Any]]]:
-        out: list[tuple[RsSegment, list[Any]]] = []
-        for leaf_h in self._h.raw_segments():
-            leaf = RsSegment(leaf_h)
-            out.append((leaf, self.path_to(leaf)))
+        # Reflow hot path (DepthMap). Use the bulk arena traversal — one FFI call
+        # returning every leaf with its full path — instead of a path_to() FFI per
+        # leaf, and cache it (the arena is immutable, so successive reflow rules on
+        # the same root reuse it).
+        cached = self._rwa
+        if cached is not None:
+            return cached
+        from sqlfluff.core.parser.segments.base import PathStep
+
+        out: list[tuple[RsSegment, list[Any]]] = [
+            (
+                RsSegment(leaf_h),
+                [
+                    PathStep(RsSegment(h), idx, ln, tuple(cidx))  # type: ignore[arg-type]
+                    for (h, idx, ln, cidx) in steps
+                ],
+            )
+            for (leaf_h, steps) in self._h.raw_segments_with_ancestors()
+        ]
+        self._rwa = out
         return out
 
     def get_parent(self) -> Optional[tuple[RsSegment, int]]:

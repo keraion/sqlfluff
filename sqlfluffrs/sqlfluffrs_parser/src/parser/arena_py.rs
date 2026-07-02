@@ -349,6 +349,43 @@ impl PyHandle {
             .collect()
     }
 
+    /// Bulk `(leaf, path_from_here_to_leaf)` for every leaf under this node, in
+    /// one arena traversal + one lock — the reflow hot path. Replaces per-leaf
+    /// `path_to` calls (each an FFI round-trip) with a single call.
+    #[allow(clippy::type_complexity)]
+    fn raw_segments_with_ancestors(
+        &self,
+    ) -> Vec<(PyHandle, Vec<(PyHandle, usize, usize, Vec<usize>)>)> {
+        let arena = self.inner.lock().unwrap();
+        arena
+            .raw_segments_with_ancestors(self.node)
+            .into_iter()
+            .map(|(leaf, steps)| {
+                let leaf_h = PyHandle {
+                    inner: self.inner.clone(),
+                    node: leaf,
+                    uuid: arena.uuid(leaf),
+                };
+                let steps_out = steps
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            PyHandle {
+                                inner: self.inner.clone(),
+                                node: s.node,
+                                uuid: arena.uuid(s.node),
+                            },
+                            s.idx,
+                            s.len,
+                            s.code_idxs,
+                        )
+                    })
+                    .collect();
+                (leaf_h, steps_out)
+            })
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         let a = self.inner.lock().unwrap();
         format!(
