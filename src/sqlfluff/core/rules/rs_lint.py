@@ -715,25 +715,35 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
     for fx in fixes:
         pm = fx.anchor.pos_marker
         lit = pm.is_literal
+        sl = pm.source_slice
+        repl = "".join(e.raw for e in (fx.edit or []))
+        et = fx.edit_type
         if not (lit() if callable(lit) else lit):
-            # Templated (non-literal) region: the source change is described by
-            # the edit segments' `source_fixes` (SourceFix(edit, source_slice,
-            # …)) — e.g. JJ01 reformatting a `{% %}`/`{{ }}` tag. Apply those.
-            # (Bail if there are none, so the caller falls back to Python.)
+            # Templated (non-literal) anchor. Two safe cases:
+            # 1. The edit segments carry `source_fixes` (SourceFix(edit,
+            #    source_slice, …)) describing the exact source rewrite of a
+            #    `{% %}`/`{{ }}` tag (e.g. JJ01) — apply those.
+            # 2. A create_before/create_after inserts at the source *boundary*
+            #    (before/after the templated region) without touching the
+            #    template itself (e.g. LT12 appending a trailing newline).
+            # A replace/delete on templated content without source_fixes would
+            # corrupt the template → bail so the caller falls back to Python.
             src_fixes = [
                 sfx
                 for e in (fx.edit or [])
                 for sfx in (getattr(e, "source_fixes", None) or [])
             ]
-            if not src_fixes:
+            if src_fixes:
+                for sfx in src_fixes:
+                    ssl = sfx.source_slice
+                    edits.append((ssl.start, ssl.stop, sfx.edit))
+            elif et == "create_before":
+                edits.append((sl.start, sl.start, repl))
+            elif et == "create_after":
+                edits.append((sl.stop, sl.stop, repl))
+            else:
                 return None
-            for sfx in src_fixes:
-                ssl = sfx.source_slice
-                edits.append((ssl.start, ssl.stop, sfx.edit))
             continue
-        sl = pm.source_slice
-        repl = "".join(e.raw for e in (fx.edit or []))
-        et = fx.edit_type
         if et == "replace":
             edits.append((sl.start, sl.stop, repl))
         elif et == "create_before":
