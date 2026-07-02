@@ -127,10 +127,23 @@ def _synth_segment_class(
         # The SegmentMetaclass recomputes ``_class_types`` from the base hierarchy
         # on class creation, so we override it *after* creation to force an exact
         # match with the arena node's class_types.
-        cls = type(name, (base,), {"type": seg_type})
+        # Include the handful of *dialect* segment methods that rules call on
+        # copied segments (which are these synthetic classes, not the concrete
+        # dialect class): CTEDefinitionSegment.get_identifier (used by ST05 on a
+        # cloned CTE). These are navigation-only so they work on any real segment.
+        cls = type(
+            name,
+            (base,),
+            {"type": seg_type, "get_identifier": _synth_get_identifier},
+        )
         cls._class_types = class_types  # type: ignore[attr-defined]
         _SYNTH_CLASSES[key] = cls
     return cls
+
+
+def _synth_get_identifier(self: Any) -> Any:
+    """Port of CTEDefinitionSegment.get_identifier for materialised copies."""
+    return self.get_child("identifier")
 
 
 class RsSegment:
