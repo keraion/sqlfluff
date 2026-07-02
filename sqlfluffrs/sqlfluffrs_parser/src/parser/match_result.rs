@@ -630,6 +630,58 @@ impl MatchResult {
                 }
             }
 
+            // PYTHON PARITY: RawSegment-subclass "containers" collapse to a single
+            // raw. In pure-Python a segment class deriving from RawSegment (e.g.
+            // sparksql's `DivBinaryOperatorSegment`, whose `match_grammar` is a
+            // bare `Ref.keyword("DIV")`) builds its node via
+            // `RawSegment.from_result_segments`, which asserts exactly one child
+            // and folds it into a single raw segment carrying the OUTER class's
+            // identity — not a `binary_operator` container wrapping a `keyword`.
+            // Rust's `apply` would otherwise build a `Node::Segment` below,
+            // leaving an extra keyword child the native / pure-Python trees lack
+            // (double-reporting in CP01 over the façade).
+            //
+            // We detect a raw-class the same way `Node::to_tuple` already does —
+            // `"raw"` present in the codegen `class_types` (genuine containers such
+            // as `ColumnIndexSegment` lack it) — and only collapse when the match
+            // folds to exactly one raw child, mirroring the `from_result_segments`
+            // `len == 1` assert. This keeps YAML parity identical (to_tuple's own
+            // collapse simply becomes a no-op on the already-raw node).
+            if !match_class.is_unparsable()
+                && result_nodes.len() == 1
+                && matches!(result_nodes.first(), Some(Node::Raw { .. }))
+                && match_class
+                    .segment_kwargs
+                    .class_types
+                    .as_ref()
+                    .is_some_and(|ct| ct.iter().any(|t| t == "raw"))
+            {
+                if let Some(Node::Raw {
+                    raw,
+                    pos_marker,
+                    segment_kwargs,
+                    ..
+                }) = result_nodes.pop()
+                {
+                    let segment_type = match_class
+                        .segment_type
+                        .clone()
+                        .unwrap_or(Cow::Borrowed("raw"));
+                    return vec![Node::Raw {
+                        segment_class: match_class.class_name,
+                        segment_type,
+                        raw,
+                        pos_marker,
+                        // Mirror Python: a freshly-built RawSegment subclass has no
+                        // instance_types (they come from base parsers, not Refs),
+                        // so get_type() falls back to the class's segment_type.
+                        instance_types: vec![],
+                        class_types: match_class.segment_kwargs.class_types.unwrap_or_default(),
+                        segment_kwargs,
+                    }];
+                }
+            }
+
             // Position marker spans ALL children (mirrors Python's
             // `PositionMarker.from_child_markers`): min source/templated start
             // to max stop. Using only the first child would make a container's
