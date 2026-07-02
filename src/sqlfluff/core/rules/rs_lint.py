@@ -436,6 +436,35 @@ class RsSegment:
         self._rwa = out
         return out
 
+    def reflow_depth_info(self) -> dict[int, Any]:
+        # Reflow DepthMap fast path: build the {leaf_uuid: DepthInfo} map wholly
+        # from arena-side scalars (no PathStep/PyHandle marshalling). The arena
+        # emits, per leaf, its top-down stack of (anc_uuid, idx, len, stack_pos)
+        # plus the deduped (anc_uuid, class_types); we assemble DepthInfo directly.
+        # DepthInfo/StackPosition imported lazily to avoid an import cycle.
+        from sqlfluff.utils.reflow.depthmap import DepthInfo, StackPosition
+
+        per_leaf, anc_cts = self._h.reflow_depth_info()
+        ct_map = {u: frozenset(ct) for u, ct in anc_cts}
+        out: dict[int, Any] = {}
+        for leaf_uuid, steps in per_leaf:
+            # Mirror native `stack_hashes = tuple(hash(ps.segment) for ...)`:
+            # RsSegment.__hash__ returns the node uuid, and Python's hash() then
+            # reduces that u128 (Mersenne modulus) — so hash(au) is byte-identical
+            # to hash(RsSegment) for the same node.
+            hashes = tuple(hash(au) for (au, i, ln, sp) in steps)
+            out[leaf_uuid] = DepthInfo(
+                stack_depth=len(steps),
+                stack_hashes=hashes,
+                stack_hash_set=frozenset(hashes),
+                stack_class_types=tuple(ct_map[au] for (au, i, ln, sp) in steps),
+                stack_positions={
+                    hashes[k]: StackPosition(i, ln, sp)
+                    for k, (au, i, ln, sp) in enumerate(steps)
+                },
+            )
+        return out
+
     def get_parent(self) -> Optional[tuple[RsSegment, int]]:
         gp = self._h.get_parent()
         return (RsSegment(gp[0]), gp[1]) if gp else None

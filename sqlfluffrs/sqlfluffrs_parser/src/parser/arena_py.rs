@@ -386,6 +386,21 @@ impl PyHandle {
             .collect()
     }
 
+    /// Fully arena-side reflow `DepthMap` data. One traversal + one lock returns
+    /// `(per_leaf, anc_class_types)` as plain scalars (no PyHandles): per leaf,
+    /// its `(leaf_uuid, [(anc_uuid, idx, len, stack_pos)])` stack, plus the deduped
+    /// `(anc_uuid, class_types)` list. The façade builds `DepthInfo` from these
+    /// directly, avoiding per-step PathStep/StackPosition marshalling.
+    #[allow(clippy::type_complexity)]
+    fn reflow_depth_info(
+        &self,
+    ) -> (
+        Vec<(u128, Vec<(u128, usize, usize, String)>)>,
+        Vec<(u128, Vec<String>)>,
+    ) {
+        self.inner.lock().unwrap().reflow_depth_info(self.node)
+    }
+
     fn __repr__(&self) -> String {
         let a = self.inner.lock().unwrap();
         format!(
