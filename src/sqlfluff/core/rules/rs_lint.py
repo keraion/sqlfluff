@@ -20,6 +20,7 @@ Detection and fixing match native SQLFluff for the covered rules.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterator, Optional
 
 # Rules whose façade multi-pass source-patch FIX output is byte-identical to
@@ -122,6 +123,67 @@ class RsSegment:
     @property
     def raw_upper(self) -> str:
         return self._h.raw_upper
+
+    @property
+    def block_type(self) -> Optional[str]:
+        # A ``TemplateSegment`` (placeholder) attribute; ``None`` otherwise.
+        return self._h.block_type()
+
+    def normalize(self, value: Optional[str] = None) -> str:
+        # Mirrors ``RawSegment.normalize`` (parser/segments/raw.py): quote-strip
+        # via ``quoted_value`` then apply ``escape_replacements``.
+        raw_buff = value or self._h.raw
+        qv = self._h.quoted_value()
+        if qv:
+            _match = re.match(qv[0], raw_buff)
+            if _match:
+                group = qv[1]
+                # The arena stores the capture group as a string; a numeric
+                # index arrives as e.g. ``"1"`` and must be int for ``group``.
+                try:
+                    group = int(group)
+                except (TypeError, ValueError):
+                    pass
+                _group_match = _match.group(group)
+                if isinstance(_group_match, str):
+                    raw_buff = _group_match
+        for old, new in self._h.escape_replacements() or []:
+            raw_buff = re.sub(old, new, raw_buff)
+        return raw_buff
+
+    def raw_normalized(self, casefold: bool = True) -> str:
+        # Raw node: normalize then apply the dialect fold (``RawSegment``).
+        # Container: join children (mirrors ``BaseSegment.raw_normalized``).
+        if self._h.is_raw():
+            raw_buff = self.normalize()
+            fold = self._h.casefold()
+            if fold and casefold:
+                if fold == "upper":
+                    raw_buff = raw_buff.upper()
+                elif fold == "lower":
+                    raw_buff = raw_buff.lower()
+            return raw_buff
+        return "".join(s.raw_normalized(casefold) for s in self.get_raw_segments())
+
+    def raw_trimmed(self) -> str:
+        # Mirrors ``RawSegment.raw_trimmed``: strip ``trim_start`` prefixes,
+        # then ``trim_chars`` from both ends.
+        raw_buff = self._h.raw
+        trim_start = self._h.trim_start()
+        if trim_start:
+            for seq in trim_start:
+                if raw_buff.startswith(seq):
+                    raw_buff = raw_buff[len(seq) :]
+        trim_chars = self._h.trim_chars()
+        if trim_chars:
+            raw_buff = self._h.raw
+            for seq in trim_chars:
+                while raw_buff.startswith(seq):
+                    raw_buff = raw_buff[len(seq) :]
+                while raw_buff.endswith(seq):
+                    raw_buff = raw_buff[: -len(seq)]
+            return raw_buff
+        return raw_buff
 
     @property
     def type(self) -> str:
