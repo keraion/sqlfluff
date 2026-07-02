@@ -724,10 +724,15 @@ def facade_fix_loop(
         for loop in range(nloops):
             this = rules if (phase == "main" and loop == 0) else by_phase[phase]
             changed = False
+            # Parse once at the start of the loop and reuse that tree across rules
+            # that make no change; only re-parse when a fix actually rewrites the
+            # source (and reuse *that* parse as both the validity check and the
+            # current tree). This replaces the previous per-rule re-parse — the
+            # dominant cost — with 1 + (number of applied fixes) parses per loop.
+            rst = parse(source)
             for rule in this:
-                rst = parse(source)
                 if rst is None:
-                    continue
+                    break
                 _v, _r, fixes, _m = rule.crawl(
                     tree=RsSegment(rst.root),
                     dialect=dialect_obj,
@@ -742,13 +747,15 @@ def facade_fix_loop(
                 new_source = apply_source_fixes(source, fixes)
                 if new_source is None or new_source == source:
                     continue
-                if parse(new_source) is None:  # reject unparsable fix (~ _valid)
-                    continue
                 if new_source in seen:  # loop detected -> stop applying
+                    continue
+                new_rst = parse(new_source)  # single parse: validity + next tree
+                if new_rst is None:  # reject unparsable fix (~ _valid)
                     continue
                 source = new_source
                 seen.add(new_source)
                 changed = True
+                rst = new_rst
             if not changed:
                 break
     return source
