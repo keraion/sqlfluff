@@ -493,6 +493,12 @@ class RsSegment:
     def path_to(self, other: "RsSegment") -> list[Any]:
         from sqlfluff.core.parser.segments.base import PathStep
 
+        # `other` may be a freshly-constructed segment (e.g. a reflow-created
+        # WhitespaceSegment) that isn't in the arena — it has no `_h`. Native
+        # path_to returns [] when `other` isn't found under self; match that
+        # rather than crashing.
+        if not isinstance(other, RsSegment):
+            return []
         return [
             PathStep(RsSegment(h), idx, ln, tuple(cidx))  # type: ignore[arg-type]
             for (h, idx, ln, cidx) in self._h.path_to(other._h)
@@ -714,6 +720,11 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
     edits: list[tuple[int, int, str]] = []
     for fx in fixes:
         pm = fx.anchor.pos_marker
+        if pm is None:
+            # A freshly-constructed anchor with no source position (e.g. some
+            # reflow indent fixes) can't be source-patched — bail so the caller
+            # falls back to the Python tree-mutation path.
+            return None
         lit = pm.is_literal
         sl = pm.source_slice
         repl = "".join(e.raw for e in (fx.edit or []))
