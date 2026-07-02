@@ -21,7 +21,7 @@ Detection and fixing match native SQLFluff for the covered rules.
 from __future__ import annotations
 
 import re
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, cast
 
 # Rules whose façade multi-pass source-patch FIX output is byte-identical to
 # native SQLFluff across every case in that rule's ``std_rule_cases`` fixture.
@@ -301,21 +301,63 @@ class RsSegment:
         recurse_into: bool = True,
         no_recursive_seg_type: Any = None,
         allow_self: bool = True,
-    ) -> list[RsSegment]:
+    ) -> Iterator[RsSegment]:
+        # Return an iterator (not a list) to match BaseSegment.recursive_crawl,
+        # so callers can `next(...)` on it (e.g. get_alias).
         if isinstance(no_recursive_seg_type, str):
             nr = [no_recursive_seg_type]
         else:
             nr = list(no_recursive_seg_type) if no_recursive_seg_type else []
-        return [
-            RsSegment(x)
-            for x in self._h.recursive_crawl(
-                list(seg_type), recurse_into, nr, allow_self
-            )
-        ]
+        return iter(
+            [
+                RsSegment(x)
+                for x in self._h.recursive_crawl(
+                    list(seg_type), recurse_into, nr, allow_self
+                )
+            ]
+        )
 
-    def recursive_crawl_all(self, reverse: bool = False) -> list[RsSegment]:
+    def recursive_crawl_all(self, reverse: bool = False) -> Iterator[RsSegment]:
         segs = [RsSegment(x) for x in self._h.recursive_crawl_all()]
-        return list(reversed(segs)) if reverse else segs
+        return iter(reversed(segs)) if reverse else iter(segs)
+
+    def get_alias(self) -> Any:
+        # Port of SelectClauseElementSegment.get_alias (dialect_ansi.py):
+        # navigation-only, so it works over the façade. Returns ColumnAliasInfo.
+        from sqlfluff.core.dialects.common import ColumnAliasInfo
+
+        alias_expression_segment = next(
+            self.recursive_crawl(
+                "alias_expression", no_recursive_seg_type="select_statement"
+            ),
+            None,
+        )
+        if alias_expression_segment is None:
+            return None
+        alias_identifier_segment = next(
+            (s for s in alias_expression_segment.segments if s.is_type("identifier")),
+            None,
+        )
+        if alias_identifier_segment is None:
+            return None
+        aliased_segment = next(
+            s
+            for s in self.segments
+            if not s.is_whitespace and not s.is_meta and s != alias_expression_segment
+        )
+        column_reference_segments = []
+        if aliased_segment.is_type("column_reference"):
+            column_reference_segments.append(aliased_segment)
+        else:
+            column_reference_segments.extend(
+                aliased_segment.recursive_crawl("column_reference")
+            )
+        # RsSegment duck-types BaseSegment; cast for the typed NamedTuple.
+        return ColumnAliasInfo(
+            alias_identifier_name=alias_identifier_segment.raw,
+            aliased_segment=cast(Any, aliased_segment),
+            column_reference_segments=cast(Any, column_reference_segments),
+        )
 
     def iter_segments(
         self, expanding: Any = None, pass_through: bool = False
