@@ -99,6 +99,40 @@ def _typename(t: Any) -> str:
     return getattr(t, "type", None) or getattr(t, "_surrogate_type", None) or str(t)
 
 
+# Cache of synthetic segment classes used by ``RsSegment.copy`` to materialise a
+# real Python ``BaseSegment`` tree from an arena subtree. Keyed by
+# (class-name, type, class_types, is_raw) so identical arena nodes reuse the same
+# class. We build synthetic classes (rather than resolving the concrete dialect
+# class) because ``RsSegment`` holds no dialect reference; setting ``_class_types``
+# directly guarantees ``is_type``/``class_types`` parity with the façade node
+# without needing the dialect registry.
+_SYNTH_CLASSES: dict[tuple[str, str, frozenset[str], bool], type] = {}
+
+
+def _synth_segment_class(
+    name: str, seg_type: str, class_types: frozenset[str], is_raw: bool
+) -> type:
+    """Return (cached) a real segment class reporting the given type/class_types."""
+    from sqlfluff.core.parser import RawSegment
+    from sqlfluff.core.parser.segments.base import BaseSegment
+
+    if not name:
+        # Meta/whitespace/newline tokens carry no class name in the arena;
+        # derive a stable one from the type so `type()` gets a valid str.
+        name = "".join(p.capitalize() for p in seg_type.split("_")) + "Segment"
+    key = (name, seg_type, class_types, is_raw)
+    cls = _SYNTH_CLASSES.get(key)
+    if cls is None:
+        base = RawSegment if is_raw else BaseSegment
+        # The SegmentMetaclass recomputes ``_class_types`` from the base hierarchy
+        # on class creation, so we override it *after* creation to force an exact
+        # match with the arena node's class_types.
+        cls = type(name, (base,), {"type": seg_type})
+        cls._class_types = class_types  # type: ignore[attr-defined]
+        _SYNTH_CLASSES[key] = cls
+    return cls
+
+
 class RsSegment:
     """A ``BaseSegment`` duck-type backed by an arena ``RsHandle``.
 
@@ -350,6 +384,18 @@ class RsSegment:
             RsSegment(x) for x in self._h.get_children([_typename(t) for t in seg_type])
         ]
 
+    def get_identifier(self) -> Any:
+        # Port of CTEDefinitionSegment.get_identifier: blindly the first
+        # identifier child (the CTE grammar guarantees one).
+        return self.get_child("identifier")
+
+    @property
+    def source_str(self) -> str:
+        # TemplateSegment.source_str is the source text at the placeholder; for
+        # the façade that's the source slice at this node's position.
+        pm = self.pos_marker
+        return pm.source_str() if pm is not None else ""
+
     def path_to(self, other: "RsSegment") -> list[Any]:
         from sqlfluff.core.parser.segments.base import PathStep
 
@@ -437,6 +483,88 @@ class RsSegment:
                 yield s
 
     # -- fix support ---------------------------------------------------------
+    def set_parent(self, parent: Any, idx: int) -> None:
+        # No-op: the arena already encodes parentage (get_parent reads it) and a
+        # façade node's parent is fixed. Native uses this to wire up freshly
+        # constructed fix segments — irrelevant to detection over the arena.
+        pass
+
+    def copy(
+        self,
+        segments: Optional[tuple[Any, ...]] = None,
+        parent: Optional[Any] = None,
+        parent_idx: Optional[int] = None,
+    ) -> Any:
+        """Materialise a real Python ``BaseSegment`` tree from this arena subtree.
+
+        Mirrors :meth:`BaseSegment.copy`: recurses to build child copies (unless
+        ``segments`` is supplied), keeps this node's ``pos_marker``, and honours
+        ``parent``/``parent_idx``. The arena itself is never mutated; this returns
+        a freestanding real segment tree that rules can safely hand to fixes.
+
+        Class identity is reconstructed via a synthetic segment class whose
+        ``type``/``class_types`` exactly match the arena node (see
+        :func:`_synth_segment_class`), so ``is_type`` and ``recursive_crawl_all``
+        line up 1:1 with the façade original (as ``ST05.SegmentCloneMap`` relies
+        on) while every leaf carries the right ``raw``/``pos_marker`` and each
+        node's ``pos_marker`` remains assignable.
+        """
+        from sqlfluff.core.helpers.identity import get_next_id
+
+        h = self._h
+        cls = _synth_segment_class(
+            h.segment_class, h.type, self.class_types, h.is_raw()
+        )
+
+        if h.is_raw():
+            fold = h.casefold()
+            casefold = (
+                str.upper if fold == "upper" else str.lower if fold == "lower" else None
+            )
+            # The arena stores the quoted_value capture group as a string; a
+            # numeric index arrives as e.g. "1" and must be an int for
+            # ``re.Match.group`` (a numeric string is treated as a group *name*).
+            # This mirrors the conversion in ``RsSegment.normalize``.
+            quoted_value = h.quoted_value()
+            if quoted_value:
+                pattern, group = quoted_value
+                try:
+                    group = int(group)
+                except (TypeError, ValueError):
+                    pass
+                quoted_value = (pattern, group)
+            new_segment = cls(
+                raw=h.raw,
+                pos_marker=h.pos_marker,
+                instance_types=tuple(h.instance_types()),
+                trim_start=h.trim_start(),
+                trim_chars=h.trim_chars(),
+                quoted_value=quoted_value,
+                escape_replacements=h.escape_replacements(),
+                casefold=casefold,
+            )
+            if parent is not None:
+                assert parent_idx is not None
+                new_segment.set_parent(parent, parent_idx)
+            return new_segment
+
+        # Container node: build via __new__ (like BaseSegment.copy) so we bypass
+        # the parse-time validation in __init__ and just transplant state.
+        new_segment = cls.__new__(cls)  # type: ignore[call-overload]
+        new_segment.pos_marker = h.pos_marker
+        new_segment.uuid = get_next_id()
+        if parent is not None:
+            assert parent_idx is not None
+            new_segment.set_parent(parent, parent_idx)
+        if segments is not None:
+            new_segment.segments = tuple(segments)
+        else:
+            new_segment.segments = tuple(
+                child.copy(parent=new_segment, parent_idx=idx)
+                for idx, child in enumerate(self.segments)
+            )
+        return new_segment
+
     def edit(self, raw: Optional[str] = None, source_fixes: Any = None) -> Any:
         """Return a real ``RawSegment`` for a fix's replacement text.
 
