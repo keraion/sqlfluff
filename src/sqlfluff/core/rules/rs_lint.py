@@ -684,8 +684,12 @@ class RsSegment:
                 block_type=self.block_type or "",
                 source_fixes=source_fixes,
             )
+        # Mirror RawSegment.edit: `raw` defaults to the current raw (fixes that
+        # only set source_fixes, e.g. JJ01, pass raw=None but must keep the raw).
         return RawSegment(
-            raw=raw, pos_marker=self.pos_marker, source_fixes=source_fixes
+            raw=raw if raw is not None else self.raw,
+            pos_marker=self.pos_marker,
+            source_fixes=source_fixes,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -712,7 +716,21 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
         pm = fx.anchor.pos_marker
         lit = pm.is_literal
         if not (lit() if callable(lit) else lit):
-            return None
+            # Templated (non-literal) region: the source change is described by
+            # the edit segments' `source_fixes` (SourceFix(edit, source_slice,
+            # …)) — e.g. JJ01 reformatting a `{% %}`/`{{ }}` tag. Apply those.
+            # (Bail if there are none, so the caller falls back to Python.)
+            src_fixes = [
+                sfx
+                for e in (fx.edit or [])
+                for sfx in (getattr(e, "source_fixes", None) or [])
+            ]
+            if not src_fixes:
+                return None
+            for sfx in src_fixes:
+                ssl = sfx.source_slice
+                edits.append((ssl.start, ssl.stop, sfx.edit))
+            continue
         sl = pm.source_slice
         repl = "".join(e.raw for e in (fx.edit or []))
         et = fx.edit_type
