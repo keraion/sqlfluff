@@ -1117,7 +1117,7 @@ impl Arena {
         // 3. Invalidate subtree-derived caches on every changed container and
         //    every ancestor up to the root (both are functions of the whole
         //    subtree below a node).
-        for container in containers {
+        for &container in &containers {
             let mut cur = Some(container);
             while let Some(c) = cur {
                 *self.nodes[c.idx()].cached_raw.borrow_mut() = None;
@@ -1126,8 +1126,25 @@ impl Arena {
             }
         }
 
-        // 4. Position pass (synthesise markers for new nodes, re-infer
-        //    working positions) — lands with the next milestone phase.
+        // 4. Position pass: synthesise markers for new nodes and re-infer
+        //    working positions.  The dirty closure (changed containers + all
+        //    their ancestors) tells the pass which unchanged-marker subtrees
+        //    still need descending into (native repositions per-level during
+        //    its reform; we run once from the root instead).
+        let mut dirty: HashSet<NodeId> = HashSet::new();
+        for &container in &containers {
+            let mut cur = Some(container);
+            while let Some(c) = cur {
+                if !dirty.insert(c) {
+                    break;
+                }
+                cur = self.nodes[c.idx()].parent;
+            }
+        }
+        if let Some(root_pos) = self.pos_marker(self.root) {
+            let root = self.root;
+            self.position_children(root, &root_pos, &dirty);
+        }
 
         self.epoch += 1;
         Some(self.epoch)
@@ -1155,6 +1172,112 @@ impl Arena {
         let children = self.nodes[id.idx()].children.clone();
         for c in children {
             self.purge_uuids(c);
+        }
+    }
+
+    // -- position pass (port of BaseSegment._position_segments) --------------
+
+    /// Marker equality for the recurse-on-change check.  Mirrors the native
+    /// dataclass `__eq__` (slices + working position; the templated file
+    /// compares by identity in practice — one `Arc` per tree).
+    fn marker_eq(a: &PositionMarker, b: &PositionMarker) -> bool {
+        a.source_slice == b.source_slice
+            && a.templated_slice == b.templated_slice
+            && a.working_line_no == b.working_line_no
+            && a.working_line_pos == b.working_line_pos
+            && Arc::ptr_eq(&a.templated_file, &b.templated_file)
+    }
+
+    /// The issue-#6261 skip: a zero-length *templated* placeholder (a jinja
+    /// expression that rendered to "") may sit before a sibling with an
+    /// earlier templated position; using it as a forward end-point would
+    /// produce an over-wide marker (base.py:493-511).
+    fn is_zero_templated_placeholder(&self, id: NodeId, pm: &PositionMarker) -> bool {
+        self.is_type(id, "placeholder")
+            && self.raw(id).is_empty()
+            && pm.templated_slice.is_empty()
+            && !pm.source_slice.is_empty()
+            && self.block_type(id).as_deref() == Some("templated")
+    }
+
+    /// Refresh positions below `parent`: assign point (or widened) markers to
+    /// position-less nodes and re-infer every node's working line/pos.  Port
+    /// of `_position_segments` (base.py:448-562), run once top-down at commit
+    /// time instead of native's per-level reform — `dirty` carries every
+    /// container whose child list changed plus their ancestors, so spliced
+    /// subtrees whose own marker didn't change are still descended into.
+    fn position_children(
+        &mut self,
+        parent: NodeId,
+        parent_pos: &PositionMarker,
+        dirty: &HashSet<NodeId>,
+    ) {
+        let children = self.nodes[parent.idx()].children.clone();
+        if children.is_empty() {
+            // Native asserts on an empty sequence; an emptied container is
+            // tolerated here (deliberate safe superset).
+            return;
+        }
+        let mut line_no = parent_pos.working_line_no;
+        let mut line_pos = parent_pos.working_line_pos;
+        for (idx, &child) in children.iter().enumerate() {
+            let old = self.pos_marker(child);
+            let mut newp = old.clone();
+            if old.is_none() {
+                // Start point: the previous sibling's (already updated) end,
+                // else the parent's start (base.py:479-489).
+                let start_point = if idx > 0 {
+                    self.pos_marker(children[idx - 1])
+                        .map(|m| m.end_point_marker())
+                } else {
+                    Some(parent_pos.start_point_marker())
+                };
+                // End point: forward scan over the (not yet updated) rest,
+                // skipping #6261 placeholders and descending to the first raw
+                // (base.py:491-516).
+                let mut end_point = None;
+                for &fwd in &children[idx + 1..] {
+                    if let Some(fm) = self.pos_marker(fwd) {
+                        if self.is_zero_templated_placeholder(fwd, &fm) {
+                            continue;
+                        }
+                        let leaves = self.raw_segments(fwd);
+                        let target = leaves.first().copied().unwrap_or(fwd);
+                        let lm = self.pos_marker(target).unwrap_or(fm);
+                        end_point = Some(lm.start_point_marker());
+                        break;
+                    }
+                }
+                newp = match (start_point, end_point) {
+                    (Some(s), Some(e)) if !Self::marker_eq(&s, &e) => {
+                        // Widened marker across the insertion gap.
+                        Some(PositionMarker::from_points(&s, &e))
+                    }
+                    (Some(s), _) => Some(s),
+                    (None, Some(e)) => Some(e),
+                    // Native raises "Unable to position new segment"; leave
+                    // unpositioned (only reachable on marker-less test trees).
+                    (None, None) => None,
+                };
+            }
+            let Some(np) = newp else {
+                continue;
+            };
+            // Regardless of repositioning, refresh the working location and
+            // advance the cursor over this node's raw (base.py:536-541).
+            let np = np.with_working_position(line_no, line_pos);
+            let raw = self.raw(child);
+            let (nl, npos) = np.infer_next_position(&raw, line_no, line_pos);
+            line_no = nl;
+            line_pos = npos;
+            let changed = match &old {
+                None => true,
+                Some(o) => !Self::marker_eq(o, &np),
+            };
+            self.nodes[child.idx()].pos_marker = Some(np.clone());
+            if !self.nodes[child.idx()].children.is_empty() && (changed || dirty.contains(&child)) {
+                self.position_children(child, &np, dirty);
+            }
         }
     }
 
@@ -2102,7 +2225,6 @@ mod tests {
         assert_eq!(fixes[0].edit, "{%+ if true -%}");
     }
 
-
     // -- splice engine tests --------------------------------------------------
 
     fn file_tree() -> Node {
@@ -2305,16 +2427,18 @@ mod tests {
         // instance_types in raw_spec? they are type whitespace) — they would
         // bubble out of select_statement... use the raw prediction to check
         // ordering regardless of trim behaviour.
-        assert!(summary.staged_raw.contains("<a>") || summary.staged_raw.contains("< a>") || {
-            // if trimmed and bubbled, the order must still be < before a, > after a
-            let s = &summary.staged_raw;
-            let (ib, ia, ig) = (
-                s.find('<').unwrap(),
-                s.find('a').unwrap(),
-                s.find('>').unwrap(),
-            );
-            ib < ia && ia < ig
-        });
+        assert!(
+            summary.staged_raw.contains("<a>") || summary.staged_raw.contains("< a>") || {
+                // if trimmed and bubbled, the order must still be < before a, > after a
+                let s = &summary.staged_raw;
+                let (ib, ia, ig) = (
+                    s.find('<').unwrap(),
+                    s.find('a').unwrap(),
+                    s.find('>').unwrap(),
+                );
+                ib < ia && ia < ig
+            }
+        );
     }
 
     #[test]
@@ -2359,8 +2483,7 @@ mod tests {
         let u = arena.uuid(ident);
         let e1 = raw_spec(9020, "naked_identifier", "b");
         let e2 = raw_spec(9021, "whitespace", "  ");
-        let summary =
-            arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![e1, e2])], false);
+        let summary = arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![e1, e2])], false);
         // The whitespace ends up between the statement and the newline at the
         // FILE level: "SELECT b" + "  " + "\n".
         assert_eq!(summary.staged_raw, "SELECT b  \n");
@@ -2489,6 +2612,176 @@ mod tests {
         // no-op stages instead).
         arena.discard_staged();
         assert_eq!(arena.epoch(), 0);
+    }
+
+
+    // -- position pass golden tests -------------------------------------------
+
+    /// file( statement( select( SELECT, " ", a ) ), "\n" ) over "SELECT a\n"
+    /// with real position markers throughout.
+    fn marked_file_tree() -> (Node, std::sync::Arc<sqlfluffrs_types::TemplatedFile>) {
+        use sqlfluffrs_types::TemplatedFile;
+        let tf = std::sync::Arc::new(TemplatedFile::new(
+            "SELECT a\n".to_string(),
+            "<test>".to_string(),
+            None,
+            None,
+            None,
+        ));
+        let mk = |start: usize, stop: usize| {
+            PositionMarker::new(
+                Slice { start, stop },
+                Slice { start, stop },
+                &tf,
+                None,
+                None,
+            )
+        };
+        let mut kw = raw("KeywordSegment", "keyword", "SELECT", &["keyword"]);
+        let mut ws = raw("WhitespaceSegment", "whitespace", " ", &["whitespace"]);
+        let mut ident = raw(
+            "IdentifierSegment",
+            "naked_identifier",
+            "a",
+            &["identifier"],
+        );
+        let mut nl = raw("NewlineSegment", "newline", "\n", &["newline"]);
+        for (n, (a, b)) in [
+            (&mut kw, (0usize, 6usize)),
+            (&mut ws, (6, 7)),
+            (&mut ident, (7, 8)),
+            (&mut nl, (8, 9)),
+        ] {
+            if let Node::Raw { pos_marker, .. } = n {
+                *pos_marker = Some(mk(a, b));
+            }
+        }
+        let select = Node::Segment {
+            segment_class: "SelectStatementSegment".into(),
+            segment_type: Some("select_statement".into()),
+            pos_marker: Some(mk(0, 8)),
+            class_types: vec!["select_statement".to_string(), "statement".to_string()],
+            children: vec![kw, ws, ident],
+        };
+        let stmt = Node::Segment {
+            segment_class: "StatementSegment".into(),
+            segment_type: Some("statement".into()),
+            pos_marker: Some(mk(0, 8)),
+            class_types: vec!["statement".to_string()],
+            children: vec![select],
+        };
+        let file = Node::Segment {
+            segment_class: "FileSegment".into(),
+            segment_type: Some("file".into()),
+            pos_marker: Some(mk(0, 9)),
+            class_types: vec!["file".to_string()],
+            children: vec![stmt, nl],
+        };
+        (file, tf)
+    }
+
+    fn working_of(arena: &Arena, text: &str) -> (usize, usize) {
+        arena
+            .pos_marker(leaf_by_raw(arena, text))
+            .expect("marker")
+            .working_loc()
+    }
+
+    #[test]
+    fn position_pass_updates_working_after_delete() {
+        let (node, _tf) = marked_file_tree();
+        let mut arena = Arena::from_node(&node);
+        // Pre-state: a at (1,8), newline at (1,9).
+        assert_eq!(working_of(&arena, "a"), (1, 8));
+        let ws_uuid = arena.uuid(leaf_by_raw(&arena, " "));
+        arena.stage_edit_batch(vec![op(ws_uuid, EditKind::Delete, vec![])], false);
+        arena.commit_staged().unwrap();
+        // Working positions cascade left; source/templated slices stay stale
+        // (native relies on the raw-vs-templated comparison to detect edits).
+        assert_eq!(working_of(&arena, "a"), (1, 7));
+        assert_eq!(working_of(&arena, "\n"), (1, 8));
+        let a = leaf_by_raw(&arena, "a");
+        assert_eq!(
+            arena.pos_marker(a).unwrap().source_slice,
+            Slice { start: 7, stop: 8 }
+        );
+    }
+
+    #[test]
+    fn position_pass_point_marker_for_insertion() {
+        let (node, _tf) = marked_file_tree();
+        let mut arena = Arena::from_node(&node);
+        let ident = leaf_by_raw(&arena, "a");
+        let u = arena.uuid(ident);
+        // Insert code (not whitespace, so it stays in the select) before "a".
+        let new = raw_spec(9100, "keyword", "DISTINCT");
+        arena.stage_edit_batch(vec![op(u, EditKind::CreateBefore, vec![new])], false);
+        arena.commit_staged().unwrap();
+        let nn = arena.node_by_uuid(9100).expect("inserted");
+        let pm = arena.pos_marker(nn).expect("positioned");
+        // Point marker between prev sibling (ws, ends 7) and fwd ("a" starts
+        // at 7): start == end → the plain start point, zero-length.
+        assert_eq!(pm.source_slice, Slice { start: 7, stop: 7 });
+        assert!(pm.templated_slice.is_empty());
+        // Working: inserted at (1,8); "a" pushed to (1,16) after "DISTINCT".
+        assert_eq!(pm.working_loc(), (1, 8));
+        assert_eq!(working_of(&arena, "a"), (1, 16));
+    }
+
+    #[test]
+    fn position_pass_widened_marker_over_gap() {
+        let (node, _tf) = marked_file_tree();
+        let mut arena = Arena::from_node(&node);
+        // Replace the whitespace (source [6,7)) with an unpositioned,
+        // DIFFERENT-raw whitespace: no consumed_pos, so the new node gets a
+        // synthesised marker widened across the gap [6,7).
+        let ws = leaf_by_raw(&arena, " ");
+        let u = arena.uuid(ws);
+        let new = raw_spec(9110, "whitespace", "  ");
+        arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![new])], false);
+        arena.commit_staged().unwrap();
+        let nn = arena.node_by_uuid(9110).expect("replaced");
+        let pm = arena.pos_marker(nn).expect("positioned");
+        // start = prev (SELECT) end 6; end = fwd ("a") start 7 → widened.
+        assert_eq!(pm.source_slice, Slice { start: 6, stop: 7 });
+        // Working of following segments re-inferred across the 2-space raw.
+        assert_eq!(working_of(&arena, "a"), (1, 9));
+    }
+
+    #[test]
+    fn position_pass_recurses_into_new_subtree() {
+        let (node, _tf) = marked_file_tree();
+        let mut arena = Arena::from_node(&node);
+        let ident = leaf_by_raw(&arena, "a");
+        let u = arena.uuid(ident);
+        // Replace "a" with a container( b, ws, c ) — every node unpositioned.
+        let sub = NodeSpec {
+            uuid: 9120,
+            kind: SpecKind::Segment {
+                segment_class: "ColumnReferenceSegment".to_string(),
+                segment_type: Some("column_reference".to_string()),
+                class_types: vec!["column_reference".to_string()],
+            },
+            source_fixes: Vec::new(),
+            children: vec![
+                raw_spec(9121, "naked_identifier", "b"),
+                raw_spec(9122, "dot", "."),
+                raw_spec(9123, "naked_identifier", "c"),
+            ],
+        };
+        arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![sub])], false);
+        arena.commit_staged().unwrap();
+        // Container positioned (widened over the gap [7,8)), children too.
+        let cont = arena.node_by_uuid(9120).unwrap();
+        assert!(arena.pos_marker(cont).is_some());
+        for uu in [9121u128, 9122, 9123] {
+            let n = arena.node_by_uuid(uu).unwrap();
+            assert!(arena.pos_marker(n).is_some(), "child {uu} positioned");
+        }
+        // Working cursor walks the new raws: b at (1,8), "." at (1,9), c at (1,10).
+        assert_eq!(working_of(&arena, "b"), (1, 8));
+        assert_eq!(working_of(&arena, "c"), (1, 10));
+        assert_eq!(working_of(&arena, "\n"), (1, 11));
     }
 
     #[test]

@@ -189,9 +189,18 @@ impl PositionMarker {
             panic!("Markers must refer to the same templated file.");
         }
 
+        // The section BETWEEN the two points (mirrors Python
+        // `PositionMarker.from_points`, markers.py:102-124): slices span
+        // start.start → end.stop; the working position is the *start*'s.
         PositionMarker::new(
-            start_marker.source_slice,
-            start_marker.templated_slice,
+            Slice {
+                start: start_marker.source_slice.start,
+                stop: end_marker.source_slice.stop,
+            },
+            Slice {
+                start: start_marker.templated_slice.start,
+                stop: end_marker.templated_slice.stop,
+            },
             &start_marker.templated_file,
             Some(start_marker.working_line_no),
             Some(start_marker.working_line_pos),
