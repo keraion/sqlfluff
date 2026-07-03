@@ -47,10 +47,15 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # detection-verified subset (this set minus the DETECTION_UNSAFE members below,
 # plus rules using ``isinstance`` on concrete classes a duck-type can't satisfy).
 #
-# KNOWN pre-existing divergence (NOT growth-related): RF06 strips backtick quotes
-# from mysql/mariadb/tsql stored-procedure/function *names* that native keeps
-# (~23 dialect fixtures). Guard-missed (valid-but-different output). Fix or drop
-# RF06 for those dialects separately.
+# RF06 was DROPPED from this set: it strips backtick quotes from
+# mysql/mariadb/tsql stored-procedure/function *names* that native LEAVES quoted.
+# Native reports the violation but its ``apply_fixes`` rejects the fix — unquoting
+# ``\`name\``` reparses as ``function_name_identifier`` not the ``naked_identifier``
+# the fix specifies, so ``validate_segment_with_reparse`` fails. The façade's
+# source-patch path skips that grammar validation (arena/materialised segments have
+# no ``match_grammar``), so it applies a fix native won't. Faithfully replicating
+# the validation needs full real-dialect-class materialisation (real leaves too),
+# which defeats the façade; deferring RF06 to the Python path is the safe fix.
 FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
     {"AL04", "AL10", "CP01", "CV09", "RF02", "ST03"}
 )
@@ -96,7 +101,6 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "PG01",
         "RF02",
         "RF04",
-        "RF06",
         "ST01",
         "ST03",
         "ST04",
