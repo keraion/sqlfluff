@@ -23,9 +23,20 @@ use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
 use sqlfluffrs_types::token::CaseFold;
-use sqlfluffrs_types::PositionMarker;
+use sqlfluffrs_types::{PositionMarker, Slice};
 
 use super::types::{MetaType, Node, RawSegmentKwargs};
+
+/// A source-level edit attached to a segment, mirroring Python's ``SourceFix``
+/// (`sqlfluff.core.parser.segments.base.SourceFix`): the replacement text and
+/// the source/templated regions it rewrites.  Carried by fix *edit* segments
+/// (e.g. JJ01 reformatting a jinja tag) and consumed by the patch generator.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SourceFixSpec {
+    pub(crate) edit: String,
+    pub(crate) source_slice: Slice,
+    pub(crate) templated_slice: Slice,
+}
 
 /// Stable, arena-local identity for a node.  A plain index for milestone 1
 /// (read-only); generational keys will be introduced alongside deletion in the
@@ -95,6 +106,14 @@ pub(crate) struct Arena {
     nodes: Vec<ArenaNode>,
     root: NodeId,
     by_uuid: HashMap<u128, NodeId>,
+    /// Mutation epoch: bumped once per committed edit batch.  Python-side
+    /// wrapper caches key their validity off this (and tests assert on it).
+    epoch: u64,
+    /// Source fixes per *leaf* node, kept as a sparse side-table rather than a
+    /// field on every `ArenaKind::Raw` — fixes are rare (a handful per file at
+    /// most) while nodes number in the tens of thousands.  Containers aggregate
+    /// over their subtree on read (mirroring `BaseSegment.source_fixes`).
+    source_fixes: HashMap<NodeId, Vec<SourceFixSpec>>,
 }
 
 /// A single step on a path between two nodes — mirrors Python's `PathStep`
@@ -116,6 +135,8 @@ impl Arena {
             nodes: Vec::new(),
             root: NodeId(0),
             by_uuid: HashMap::new(),
+            epoch: 0,
+            source_fixes: HashMap::new(),
         };
         let root = arena.ingest(node, None, 0);
         arena.root = root;
@@ -268,6 +289,70 @@ impl Arena {
 
     pub(crate) fn node_by_uuid(&self, uuid: u128) -> Option<NodeId> {
         self.by_uuid.get(&uuid).copied()
+    }
+
+    /// Mutation epoch — bumped once per committed edit batch.
+    #[inline]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Bump the mutation epoch.  Called at commit time by the splice engine;
+    /// exposed at crate level so groundwork tests can drive it before the
+    /// engine lands.
+    #[inline]
+    pub(crate) fn bump_epoch(&mut self) {
+        self.epoch += 1;
+    }
+
+    /// A node is *detached* once tombstoned by an edit: unlinked from its
+    /// parent but with payload intact so outstanding handles keep reading
+    /// (mirrors native, where a rule holding a deleted segment still reads it).
+    /// The root is never detached.
+    #[inline]
+    pub(crate) fn is_detached(&self, id: NodeId) -> bool {
+        id != self.root && self.nodes[id.idx()].parent.is_none()
+    }
+
+    /// Attach source fixes to a (leaf) node.  Used when ingesting fix edit
+    /// segments; replaces any existing entry.
+    pub(crate) fn set_source_fixes(&mut self, id: NodeId, fixes: Vec<SourceFixSpec>) {
+        if fixes.is_empty() {
+            self.source_fixes.remove(&id);
+        } else {
+            self.source_fixes.insert(id, fixes);
+        }
+    }
+
+    /// Subtree source fixes in document order — mirrors
+    /// `BaseSegment.source_fixes` (chained over children).
+    pub(crate) fn node_source_fixes(&self, id: NodeId) -> Vec<SourceFixSpec> {
+        let mut out = Vec::new();
+        self.collect_source_fixes(id, &mut out);
+        out
+    }
+
+    fn collect_source_fixes(&self, id: NodeId, out: &mut Vec<SourceFixSpec>) {
+        if let Some(fixes) = self.source_fixes.get(&id) {
+            out.extend(fixes.iter().cloned());
+        }
+        for &c in &self.nodes[id.idx()].children {
+            self.collect_source_fixes(c, out);
+        }
+    }
+
+    /// The stored ``source_str`` of a Template placeholder meta (`None` for
+    /// any other node kind).  Native `TemplateSegment.source_str` is a stored
+    /// attribute — deriving it from the pos marker (as the façade previously
+    /// did) breaks once a placeholder's source is *edited* by a fix.
+    pub(crate) fn meta_source_str(&self, id: NodeId) -> Option<String> {
+        match &self.node(id).kind {
+            ArenaKind::Meta {
+                meta_type: MetaType::Template { source_str, .. },
+                ..
+            } => Some(source_str.clone()),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -1057,5 +1142,81 @@ mod tests {
         assert_eq!(arena.get_children(root, &indent).len(), 1);
         // A non-meta query still works alongside metas.
         assert!(arena.get_child(root, &["keyword".to_string()]).is_some());
+    }
+
+    #[test]
+    fn epoch_starts_zero_and_bumps() {
+        let mut arena = Arena::from_node(&select_tree());
+        assert_eq!(arena.epoch(), 0);
+        arena.bump_epoch();
+        assert_eq!(arena.epoch(), 1);
+    }
+
+    #[test]
+    fn nothing_detached_after_ingest() {
+        let arena = Arena::from_node(&select_tree());
+        for i in 0..arena.len() {
+            assert!(!arena.is_detached(NodeId(i as u32)));
+        }
+    }
+
+    #[test]
+    fn source_fixes_aggregate_in_document_order() {
+        let mut arena = Arena::from_node(&select_tree());
+        let root = arena.root();
+        // Attach fixes to two leaves (keyword + identifier) and assert the
+        // subtree aggregate at every ancestor level, in document order.
+        let leaves = arena.raw_segments(root);
+        let kw = leaves[0]; // "SELECT"
+        let ident = *leaves.last().unwrap(); // "a"
+        let f1 = SourceFixSpec {
+            edit: "select".to_string(),
+            source_slice: Slice { start: 0, stop: 6 },
+            templated_slice: Slice { start: 0, stop: 6 },
+        };
+        let f2 = SourceFixSpec {
+            edit: "b".to_string(),
+            source_slice: Slice { start: 7, stop: 8 },
+            templated_slice: Slice { start: 7, stop: 8 },
+        };
+        arena.set_source_fixes(ident, vec![f2.clone()]);
+        arena.set_source_fixes(kw, vec![f1.clone()]);
+        // Leaf-level: exactly its own.
+        assert_eq!(arena.node_source_fixes(kw), vec![f1.clone()]);
+        // Root-level: document order (keyword before identifier), regardless
+        // of insertion order.
+        assert_eq!(arena.node_source_fixes(root), vec![f1, f2]);
+        // Clearing removes the side-table entry.
+        arena.set_source_fixes(kw, Vec::new());
+        assert_eq!(arena.node_source_fixes(root).len(), 1);
+    }
+
+    #[test]
+    fn meta_source_str_only_for_template_metas() {
+        let tree = Node::Segment {
+            segment_class: "FileSegment".into(),
+            segment_type: Some("file".into()),
+            pos_marker: None,
+            class_types: vec!["file".to_string()],
+            children: vec![
+                raw("KeywordSegment", "keyword", "SELECT", &["keyword"]),
+                Node::Meta {
+                    meta_type: MetaType::Template {
+                        source_str: "{{ ref('a') }}".to_string(),
+                        block_type: "templated".to_string(),
+                    },
+                    pos_marker: None,
+                    block_uuid: None,
+                },
+            ],
+        };
+        let arena = Arena::from_node(&tree);
+        let root = arena.root();
+        let kids = arena.children(root).to_vec();
+        assert_eq!(arena.meta_source_str(kids[0]), None);
+        assert_eq!(
+            arena.meta_source_str(kids[1]).as_deref(),
+            Some("{{ ref('a') }}")
+        );
     }
 }

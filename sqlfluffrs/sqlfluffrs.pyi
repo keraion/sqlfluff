@@ -220,6 +220,23 @@ class RsHandle:
     def path_to(
         self, other: "RsHandle"
     ) -> List[tuple["RsHandle", int, int, List[int]]]: ...
+    def source_fixes(
+        self,
+    ) -> List[tuple[str, tuple[int, int], tuple[int, int]]]:
+        """Subtree source fixes in document order.
+
+        ``(edit, (source_start, source_stop), (templated_start,
+        templated_stop))`` tuples — mirrors ``BaseSegment.source_fixes``.
+        """
+        ...
+
+    def source_str(self) -> Optional[str]:
+        """Stored ``source_str`` of a Template placeholder meta; else None."""
+        ...
+
+    def is_detached(self) -> bool:
+        """True once tombstoned (unlinked) by an edit batch."""
+        ...
 
 class RsTree:
     """Owner of a mutable arena parse tree, used by the ``RsSegment`` facade."""
@@ -229,6 +246,9 @@ class RsTree:
     # if the tree was not built via an engine render). Passed as
     # ``context.templated_file`` by the facade linting path.
     templated_file: Optional[Any]
+    # Mutation epoch — bumped once per committed edit batch. Python wrapper
+    # caches key their validity off this.
+    epoch: int
 
     def __len__(self) -> int: ...
     def node_by_uuid(self, uuid: int) -> Optional[RsHandle]: ...

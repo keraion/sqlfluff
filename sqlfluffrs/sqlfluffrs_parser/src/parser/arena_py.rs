@@ -99,6 +99,13 @@ impl PyTree {
         self.inner.lock().unwrap().len()
     }
 
+    /// Mutation epoch — bumped once per committed edit batch.  Python wrapper
+    /// caches key their validity off this.
+    #[getter]
+    fn epoch(&self) -> u64 {
+        self.inner.lock().unwrap().epoch()
+    }
+
     /// Resolve a handle from a node uuid (used by fix anchoring in later
     /// milestones; available now for parity tests).
     fn node_by_uuid(&self, uuid: u128) -> Option<PyHandle> {
@@ -239,6 +246,39 @@ impl PyHandle {
     /// metas and non-metas.  Mirrors `TemplateSegment.block_uuid`.
     fn block_uuid(&self) -> Option<u128> {
         self.inner.lock().unwrap().block_uuid(self.node)
+    }
+
+    /// Subtree source fixes in document order, as
+    /// `(edit, (source_start, source_stop), (templated_start, templated_stop))`
+    /// tuples.  Mirrors `BaseSegment.source_fixes` (chained over children).
+    fn source_fixes(&self) -> Vec<(String, (usize, usize), (usize, usize))> {
+        self.inner
+            .lock()
+            .unwrap()
+            .node_source_fixes(self.node)
+            .into_iter()
+            .map(|f| {
+                (
+                    f.edit,
+                    (f.source_slice.start, f.source_slice.stop),
+                    (f.templated_slice.start, f.templated_slice.stop),
+                )
+            })
+            .collect()
+    }
+
+    /// The stored `source_str` of a Template placeholder meta (`None`
+    /// otherwise).  Native `TemplateSegment.source_str` is a stored attribute;
+    /// deriving it from the pos marker breaks once the placeholder's source is
+    /// edited by a fix.
+    fn source_str(&self) -> Option<String> {
+        self.inner.lock().unwrap().meta_source_str(self.node)
+    }
+
+    /// Whether this node has been tombstoned (unlinked) by an edit batch.
+    /// Payload stays readable; navigation from the root can no longer reach it.
+    fn is_detached(&self) -> bool {
+        self.inner.lock().unwrap().is_detached(self.node)
     }
 
     #[getter]

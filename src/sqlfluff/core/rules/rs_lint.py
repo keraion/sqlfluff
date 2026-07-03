@@ -361,9 +361,18 @@ class RsSegment:
 
     @property
     def source_fixes(self) -> list[Any]:
-        # Arena nodes come straight from a parse and carry no prior source fixes
-        # (matches a freshly-parsed native segment's empty list).
-        return []
+        # Subtree aggregate in document order (mirrors BaseSegment.source_fixes).
+        # Empty straight after a parse; populated once fix edit segments carrying
+        # SourceFixes are ingested into the arena by the mutation path.
+        raw_fixes = self._h.source_fixes()
+        if not raw_fixes:
+            return []
+        from sqlfluff.core.parser.segments.base import SourceFix
+
+        return [
+            SourceFix(edit, slice(s0, s1), slice(t0, t1))
+            for (edit, (s0, s1), (t0, t1)) in raw_fixes
+        ]
 
     @property
     def is_code(self) -> bool:
@@ -517,8 +526,14 @@ class RsSegment:
 
     @property
     def source_str(self) -> str:
-        # TemplateSegment.source_str is the source text at the placeholder; for
-        # the façade that's the source slice at this node's position.
+        # TemplateSegment.source_str is a STORED attribute on the placeholder —
+        # prefer the arena's stored value (correct even after a fix edits the
+        # placeholder's source). Fall back to the pos-marker-derived source
+        # slice for non-Template nodes (native only defines source_str on
+        # TemplateSegment, but rules probe it via getattr).
+        stored = self._h.source_str()
+        if stored is not None:
+            return stored
         pm = self.pos_marker
         return pm.source_str() if pm is not None else ""
 

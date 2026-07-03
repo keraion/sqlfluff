@@ -885,7 +885,13 @@ fn token_to_node(tok: &Token) -> Node {
             "dedent" => MetaType::Dedent { is_implicit: false },
             "template_loop" => MetaType::TemplateLoop,
             _ => MetaType::Template {
-                source_str: tok.raw().to_owned(),
+                // A placeholder's SOURCE text lives in `Token.source_str` (its
+                // `raw()` is empty — placeholders occupy no templated space).
+                // Native `TemplateSegment.source_str` is this stored value.
+                source_str: tok
+                    .source_str
+                    .clone()
+                    .unwrap_or_else(|| tok.raw().to_owned()),
                 block_type: tok.block_type().expect("block_type for template"),
             },
         };
