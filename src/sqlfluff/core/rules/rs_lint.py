@@ -5,9 +5,12 @@ The Rust-driven engine parses to an arena and hands Python an ``RsTree``
 duck-type backed by the arena's ``RsHandle`` cursor, so the existing Python
 rules can crawl the Rust tree directly — no Python ``BaseSegment`` tree is built.
 
-Fixes are applied by **source-slice patching + re-parse** rather than mutating a
-tree, so this works today without arena mutation. :func:`facade_fix_loop` mirrors
-``Linter.lint_fix_parsed``'s main/post phase scheduling.
+Fixes are applied by **mutating the arena in place** (no reparse), mirroring
+native ``apply_fixes`` — :func:`facade_fix_loop` (→ :func:`facade_fix_loop_v3`)
+stages/commits edit batches on the Rust arena and reconstructs the source with
+native ``generate_source_patches``. This is ~2.3× faster than native and
+byte-identical. (Set ``SQLFLUFF_RS_FIX_V1=1`` for the legacy source-patch +
+re-parse loop, kept one cycle for bisection.)
 
 This covers the rules whose ``BaseSegment`` API surface the façade implements
 (see :data:`FACADE_SAFE_RULES`); other rules should stay on the Python path.
@@ -1185,18 +1188,16 @@ def facade_fix_loop(
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
-    Default (v1): source-patch + re-parse per applied fix, mirroring the
-    main/post phase scheduling of ``Linter.lint_fix_parsed``.  Set
-    ``SQLFLUFF_RS_FIX_V3=1`` to route through :func:`facade_fix_loop_v3`
-    (arena mutation, no reparse) — the transition flag while v3 is vetted;
-    v3 becomes the default (and v1 is retired) once the corpus parity + perf
-    gates pass.
+    Default: arena mutation with no reparse (:func:`facade_fix_loop_v3`) — 2.3×
+    faster than native, byte-identical, guard-clean over the whole dialect
+    corpus.  Set ``SQLFLUFF_RS_FIX_V1=1`` to fall back to the legacy
+    source-patch + re-parse loop (kept one cycle for bisection; retire after).
     """
     import os
 
     import sqlfluffrs
 
-    if os.environ.get("SQLFLUFF_RS_FIX_V3") == "1":
+    if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
         return facade_fix_loop_v3(source, fname, config, rules, limit)
 
     dialect_obj = config.get("dialect_obj")
