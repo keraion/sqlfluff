@@ -38,6 +38,91 @@ pub(crate) struct SourceFixSpec {
     pub(crate) templated_slice: Slice,
 }
 
+/// The four native `LintFix` edit types (`fix.py:42-47`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditKind {
+    Delete,
+    Replace,
+    CreateBefore,
+    CreateAfter,
+}
+
+/// One fix to apply: native `LintFix` reduced to what the arena needs —
+/// the anchor's uuid (fix matching is by `anchor.uuid`, `fix.py:160`), the
+/// edit type, and the replacement/insertion segments as [`NodeSpec`]s.
+// TODO(fixing milestone): consumed by the splice engine (`stage_edit_batch`);
+// the dead_code allow goes away when it lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct EditOp {
+    pub(crate) anchor_uuid: u128,
+    pub(crate) kind: EditKind,
+    pub(crate) edits: Vec<NodeSpec>,
+}
+
+/// Payload for a to-be-created node, mirroring [`ArenaKind`] minus caches.
+// TODO(fixing milestone): fields read by `ingest_spec` (in tests today) and
+// the splice engine; allow goes away when `stage_edit_batch` lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum SpecKind {
+    Raw {
+        segment_class: String,
+        segment_type: String,
+        class_type: String,
+        raw: String,
+        instance_types: Vec<String>,
+        class_types: Vec<String>,
+        kwargs: RawSegmentKwargs,
+    },
+    Segment {
+        segment_class: String,
+        segment_type: Option<String>,
+        class_types: Vec<String>,
+    },
+    Meta {
+        meta_type: MetaType,
+        block_uuid: Option<u128>,
+    },
+}
+
+/// A recursive description of a Python fix *edit* segment to ingest into the
+/// arena.  Built by the façade (`_segment_to_spec`) from `LintFix.edit`
+/// segments.  `pos_marker` is deliberately absent: native strips edit markers
+/// in the `LintFix` constructor and relies on the position pass to synthesise
+/// them (`fix.py:53-75`).
+#[derive(Debug, Clone)]
+pub(crate) struct NodeSpec {
+    /// The Python segment's uuid (PYTHON_TAG space — disjoint from arena-minted
+    /// RUST_TAG uuids). Preserved on ingest so identities match a native tree;
+    /// a duplicate (a rule reusing one edit segment object across fixes —
+    /// `BaseSegment.copy()` keeps uuids) is re-minted instead.
+    pub(crate) uuid: u128,
+    pub(crate) kind: SpecKind,
+    pub(crate) source_fixes: Vec<SourceFixSpec>,
+    pub(crate) children: Vec<NodeSpec>,
+}
+
+impl NodeSpec {
+    /// Joined raw of the spec subtree — mirrors `BaseSegment.raw` for the
+    /// yet-to-be-created segment (used for the `consumed_pos` match).
+    // TODO(fixing milestone): used by the splice engine's consumed_pos check.
+    #[allow(dead_code)]
+    pub(crate) fn spec_raw(&self) -> String {
+        match &self.kind {
+            SpecKind::Raw { raw, .. } => raw.clone(),
+            SpecKind::Meta { .. } => String::new(),
+            SpecKind::Segment { .. } => {
+                let mut s = String::new();
+                for c in &self.children {
+                    s.push_str(&c.spec_raw());
+                }
+                s
+            }
+        }
+    }
+}
+
 /// Stable, arena-local identity for a node.  A plain index for milestone 1
 /// (read-only); generational keys will be introduced alongside deletion in the
 /// fixing milestone so that stale ids fail loudly instead of aliasing.
@@ -174,6 +259,103 @@ impl Arena {
         id
     }
 
+    /// Like [`alloc`], but with a caller-supplied uuid (a Python edit segment's
+    /// identity, preserved across the FFI).  On collision — native
+    /// `BaseSegment.copy()` keeps uuids, so a rule reusing one edit segment
+    /// object across fixes produces duplicates — a fresh Rust uuid is minted
+    /// instead, keeping `by_uuid` a bijection over attached nodes.
+    // TODO(fixing milestone): lib callers arrive with the splice engine.
+    #[allow(dead_code)]
+    fn alloc_with_uuid(
+        &mut self,
+        kind: ArenaKind,
+        pos_marker: Option<PositionMarker>,
+        parent: Option<NodeId>,
+        parent_idx: usize,
+        uuid: u128,
+    ) -> NodeId {
+        let id = NodeId(self.nodes.len() as u32);
+        let uuid = if self.by_uuid.contains_key(&uuid) {
+            self.next_uuid()
+        } else {
+            uuid
+        };
+        self.nodes.push(ArenaNode {
+            uuid,
+            parent,
+            parent_idx,
+            children: Vec::new(),
+            pos_marker,
+            kind,
+            cached_raw: RefCell::new(None),
+            descendant_types: RefCell::new(None),
+        });
+        self.by_uuid.insert(uuid, id);
+        id
+    }
+
+    /// Recursively allocate a [`NodeSpec`] subtree (a Python fix edit segment)
+    /// into the arena.  Nodes are created *detached-by-construction*: the
+    /// splice engine links the returned root into a parent's `children`.
+    /// `pos_marker` stays `None` throughout — the position pass synthesises
+    /// markers after splicing, mirroring native `_position_segments`.
+    // TODO(fixing milestone): lib callers arrive with the splice engine.
+    #[allow(dead_code)]
+    pub(crate) fn ingest_spec(
+        &mut self,
+        spec: &NodeSpec,
+        parent: Option<NodeId>,
+        parent_idx: usize,
+    ) -> NodeId {
+        let kind = match &spec.kind {
+            SpecKind::Raw {
+                segment_class,
+                segment_type,
+                class_type,
+                raw,
+                instance_types,
+                class_types,
+                kwargs,
+            } => ArenaKind::Raw {
+                segment_class: Cow::Owned(segment_class.clone()),
+                segment_type: Cow::Owned(segment_type.clone()),
+                class_type: Cow::Owned(class_type.clone()),
+                raw: raw.clone(),
+                instance_types: instance_types.clone(),
+                class_types: class_types.clone(),
+                kwargs: kwargs.clone(),
+            },
+            SpecKind::Segment {
+                segment_class,
+                segment_type,
+                class_types,
+            } => ArenaKind::Segment {
+                segment_class: Cow::Owned(segment_class.clone()),
+                segment_type: segment_type.clone().map(Cow::Owned),
+                class_types: class_types.clone(),
+            },
+            SpecKind::Meta {
+                meta_type,
+                block_uuid,
+            } => ArenaKind::Meta {
+                meta_type: meta_type.clone(),
+                block_uuid: *block_uuid,
+            },
+        };
+        let id = self.alloc_with_uuid(kind, None, parent, parent_idx, spec.uuid);
+        if !spec.source_fixes.is_empty() {
+            self.source_fixes.insert(id, spec.source_fixes.clone());
+        }
+        let child_ids: Vec<NodeId> = spec
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| self.ingest_spec(c, Some(id), i))
+            .collect();
+        self.nodes[id.idx()].children = child_ids;
+        id
+    }
+
     fn ingest(&mut self, node: &Node, parent: Option<NodeId>, parent_idx: usize) -> NodeId {
         match node {
             Node::Raw {
@@ -300,6 +482,8 @@ impl Arena {
     /// Bump the mutation epoch.  Called at commit time by the splice engine;
     /// exposed at crate level so groundwork tests can drive it before the
     /// engine lands.
+    // TODO(fixing milestone): called by `commit_staged`.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn bump_epoch(&mut self) {
         self.epoch += 1;
@@ -316,6 +500,8 @@ impl Arena {
 
     /// Attach source fixes to a (leaf) node.  Used when ingesting fix edit
     /// segments; replaces any existing entry.
+    // TODO(fixing milestone): used by the splice engine (tests exercise it now).
+    #[allow(dead_code)]
     pub(crate) fn set_source_fixes(&mut self, id: NodeId, fixes: Vec<SourceFixSpec>) {
         if fixes.is_empty() {
             self.source_fixes.remove(&id);
@@ -1189,6 +1375,114 @@ mod tests {
         // Clearing removes the side-table entry.
         arena.set_source_fixes(kw, Vec::new());
         assert_eq!(arena.node_source_fixes(root).len(), 1);
+    }
+
+    fn raw_spec(uuid: u128, ty: &str, text: &str) -> NodeSpec {
+        NodeSpec {
+            uuid,
+            kind: SpecKind::Raw {
+                segment_class: "RawSegment".to_string(),
+                segment_type: ty.to_string(),
+                class_type: ty.to_string(),
+                raw: text.to_string(),
+                instance_types: Vec::new(),
+                class_types: vec![ty.to_string()],
+                kwargs: RawSegmentKwargs::default(),
+            },
+            source_fixes: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spec_raw_joins_subtree() {
+        let spec = NodeSpec {
+            uuid: 1,
+            kind: SpecKind::Segment {
+                segment_class: "CastExpressionSegment".to_string(),
+                segment_type: Some("cast_expression".to_string()),
+                class_types: vec!["cast_expression".to_string()],
+            },
+            source_fixes: Vec::new(),
+            children: vec![raw_spec(2, "keyword", "cast"), raw_spec(3, "symbol", "(")],
+        };
+        assert_eq!(spec.spec_raw(), "cast(");
+        // Metas contribute nothing.
+        let meta = NodeSpec {
+            uuid: 4,
+            kind: SpecKind::Meta {
+                meta_type: MetaType::Indent { is_implicit: false },
+                block_uuid: None,
+            },
+            source_fixes: Vec::new(),
+            children: Vec::new(),
+        };
+        assert_eq!(meta.spec_raw(), "");
+    }
+
+    #[test]
+    fn ingest_spec_preserves_uuid_and_structure() {
+        let mut arena = Arena::from_node(&select_tree());
+        let before_len = arena.len();
+        let spec = NodeSpec {
+            uuid: (1u128 << 120) | 42, // PYTHON_TAG-style uuid
+            kind: SpecKind::Segment {
+                segment_class: "ColumnReferenceSegment".to_string(),
+                segment_type: Some("column_reference".to_string()),
+                class_types: vec!["column_reference".to_string()],
+            },
+            source_fixes: Vec::new(),
+            children: vec![raw_spec((1u128 << 120) | 43, "naked_identifier", "b")],
+        };
+        let id = arena.ingest_spec(&spec, None, 0);
+        assert_eq!(arena.len(), before_len + 2);
+        // uuid preserved + resolvable.
+        assert_eq!(arena.uuid(id), (1u128 << 120) | 42);
+        assert_eq!(arena.node_by_uuid((1u128 << 120) | 42), Some(id));
+        // Structure + payload.
+        assert_eq!(arena.raw(id), "b");
+        assert_eq!(arena.get_type(id), "column_reference");
+        let kids = arena.children(id).to_vec();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(arena.parent(kids[0]), Some(id));
+        assert_eq!(arena.get_type(kids[0]), "naked_identifier");
+        // No pos_marker until the position pass runs.
+        assert!(arena.pos_marker(id).is_none());
+        // Detached by construction (no parent link).
+        assert!(arena.is_detached(id));
+    }
+
+    #[test]
+    fn ingest_spec_mints_on_uuid_collision() {
+        let mut arena = Arena::from_node(&select_tree());
+        let existing_uuid = arena.uuid(arena.root());
+        let spec = raw_spec(existing_uuid, "whitespace", " ");
+        let id = arena.ingest_spec(&spec, None, 0);
+        // Fresh uuid minted; original mapping untouched.
+        assert_ne!(arena.uuid(id), existing_uuid);
+        assert_eq!(arena.node_by_uuid(existing_uuid), Some(arena.root()));
+        assert_eq!(arena.node_by_uuid(arena.uuid(id)), Some(id));
+    }
+
+    #[test]
+    fn ingest_spec_carries_source_fixes() {
+        let mut arena = Arena::from_node(&select_tree());
+        let mut spec = raw_spec(999, "placeholder", "");
+        spec.source_fixes = vec![SourceFixSpec {
+            edit: "{%+ if true -%}".to_string(),
+            source_slice: Slice {
+                start: 14,
+                stop: 27,
+            },
+            templated_slice: Slice {
+                start: 14,
+                stop: 14,
+            },
+        }];
+        let id = arena.ingest_spec(&spec, None, 0);
+        let fixes = arena.node_source_fixes(id);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].edit, "{%+ if true -%}");
     }
 
     #[test]

@@ -19,8 +19,11 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 
 use sqlfluffrs_python::marker::PyPositionMarker;
+use sqlfluffrs_types::token::CaseFold;
+use sqlfluffrs_types::Slice;
 
-use super::arena::{Arena, NodeId};
+use super::arena::{Arena, EditKind, EditOp, NodeId, NodeSpec, SourceFixSpec, SpecKind};
+use super::types::{MetaType, RawSegmentKwargs};
 
 /// The arena is shared behind `Arc<Mutex<…>>` rather than `Rc<RefCell<…>>` so
 /// that `RsTree`/`RsHandle` are `Send` — the linter moves the parse tree (which
@@ -474,4 +477,180 @@ impl PyHandle {
             a.raw(self.node)
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// FFI extraction of fix edit batches (EditOp / NodeSpec), built by the façade's
+// `_segment_to_spec` / `_anchor_info_to_ops` as positional tuples.
+//
+// NodeSpec tuple layout (one per edit segment, recursive in `children`):
+//   (tag, uuid, segment_class, segment_type, class_type, raw,
+//    instance_types, class_types, kwargs, meta, source_fixes, children)
+// where tag ∈ {"raw", "segment", "meta"}; `kwargs` is
+//   (trim_chars, trim_start, quoted_value, escape_replacements, casefold)
+// for raws (else None); `meta` is
+//   (meta_kind, source_str, block_type, is_implicit, block_uuid)
+// for metas (else None); `source_fixes` is
+//   [(edit, (src_start, src_stop), (tpl_start, tpl_stop)), …].
+//
+// EditOp tuple layout: (anchor_uuid, kind, edits) with
+// kind ∈ {"delete", "replace", "create_before", "create_after"}.
+// ---------------------------------------------------------------------------
+
+// TODO(fixing milestone phase 3): consumed by `stage_edit_batch`; the allows
+// are removed when the splice engine lands.
+#[allow(dead_code)]
+pub(crate) fn extract_edit_ops(obj: &Bound<'_, PyAny>) -> PyResult<Vec<EditOp>> {
+    let mut out = Vec::new();
+    for item in obj.try_iter()? {
+        let item = item?;
+        let (anchor_uuid, kind_str, edits_obj): (u128, String, Bound<'_, PyAny>) =
+            item.extract()?;
+        let kind = match kind_str.as_str() {
+            "delete" => EditKind::Delete,
+            "replace" => EditKind::Replace,
+            "create_before" => EditKind::CreateBefore,
+            "create_after" => EditKind::CreateAfter,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown edit kind: {other:?}"
+                )))
+            }
+        };
+        let mut edits = Vec::new();
+        for e in edits_obj.try_iter()? {
+            edits.push(extract_node_spec(&e?)?);
+        }
+        out.push(EditOp {
+            anchor_uuid,
+            kind,
+            edits,
+        });
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+type PyKwargsTuple = (
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<(String, String)>,
+    Option<Vec<(String, String)>>,
+    Option<String>,
+);
+#[allow(dead_code)]
+type PyMetaTuple = (String, Option<String>, Option<String>, bool, Option<u128>);
+#[allow(dead_code)]
+type PySourceFixTuple = (String, (usize, usize), (usize, usize));
+
+#[allow(dead_code)]
+fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
+    #[allow(clippy::type_complexity)]
+    let (
+        tag,
+        uuid,
+        segment_class,
+        segment_type,
+        class_type,
+        raw,
+        instance_types,
+        class_types,
+        kwargs,
+        meta,
+        source_fixes,
+        children_obj,
+    ): (
+        String,
+        u128,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+        Vec<String>,
+        Option<PyKwargsTuple>,
+        Option<PyMetaTuple>,
+        Vec<PySourceFixTuple>,
+        Bound<'_, PyAny>,
+    ) = obj.extract()?;
+
+    let kind = match tag.as_str() {
+        "raw" => {
+            let (trim_chars, trim_start, quoted_value, escape_replacements, casefold) =
+                kwargs.unwrap_or((None, None, None, None, None));
+            SpecKind::Raw {
+                segment_class: segment_class.unwrap_or_default(),
+                segment_type: segment_type.clone().unwrap_or_default(),
+                class_type: class_type.or(segment_type).unwrap_or_default(),
+                raw: raw.unwrap_or_default(),
+                instance_types,
+                class_types,
+                kwargs: RawSegmentKwargs {
+                    trim_chars,
+                    trim_start,
+                    quoted_value,
+                    escape_replacements,
+                    casefold: match casefold.as_deref() {
+                        Some("upper") => CaseFold::Upper,
+                        Some("lower") => CaseFold::Lower,
+                        _ => CaseFold::None,
+                    },
+                },
+            }
+        }
+        "segment" => SpecKind::Segment {
+            segment_class: segment_class.unwrap_or_default(),
+            segment_type,
+            class_types,
+        },
+        "meta" => {
+            let (meta_kind, source_str, block_type, is_implicit, block_uuid) =
+                meta.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("meta spec missing meta tuple")
+                })?;
+            let meta_type = match meta_kind.as_str() {
+                "indent" => MetaType::Indent { is_implicit },
+                "dedent" => MetaType::Dedent { is_implicit },
+                "placeholder" => MetaType::Template {
+                    source_str: source_str.unwrap_or_default(),
+                    block_type: block_type.unwrap_or_default(),
+                },
+                "template_loop" => MetaType::TemplateLoop,
+                "end_of_file" => MetaType::EndOfFile,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown meta kind: {other:?}"
+                    )))
+                }
+            };
+            SpecKind::Meta {
+                meta_type,
+                block_uuid,
+            }
+        }
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown spec tag: {other:?}"
+            )))
+        }
+    };
+
+    let mut children = Vec::new();
+    for c in children_obj.try_iter()? {
+        children.push(extract_node_spec(&c?)?);
+    }
+
+    Ok(NodeSpec {
+        uuid,
+        kind,
+        source_fixes: source_fixes
+            .into_iter()
+            .map(|(edit, (s0, s1), (t0, t1))| SourceFixSpec {
+                edit,
+                source_slice: Slice { start: s0, stop: s1 },
+                templated_slice: Slice { start: t0, stop: t1 },
+            })
+            .collect(),
+        children,
+    })
 }
