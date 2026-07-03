@@ -734,8 +734,6 @@ class RsSegment:
         ``TemplateSegment.edit``: when ``source_str`` is given we're editing a
         template placeholder, so return a ``TemplateSegment``.
         """
-        from sqlfluff.core.parser import RawSegment
-
         if source_str is not None:
             from sqlfluff.core.parser.segments.meta import TemplateSegment
 
@@ -746,12 +744,21 @@ class RsSegment:
                 source_fixes=source_fixes,
             )
         # Mirror RawSegment.edit: `raw` defaults to the current raw (fixes that
-        # only set source_fixes, e.g. JJ01, pass raw=None but must keep the raw).
-        return RawSegment(
+        # only set source_fixes, e.g. JJ01, pass raw=None but must keep the raw)
+        # and — crucially — the edited copy keeps the segment's CLASS identity
+        # (native returns `self.__class__(...)`). A bare RawSegment would come
+        # back typed "raw", so e.g. a reflow-edited whitespace would stop being
+        # `whitespace` on the mutated tree and re-trigger spacing rules forever
+        # (the v1 source-patch loop masked this by re-lexing on reparse).
+        h = self._h
+        cls = _synth_segment_class(h.segment_class, h.type, self.class_types, True)
+        seg = cls(
             raw=raw if raw is not None else self.raw,
             pos_marker=self.pos_marker,
+            instance_types=tuple(h.instance_types()),
             source_fixes=source_fixes,
         )
+        return seg
 
     def __getattr__(self, name: str) -> Any:
         # Only fires for BaseSegment API the façade doesn't implement yet. Raising
@@ -941,6 +948,234 @@ def _native_apply_fixes(
         return None
 
 
+def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
+    """Convert a fix *edit* segment into the arena NodeSpec tuple.
+
+    Layout (matching ``extract_node_spec`` in arena_py.rs)::
+
+        (tag, uuid, segment_class, segment_type, class_type, raw,
+         instance_types, class_types, kwargs, meta, source_fixes, children)
+
+    Works for real dialect segments, ``RawSegment``s from ``RsSegment.edit``,
+    and the synthetic classes from ``RsSegment.copy``.
+    """
+    seg_type = seg.get_type()
+    cls_type = getattr(type(seg), "type", None) or seg_type
+    src_fixes = [
+        (
+            sf.edit,
+            (sf.source_slice.start, sf.source_slice.stop),
+            (sf.templated_slice.start, sf.templated_slice.stop),
+        )
+        for sf in (getattr(seg, "source_fixes", None) or [])
+    ]
+    class_types = sorted(seg.class_types)
+    if seg.is_meta:
+        kind = seg_type
+        if kind not in (
+            "indent",
+            "dedent",
+            "placeholder",
+            "template_loop",
+            "end_of_file",
+        ):
+            # Dedent subclasses Indent; classify by class types.
+            kind = "dedent" if seg.is_type("dedent") else "indent"
+        block_uuid = getattr(seg, "block_uuid", None)
+        meta = (
+            kind,
+            getattr(seg, "source_str", None) if kind == "placeholder" else None,
+            getattr(seg, "block_type", None) if kind == "placeholder" else None,
+            bool(getattr(seg, "is_implicit", False)),
+            block_uuid.int if block_uuid is not None else None,
+        )
+        return (
+            "meta",
+            seg.uuid,
+            type(seg).__name__,
+            seg_type,
+            cls_type,
+            "",
+            [],
+            class_types,
+            None,
+            meta,
+            src_fixes,
+            [],
+        )
+    if not seg.segments:
+        # Raw leaf.
+        fold = getattr(seg, "casefold", None)
+        casefold = (
+            "upper" if fold is str.upper else "lower" if fold is str.lower else None
+        )
+        qv = getattr(seg, "quoted_value", None)
+        kwargs = (
+            list(seg.trim_chars) if getattr(seg, "trim_chars", None) else None,
+            list(seg.trim_start) if getattr(seg, "trim_start", None) else None,
+            (qv[0], str(qv[1])) if qv else None,
+            [tuple(e) for e in getattr(seg, "escape_replacements", None) or []] or None,
+            casefold,
+        )
+        return (
+            "raw",
+            seg.uuid,
+            type(seg).__name__,
+            seg_type,
+            cls_type,
+            seg.raw,
+            sorted(getattr(seg, "instance_types", ()) or ()),
+            class_types,
+            kwargs,
+            None,
+            src_fixes,
+            [],
+        )
+    return (
+        "segment",
+        seg.uuid,
+        type(seg).__name__,
+        seg_type,
+        cls_type,
+        None,
+        [],
+        class_types,
+        None,
+        None,
+        src_fixes,
+        [_segment_to_spec(c) for c in seg.segments],
+    )
+
+
+def _anchor_info_to_ops(anchor_info: Any) -> list[tuple[int, str, list[Any]]]:
+    """Convert native ``compute_anchor_edit_info`` output to arena EditOps."""
+    ops: list[tuple[int, str, list[Any]]] = []
+    for uuid, info in anchor_info.items():
+        for fx in info.fixes:
+            ops.append(
+                (
+                    uuid,
+                    fx.edit_type,
+                    [_segment_to_spec(e) for e in (fx.edit or [])],
+                )
+            )
+    return ops
+
+
+def _sweep_wrapper_caches() -> None:
+    """Invalidate interned ``RsSegment`` caches after an arena commit.
+
+    ``_segments`` (children tuple) and ``_rwa`` (raw_segments_with_ancestors)
+    are subtree-derived and go stale on mutation; ``_ct``/``_uid`` stay — a
+    surviving node never changes kind or uuid in place (replace creates new
+    nodes).  An explicit sweep at the single mutation point beats per-access
+    epoch checks, which would tax the hot crawl path.
+    """
+    for seg in list(_INTERN.values()):
+        seg._segments = None
+        seg._rwa = None
+
+
+def facade_fix_loop_v3(
+    source: str,
+    fname: str,
+    config: Any,
+    rules: list[Any],
+    limit: int,
+) -> str:
+    """Iteratively fix ``source`` by MUTATING the arena (no reparse).
+
+    Mirrors ``Linter.lint_fix_parsed`` (linter.py:457-660): parse once; per
+    rule crawl the same (mutated) façade tree, stage the fix batch on the
+    arena, gate the commit on native's loop-protections — the
+    ``(raw, source_fixes)`` version set AND the consecutive-identical-fixes
+    check — then reconstruct the fixed source with native patch generation
+    over the mutated façade.
+    """
+    import sqlfluffrs
+    from sqlfluff.core.linter.fix import compute_anchor_edit_info
+    from sqlfluff.core.linter.linted_file import LintedFile
+    from sqlfluff.core.linter.patch import generate_source_patches
+
+    dialect_obj = config.get("dialect_obj")
+    rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
+    if rst is None:
+        return source
+    tf = rst.templated_file
+    if tf is None:
+        return source
+    root = RsSegment(rst.root)
+    root_handle = rst.root
+    feu = bool(config.get("fix_even_unparsable"))
+
+    def current_version() -> tuple[str, tuple[Any, ...]]:
+        return (root.raw, tuple(root_handle.source_fixes()))
+
+    previous_versions: set[tuple[str, tuple[Any, ...]]] = {current_version()}
+    last_fixes: Any = None
+    by_phase = {
+        "main": [r for r in rules if r.lint_phase == "main"],
+        "post": [r for r in rules if r.lint_phase == "post"],
+    }
+
+    for phase in ("main", "post"):
+        nloops = limit if phase == "main" else 2
+        for loop in range(nloops):
+            this = rules if (phase == "main" and loop == 0) else by_phase[phase]
+            changed = False
+            for rule in this:
+                _v, _r, fixes, _m = rule.crawl(
+                    tree=root,
+                    dialect=dialect_obj,
+                    fix=True,
+                    templated_file=tf,
+                    ignore_mask=None,
+                    fname=fname,
+                    config=config,
+                )
+                if not fixes:
+                    continue
+                anchor_info = compute_anchor_edit_info(fixes)
+                if any(not info.is_valid for info in anchor_info.values()):
+                    continue  # conflicting fixes on one anchor (native drops)
+                if fixes == last_fixes:
+                    # Same fixes twice in a row -> we're looping; stop
+                    # applying (native linter.py:597-608).
+                    continue
+                last_fixes = fixes
+                ops = _anchor_info_to_ops(anchor_info)
+                (
+                    staged_raw,
+                    staged_sfx,
+                    _applied,
+                    _unapplied,
+                    _reverted,
+                    st_changed,
+                ) = rst.stage_edit_batch(ops, feu)
+                staged_version = (staged_raw, tuple(staged_sfx))
+                if (
+                    not st_changed
+                    or staged_version == current_version()
+                    or staged_version in previous_versions
+                ):
+                    rst.discard_staged()
+                    continue
+                rst.commit_staged()
+                _sweep_wrapper_caches()
+                previous_versions.add(staged_version)
+                changed = True
+            if not changed:
+                break
+
+    # Reconstruction: native patch generation over the mutated façade.
+    patches = generate_source_patches(root, tf)  # type: ignore[arg-type]
+    source_only = tf.source_only_slices()
+    slices = LintedFile._slice_source_file_using_patches(
+        patches, source_only, tf.source_str
+    )
+    return LintedFile._build_up_fixed_source_string(slices, patches, tf.source_str)
+
+
 def facade_fix_loop(
     source: str,
     fname: str,
@@ -950,10 +1185,19 @@ def facade_fix_loop(
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
-    Mirrors the main/post phase scheduling of ``Linter.lint_fix_parsed``
-    (source-patch + re-parse, version-based loop detection).
+    Default (v1): source-patch + re-parse per applied fix, mirroring the
+    main/post phase scheduling of ``Linter.lint_fix_parsed``.  Set
+    ``SQLFLUFF_RS_FIX_V3=1`` to route through :func:`facade_fix_loop_v3`
+    (arena mutation, no reparse) — the transition flag while v3 is vetted;
+    v3 becomes the default (and v1 is retired) once the corpus parity + perf
+    gates pass.
     """
+    import os
+
     import sqlfluffrs
+
+    if os.environ.get("SQLFLUFF_RS_FIX_V3") == "1":
+        return facade_fix_loop_v3(source, fname, config, rules, limit)
 
     dialect_obj = config.get("dialect_obj")
     by_phase = {

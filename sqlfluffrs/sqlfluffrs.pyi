@@ -252,6 +252,34 @@ class RsTree:
 
     def __len__(self) -> int: ...
     def node_by_uuid(self, uuid: int) -> Optional[RsHandle]: ...
+    def stage_edit_batch(
+        self, ops: List[tuple], fix_even_unparsable: bool
+    ) -> tuple[
+        str,
+        List[tuple[str, tuple[int, int], tuple[int, int]]],
+        int,
+        List[int],
+        int,
+        bool,
+    ]:
+        """Plan an edit batch WITHOUT mutating.
+
+        ``ops`` is ``[(anchor_uuid, kind, edits), …]`` (see arena_py.rs).
+        Returns ``(staged_raw, staged_source_fixes, applied,
+        unapplied_anchors, reverted_containers, changed)`` so the fix loop can
+        run native's loop-detection gates on the predicted state.
+        """
+        ...
+
+    def commit_staged(self) -> int:
+        """Install the staged plan; returns the new epoch. Errors if none."""
+        ...
+
+    def discard_staged(self) -> None:
+        """Drop the staged plan without mutating."""
+        ...
+
+    def has_staged(self) -> bool: ...
 
 class RsParseError(Exception):
     """Exception raised by Rust parser when parsing fails.

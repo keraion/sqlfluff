@@ -1568,9 +1568,20 @@ impl Arena {
 
     pub(crate) fn is_whitespace(&self, id: NodeId) -> bool {
         match &self.node(id).kind {
-            ArenaKind::Raw { instance_types, .. } => instance_types
-                .iter()
-                .any(|t| matches!(t.as_str(), "whitespace" | "newline")),
+            ArenaKind::Raw {
+                segment_type,
+                instance_types,
+                ..
+            } => {
+                // Check the semantic type as well as instance_types: lexed
+                // tokens always carry instance_types, but nodes ingested from
+                // fix edit segments (e.g. a NewlineSegment created by a rule)
+                // may not — the type check mirrors `is_code`'s.
+                matches!(segment_type.as_ref(), "whitespace" | "newline")
+                    || instance_types
+                        .iter()
+                        .any(|t| matches!(t.as_str(), "whitespace" | "newline"))
+            }
             ArenaKind::Segment { .. } | ArenaKind::Unparsable { .. } => {
                 let kids = self.children(id);
                 !kids.is_empty() && kids.iter().all(|&c| self.is_whitespace(c))
@@ -2613,7 +2624,6 @@ mod tests {
         arena.discard_staged();
         assert_eq!(arena.epoch(), 0);
     }
-
 
     // -- position pass golden tests -------------------------------------------
 
