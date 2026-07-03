@@ -56,6 +56,16 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # no ``match_grammar``), so it applies a fix native won't. Faithfully replicating
 # the validation needs full real-dialect-class materialisation (real leaves too),
 # which defeats the façade; deferring RF06 to the Python path is the safe fix.
+#
+# TQ02 was also DROPPED, for a *different* reason — a reparse-vs-mutate fixed-point
+# divergence, not a validation gap. On a tsql procedure body its fix reorders
+# BEGIN / SET NOCOUNT; native's apply_fixes re-fires it on the MUTATED tree every
+# pass (never stabilises) → hits runaway_limit → reverts to the ORIGINAL. The
+# façade re-crawls the REPARSED source, where the fix does NOT re-fire → it
+# stabilises after one pass and keeps the reorder. The façade reaches a stable
+# fixed point native's mutate-loop can't; matching native's give-up would require
+# running native's mutate-loop (defeating the façade). Loop-hardening can't help
+# (the façade stabilises); deferring TQ02 to Python is the safe fix.
 FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
     {"AL04", "AL10", "CP01", "CV09", "RF02", "ST03"}
 )
@@ -109,7 +119,6 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "ST08",
         "ST09",
         "TQ01",
-        "TQ02",
         "TQ03",
     }
 )
