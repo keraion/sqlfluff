@@ -116,6 +116,71 @@ impl PyTree {
         id.map(|n| self.handle(n))
     }
 
+    /// Plan an edit batch WITHOUT mutating.  `ops` is a list of
+    /// `(anchor_uuid, kind, edits)` tuples (see the extraction docs at the
+    /// bottom of this module).  Returns
+    /// `(staged_raw, staged_source_fixes, applied, unapplied_anchors,
+    /// reverted_containers, changed)` so the Python fix loop can run native's
+    /// loop-detection gates on the predicted state before committing.
+    #[allow(clippy::type_complexity)]
+    fn stage_edit_batch(
+        &self,
+        ops: &Bound<'_, PyAny>,
+        fix_even_unparsable: bool,
+    ) -> PyResult<(
+        String,
+        Vec<(String, (usize, usize), (usize, usize))>,
+        usize,
+        Vec<u128>,
+        usize,
+        bool,
+    )> {
+        let ops = extract_edit_ops(ops)?;
+        let summary = self
+            .inner
+            .lock()
+            .unwrap()
+            .stage_edit_batch(ops, fix_even_unparsable);
+        Ok((
+            summary.staged_raw,
+            summary
+                .staged_source_fixes
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.edit,
+                        (f.source_slice.start, f.source_slice.stop),
+                        (f.templated_slice.start, f.templated_slice.stop),
+                    )
+                })
+                .collect(),
+            summary.applied,
+            summary.unapplied_anchors,
+            summary.reverted_containers,
+            summary.changed,
+        ))
+    }
+
+    /// Install the staged plan (splice + cache invalidation + epoch bump).
+    /// Errors if nothing is staged.
+    fn commit_staged(&self) -> PyResult<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commit_staged()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("no edit batch staged"))
+    }
+
+    /// Drop the staged plan without mutating.
+    fn discard_staged(&self) {
+        self.inner.lock().unwrap().discard_staged();
+    }
+
+    /// Whether an edit batch is currently staged.
+    fn has_staged(&self) -> bool {
+        self.inner.lock().unwrap().has_staged()
+    }
+
     fn __repr__(&self) -> String {
         format!("RsTree(nodes={})", self.inner.lock().unwrap().len())
     }
@@ -497,9 +562,6 @@ impl PyHandle {
 // kind ∈ {"delete", "replace", "create_before", "create_after"}.
 // ---------------------------------------------------------------------------
 
-// TODO(fixing milestone phase 3): consumed by `stage_edit_batch`; the allows
-// are removed when the splice engine lands.
-#[allow(dead_code)]
 pub(crate) fn extract_edit_ops(obj: &Bound<'_, PyAny>) -> PyResult<Vec<EditOp>> {
     let mut out = Vec::new();
     for item in obj.try_iter()? {
@@ -530,7 +592,6 @@ pub(crate) fn extract_edit_ops(obj: &Bound<'_, PyAny>) -> PyResult<Vec<EditOp>> 
     Ok(out)
 }
 
-#[allow(dead_code)]
 type PyKwargsTuple = (
     Option<Vec<String>>,
     Option<Vec<String>>,
@@ -538,12 +599,9 @@ type PyKwargsTuple = (
     Option<Vec<(String, String)>>,
     Option<String>,
 );
-#[allow(dead_code)]
 type PyMetaTuple = (String, Option<String>, Option<String>, bool, Option<u128>);
-#[allow(dead_code)]
 type PySourceFixTuple = (String, (usize, usize), (usize, usize));
 
-#[allow(dead_code)]
 fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
     #[allow(clippy::type_complexity)]
     let (
@@ -647,8 +705,14 @@ fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
             .into_iter()
             .map(|(edit, (s0, s1), (t0, t1))| SourceFixSpec {
                 edit,
-                source_slice: Slice { start: s0, stop: s1 },
-                templated_slice: Slice { start: t0, stop: t1 },
+                source_slice: Slice {
+                    start: s0,
+                    stop: s1,
+                },
+                templated_slice: Slice {
+                    start: t0,
+                    stop: t1,
+                },
             })
             .collect(),
         children,

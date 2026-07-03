@@ -17,6 +17,11 @@
 //! uuid through `apply_as_root` is deferred to the fixing milestone where
 //! cross-reingest identity matters for `LintFix` anchoring.
 
+// Most of the arena's crate-public surface is consumed via the python-gated
+// `arena_py` bindings; a no-python build (plain `cargo test`) would otherwise
+// drown in cascade dead-code warnings for code the extension build exercises.
+#![cfg_attr(not(feature = "python"), allow(dead_code))]
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -50,9 +55,6 @@ pub(crate) enum EditKind {
 /// One fix to apply: native `LintFix` reduced to what the arena needs —
 /// the anchor's uuid (fix matching is by `anchor.uuid`, `fix.py:160`), the
 /// edit type, and the replacement/insertion segments as [`NodeSpec`]s.
-// TODO(fixing milestone): consumed by the splice engine (`stage_edit_batch`);
-// the dead_code allow goes away when it lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct EditOp {
     pub(crate) anchor_uuid: u128,
@@ -61,9 +63,6 @@ pub(crate) struct EditOp {
 }
 
 /// Payload for a to-be-created node, mirroring [`ArenaKind`] minus caches.
-// TODO(fixing milestone): fields read by `ingest_spec` (in tests today) and
-// the splice engine; allow goes away when `stage_edit_batch` lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum SpecKind {
     Raw {
@@ -106,8 +105,6 @@ pub(crate) struct NodeSpec {
 impl NodeSpec {
     /// Joined raw of the spec subtree — mirrors `BaseSegment.raw` for the
     /// yet-to-be-created segment (used for the `consumed_pos` match).
-    // TODO(fixing milestone): used by the splice engine's consumed_pos check.
-    #[allow(dead_code)]
     pub(crate) fn spec_raw(&self) -> String {
         match &self.kind {
             SpecKind::Raw { raw, .. } => raw.clone(),
@@ -119,6 +116,62 @@ impl NodeSpec {
                 }
                 s
             }
+        }
+    }
+
+    fn is_meta(&self) -> bool {
+        matches!(self.kind, SpecKind::Meta { .. })
+    }
+
+    /// Mirrors [`Arena::is_code`] over the not-yet-created payload (used by
+    /// the non-code bubble-up check on planned children).
+    fn is_code(&self) -> bool {
+        match &self.kind {
+            SpecKind::Meta { .. } => false,
+            SpecKind::Raw {
+                segment_type,
+                instance_types,
+                class_types,
+                ..
+            } => {
+                let non_code_by_instance = instance_types.iter().any(|t| {
+                    matches!(
+                        t.as_str(),
+                        "whitespace"
+                            | "newline"
+                            | "comment"
+                            | "inline_comment"
+                            | "block_comment"
+                            | "trailing_newline"
+                    )
+                });
+                let non_code_by_type = segment_type.contains("comment")
+                    || matches!(segment_type.as_str(), "whitespace" | "newline");
+                let non_code_by_class = class_types.iter().any(|t| t == "comment");
+                !(non_code_by_instance || non_code_by_type || non_code_by_class)
+            }
+            SpecKind::Segment { .. } => self.children.iter().any(|c| c.is_code()),
+        }
+    }
+
+    /// The spec's declared class types (what Python sent — the edit segment's
+    /// full `class_types` set), for the native validate-skip comparison
+    /// (`f.edit[0].class_types == seg.class_types`, fix.py:223-227).
+    fn class_type_set(&self) -> HashSet<String> {
+        match &self.kind {
+            SpecKind::Raw { class_types, .. } | SpecKind::Segment { class_types, .. } => {
+                class_types.iter().cloned().collect()
+            }
+            SpecKind::Meta { .. } => HashSet::new(),
+        }
+    }
+
+    /// Subtree source fixes in document order (spec analogue of
+    /// [`Arena::node_source_fixes`]).
+    fn spec_source_fixes(&self, out: &mut Vec<SourceFixSpec>) {
+        out.extend(self.source_fixes.iter().cloned());
+        for c in &self.children {
+            c.spec_source_fixes(out);
         }
     }
 }
@@ -199,6 +252,74 @@ pub(crate) struct Arena {
     /// most) while nodes number in the tens of thousands.  Containers aggregate
     /// over their subtree on read (mirroring `BaseSegment.source_fixes`).
     source_fixes: HashMap<NodeId, Vec<SourceFixSpec>>,
+    /// A staged (planned but uncommitted) edit batch.  Staging computes the
+    /// full splice plan *without mutating* so the Python fix loop can run
+    /// native's loop-detection gates on the predicted state and only then
+    /// commit — mirroring how native `apply_fixes` builds a new tree
+    /// functionally and adopts it after the checks (`linter.py:623-656`).
+    staged: Option<StagedBatch>,
+}
+
+/// One entry in a planned child list: either an existing arena node (kept,
+/// possibly relocated by non-code bubble-up) or a to-be-created [`NodeSpec`]
+/// (with the anchor's position marker when inherited via `consumed_pos`).
+#[derive(Debug, Clone)]
+enum PlannedChild {
+    Existing(NodeId),
+    New(Box<NodeSpec>, Option<PositionMarker>),
+}
+
+/// A fully-planned edit batch: for every container whose child list changes,
+/// the complete new list; plus the subtree roots removed by delete/replace.
+pub(crate) struct StagedBatch {
+    children_of: HashMap<NodeId, Vec<PlannedChild>>,
+    tombstones: Vec<NodeId>,
+}
+
+/// What staging predicts, so Python can gate the commit (native's
+/// `(raw, source_fixes)` loop checks) without mutating anything.
+pub(crate) struct StageSummary {
+    pub(crate) staged_raw: String,
+    pub(crate) staged_source_fixes: Vec<SourceFixSpec>,
+    pub(crate) applied: usize,
+    pub(crate) unapplied_anchors: Vec<u128>,
+    pub(crate) reverted_containers: usize,
+    pub(crate) changed: bool,
+}
+
+/// Result of a subtree plan (mirrors native `apply_fixes`' recursive return:
+/// the planned node plus non-code bubbled up to the parent).
+struct SubPlan {
+    changed: bool,
+    pre: Vec<PlannedChild>,
+    post: Vec<PlannedChild>,
+    children_of: HashMap<NodeId, Vec<PlannedChild>>,
+    tombstones: Vec<NodeId>,
+    applied: usize,
+    reverted: usize,
+}
+
+impl SubPlan {
+    fn unchanged() -> Self {
+        SubPlan {
+            changed: false,
+            pre: Vec::new(),
+            post: Vec::new(),
+            children_of: HashMap::new(),
+            tombstones: Vec::new(),
+            applied: 0,
+            reverted: 0,
+        }
+    }
+
+    fn merge_child(&mut self, other: SubPlan) -> (Vec<PlannedChild>, Vec<PlannedChild>) {
+        self.changed |= other.changed;
+        self.children_of.extend(other.children_of);
+        self.tombstones.extend(other.tombstones);
+        self.applied += other.applied;
+        self.reverted += other.reverted;
+        (other.pre, other.post)
+    }
 }
 
 /// A single step on a path between two nodes — mirrors Python's `PathStep`
@@ -222,6 +343,7 @@ impl Arena {
             by_uuid: HashMap::new(),
             epoch: 0,
             source_fixes: HashMap::new(),
+            staged: None,
         };
         let root = arena.ingest(node, None, 0);
         arena.root = root;
@@ -264,8 +386,6 @@ impl Arena {
     /// `BaseSegment.copy()` keeps uuids, so a rule reusing one edit segment
     /// object across fixes produces duplicates — a fresh Rust uuid is minted
     /// instead, keeping `by_uuid` a bijection over attached nodes.
-    // TODO(fixing milestone): lib callers arrive with the splice engine.
-    #[allow(dead_code)]
     fn alloc_with_uuid(
         &mut self,
         kind: ArenaKind,
@@ -299,8 +419,6 @@ impl Arena {
     /// splice engine links the returned root into a parent's `children`.
     /// `pos_marker` stays `None` throughout — the position pass synthesises
     /// markers after splicing, mirroring native `_position_segments`.
-    // TODO(fixing milestone): lib callers arrive with the splice engine.
-    #[allow(dead_code)]
     pub(crate) fn ingest_spec(
         &mut self,
         spec: &NodeSpec,
@@ -482,8 +600,6 @@ impl Arena {
     /// Bump the mutation epoch.  Called at commit time by the splice engine;
     /// exposed at crate level so groundwork tests can drive it before the
     /// engine lands.
-    // TODO(fixing milestone): called by `commit_staged`.
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn bump_epoch(&mut self) {
         self.epoch += 1;
@@ -500,8 +616,6 @@ impl Arena {
 
     /// Attach source fixes to a (leaf) node.  Used when ingesting fix edit
     /// segments; replaces any existing entry.
-    // TODO(fixing milestone): used by the splice engine (tests exercise it now).
-    #[allow(dead_code)]
     pub(crate) fn set_source_fixes(&mut self, id: NodeId, fixes: Vec<SourceFixSpec>) {
         if fixes.is_empty() {
             self.source_fixes.remove(&id);
@@ -538,6 +652,509 @@ impl Arena {
                 ..
             } => Some(source_str.clone()),
             _ => None,
+        }
+    }
+
+    // -- edit staging / commit (the splice engine) ---------------------------
+    //
+    // Replicates native `apply_fixes` (src/sqlfluff/core/linter/fix.py:107-348)
+    // over the arena, split into a *plan* phase (`stage_edit_batch` — computes
+    // the full splice without mutating, so Python can run native's
+    // loop-detection gates on the predicted state) and a *commit* phase
+    // (`commit_staged` — installs the plan).  Grammar re-validation is a later
+    // milestone; the local "already unparsable → silently revert" guard
+    // (fix.py:317-330) IS replicated.
+
+    /// Native `can_start_end_non_code`: only file and unparsable containers
+    /// may start/end with non-code (whitespace) children.
+    fn can_start_end_non_code(&self, id: NodeId) -> bool {
+        self.is_type(id, "file") || self.is_type(id, "unparsable")
+    }
+
+    fn is_code_or_meta(&self, id: NodeId) -> bool {
+        self.is_code(id) || self.is_meta(id)
+    }
+
+    fn planned_is_code_or_meta(&self, pc: &PlannedChild) -> bool {
+        match pc {
+            PlannedChild::Existing(id) => self.is_code_or_meta(*id),
+            PlannedChild::New(spec, _) => spec.is_code() || spec.is_meta(),
+        }
+    }
+
+    /// Plan an edit batch without mutating.  Returns the predicted state; the
+    /// plan is stored on the arena for `commit_staged` / `discard_staged`.
+    pub(crate) fn stage_edit_batch(
+        &mut self,
+        ops: Vec<EditOp>,
+        fix_even_unparsable: bool,
+    ) -> StageSummary {
+        // Group ops by anchor uuid (at most two per anchor: the
+        // create_before+create_after pair — Python's compute_anchor_edit_info
+        // enforces validity before we're called).
+        let mut ops_map: HashMap<u128, Vec<EditOp>> = HashMap::new();
+        for op in ops {
+            ops_map.entry(op.anchor_uuid).or_default().push(op);
+        }
+
+        // Dirty set: every ancestor chain from each anchor's PARENT to the
+        // root (fixes are applied from the parent; native visits everything
+        // but only paths towards remaining anchors can match).
+        let mut dirty: HashSet<NodeId> = HashSet::new();
+        for uuid in ops_map.keys() {
+            if let Some(anchor) = self.node_by_uuid(*uuid) {
+                let mut cur = self.parent(anchor);
+                while let Some(p) = cur {
+                    if !dirty.insert(p) {
+                        break; // chain above already marked
+                    }
+                    cur = self.parent(p);
+                }
+            }
+        }
+
+        let plan = self.plan_node(self.root, &mut ops_map, &dirty, fix_even_unparsable);
+        // Anything still unconsumed never matched a visited child: unknown
+        // uuids, root-anchored ops (native never matches the root — fixes
+        // apply from the parent), or anchors inside deleted/replaced subtrees.
+        let unapplied: Vec<u128> = ops_map.keys().copied().collect();
+
+        let mut children_of = plan.children_of;
+        // Non-code bubbled out of the root has nowhere to go; native's root is
+        // a `file` (can_start_end_non_code), so pre/post are always empty
+        // there.  Guard anyway: fold them into the root's planned list.
+        if !plan.pre.is_empty() || !plan.post.is_empty() {
+            let entry = children_of.entry(self.root).or_insert_with(|| {
+                self.children(self.root)
+                    .iter()
+                    .map(|&c| PlannedChild::Existing(c))
+                    .collect()
+            });
+            let mut merged = plan.pre.clone();
+            merged.extend(entry.iter().cloned());
+            merged.extend(plan.post.clone());
+            *entry = merged;
+        }
+
+        let staged_raw = self.planned_raw(self.root, &children_of);
+        let mut staged_source_fixes = Vec::new();
+        self.planned_source_fixes(self.root, &children_of, &mut staged_source_fixes);
+        let changed = plan.changed && !children_of.is_empty();
+
+        self.staged = Some(StagedBatch {
+            children_of,
+            tombstones: plan.tombstones,
+        });
+
+        StageSummary {
+            staged_raw,
+            staged_source_fixes,
+            applied: plan.applied,
+            unapplied_anchors: unapplied,
+            reverted_containers: plan.reverted,
+            changed,
+        }
+    }
+
+    /// Recursive plan step for one container — mirrors the body of native
+    /// `apply_fixes` (child loop → splice → recurse → non-code trim →
+    /// unparsable guard).
+    fn plan_node(
+        &self,
+        id: NodeId,
+        ops: &mut HashMap<u128, Vec<EditOp>>,
+        dirty: &HashSet<NodeId>,
+        fix_even_unparsable: bool,
+    ) -> SubPlan {
+        // Mirrors native's early-out (`if not fixes or segment.is_raw()`):
+        // nothing can change below a leaf, and off the dirty paths no
+        // remaining anchor can match.
+        if self.children(id).is_empty() || (!dirty.contains(&id) && ops.is_empty()) {
+            return SubPlan::unchanged();
+        }
+        if !dirty.contains(&id) {
+            return SubPlan::unchanged();
+        }
+
+        let mut out = SubPlan::unchanged();
+        let mut buffer: Vec<PlannedChild> = Vec::new();
+        let mut requires_validate = false;
+        let mut fixes_applied = false;
+
+        // -- splice (native fix.py:157-234) -----------------------------------
+        for &child in self.children(id) {
+            let anchor_ops = match ops.remove(&self.uuid(child)) {
+                None => {
+                    buffer.push(PlannedChild::Existing(child));
+                    continue;
+                }
+                Some(a) => a,
+            };
+            fixes_applied = true;
+            let mut anchor_ops = anchor_ops;
+            // The pair case: ensure create_before comes first.
+            if anchor_ops.len() == 2 && anchor_ops[0].kind == EditKind::CreateAfter {
+                anchor_ops.reverse();
+            }
+            let n_fixes = anchor_ops.len();
+            for op in anchor_ops {
+                out.applied += 1;
+                match op.kind {
+                    EditKind::Delete => {
+                        requires_validate = true;
+                        out.tombstones.push(child);
+                    }
+                    EditKind::Replace | EditKind::CreateBefore | EditKind::CreateAfter => {
+                        if op.kind == EditKind::CreateAfter && n_fixes == 1 {
+                            // Unpaired create_after: anchor first.
+                            buffer.push(PlannedChild::Existing(child));
+                        }
+                        let child_raw = self.raw(child);
+                        let mut consumed_pos = false;
+                        let n_edits = op.edits.len();
+                        // Validate-skip: single same-class-types replace
+                        // (fix.py:223-227).
+                        if !(op.kind == EditKind::Replace
+                            && n_edits == 1
+                            && op.edits[0].class_type_set()
+                                == self
+                                    .class_types(child)
+                                    .into_iter()
+                                    .collect::<HashSet<String>>())
+                        {
+                            requires_validate = true;
+                        }
+                        for spec in op.edits {
+                            // consumed_pos: on replace, the FIRST edit whose
+                            // raw equals the anchor's raw inherits the
+                            // anchor's full pos_marker (fix.py:209-217).
+                            let marker = if op.kind == EditKind::Replace
+                                && !consumed_pos
+                                && spec.spec_raw() == child_raw
+                            {
+                                consumed_pos = true;
+                                self.pos_marker(child)
+                            } else {
+                                None
+                            };
+                            buffer.push(PlannedChild::New(Box::new(spec), marker));
+                        }
+                        if op.kind == EditKind::Replace {
+                            out.tombstones.push(child);
+                        }
+                        if op.kind == EditKind::CreateBefore {
+                            buffer.push(PlannedChild::Existing(child));
+                        }
+                    }
+                }
+            }
+        }
+
+        // -- recurse (native fix.py:249-270) ----------------------------------
+        let mut recursed: Vec<PlannedChild> = Vec::new();
+        for pc in buffer {
+            match pc {
+                PlannedChild::Existing(c) => {
+                    let sub = self.plan_node(c, ops, dirty, fix_even_unparsable);
+                    let (pre, post) = out.merge_child(sub);
+                    recursed.extend(pre);
+                    recursed.push(PlannedChild::Existing(c));
+                    recursed.extend(post);
+                }
+                PlannedChild::New(mut spec, marker) => {
+                    // Native recurses into freshly spliced edit segments too:
+                    // `BaseSegment.copy()` preserves uuids, so remaining
+                    // anchors can match INSIDE a replacement copy.
+                    let (pre, post, rv) = Self::plan_spec(&mut spec, ops, &mut out);
+                    requires_validate |= rv;
+                    recursed.extend(
+                        pre.into_iter()
+                            .map(|s| PlannedChild::New(Box::new(s), None)),
+                    );
+                    recursed.push(PlannedChild::New(spec, marker));
+                    recursed.extend(
+                        post.into_iter()
+                            .map(|s| PlannedChild::New(Box::new(s), None)),
+                    );
+                }
+            }
+        }
+        let mut seg_buffer = recursed;
+
+        // -- non-code bubble-up (native fix.py:280-293) ------------------------
+        let mut pre: Vec<PlannedChild> = Vec::new();
+        let mut post: Vec<PlannedChild> = Vec::new();
+        if !self.can_start_end_non_code(id) {
+            let start = seg_buffer
+                .iter()
+                .position(|pc| self.planned_is_code_or_meta(pc))
+                .unwrap_or(seg_buffer.len());
+            pre = seg_buffer.drain(..start).collect();
+            let stop = seg_buffer
+                .iter()
+                .rposition(|pc| self.planned_is_code_or_meta(pc))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            post = seg_buffer.split_off(stop);
+        }
+
+        let changed_here = fixes_applied
+            || out.changed
+            || !pre.is_empty()
+            || !post.is_empty()
+            || seg_buffer.len() != self.children(id).len()
+            || seg_buffer
+                .iter()
+                .zip(self.children(id))
+                .any(|(pc, &c)| !matches!(pc, PlannedChild::Existing(e) if *e == c));
+
+        if !changed_here {
+            // Nothing changed at or below this container — keep the plan
+            // sparse so raw prediction stays cheap.
+            return SubPlan {
+                changed: out.changed,
+                pre: Vec::new(),
+                post: Vec::new(),
+                children_of: out.children_of,
+                tombstones: out.tombstones,
+                applied: out.applied,
+                reverted: out.reverted,
+            };
+        }
+
+        // -- "already unparsable" silent revert (native fix.py:317-330) --------
+        if requires_validate && !fix_even_unparsable {
+            let scoped_unparsable = self.is_type(id, "unparsable")
+                || self.descendant_type_set(id).contains("unparsable");
+            if scoped_unparsable {
+                // Discard every planned change at/below this container and
+                // return the ORIGINAL subtree (native returns `segment`).
+                // Ops consumed within stay consumed — native popped them too.
+                return SubPlan {
+                    changed: false,
+                    pre: Vec::new(),
+                    post: Vec::new(),
+                    children_of: HashMap::new(),
+                    tombstones: Vec::new(),
+                    applied: out.applied,
+                    reverted: out.reverted + 1,
+                };
+            }
+        }
+
+        out.changed = true;
+        out.children_of.insert(id, seg_buffer);
+        out.pre = pre;
+        out.post = post;
+        out
+    }
+
+    /// Spec-level analogue of the child loop + recursion: applies remaining
+    /// ops whose anchors match uuids INSIDE a replacement copy (native reaches
+    /// them by recursing into the spliced edit segments), and trims non-code
+    /// ends of new containers.  Returns (pre, post, requires_validate).
+    fn plan_spec(
+        spec: &mut NodeSpec,
+        ops: &mut HashMap<u128, Vec<EditOp>>,
+        out: &mut SubPlan,
+    ) -> (Vec<NodeSpec>, Vec<NodeSpec>, bool) {
+        if spec.children.is_empty() || ops.is_empty() {
+            return (Vec::new(), Vec::new(), false);
+        }
+        let mut requires_validate = false;
+        let mut buffer: Vec<NodeSpec> = Vec::new();
+        for child in std::mem::take(&mut spec.children) {
+            let anchor_ops = match ops.remove(&child.uuid) {
+                None => {
+                    buffer.push(child);
+                    continue;
+                }
+                Some(a) => a,
+            };
+            let mut anchor_ops = anchor_ops;
+            if anchor_ops.len() == 2 && anchor_ops[0].kind == EditKind::CreateAfter {
+                anchor_ops.reverse();
+            }
+            let n_fixes = anchor_ops.len();
+            for op in anchor_ops {
+                out.applied += 1;
+                match op.kind {
+                    EditKind::Delete => {
+                        requires_validate = true;
+                    }
+                    EditKind::Replace | EditKind::CreateBefore | EditKind::CreateAfter => {
+                        if op.kind == EditKind::CreateAfter && n_fixes == 1 {
+                            buffer.push(child.clone());
+                        }
+                        if !(op.kind == EditKind::Replace
+                            && op.edits.len() == 1
+                            && op.edits[0].class_type_set() == child.class_type_set())
+                        {
+                            requires_validate = true;
+                        }
+                        buffer.extend(op.edits);
+                        if op.kind == EditKind::CreateBefore {
+                            buffer.push(child.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Recurse into spec children.
+        let mut recursed: Vec<NodeSpec> = Vec::new();
+        for mut child in buffer {
+            let (pre, post, rv) = Self::plan_spec(&mut child, ops, out);
+            requires_validate |= rv;
+            recursed.extend(pre);
+            recursed.push(child);
+            recursed.extend(post);
+        }
+        // Non-code trim: a new container may not start/end with non-code
+        // unless it's a file/unparsable (never the case for edit specs).
+        let start = recursed
+            .iter()
+            .position(|s| s.is_code() || s.is_meta())
+            .unwrap_or(recursed.len());
+        let pre: Vec<NodeSpec> = recursed.drain(..start).collect();
+        let stop = recursed
+            .iter()
+            .rposition(|s| s.is_code() || s.is_meta())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let post = recursed.split_off(stop);
+        spec.children = recursed;
+        (pre, post, requires_validate)
+    }
+
+    /// Predicted joined raw with the plan overlaid.
+    fn planned_raw(&self, id: NodeId, children_of: &HashMap<NodeId, Vec<PlannedChild>>) -> String {
+        match children_of.get(&id) {
+            None => self.raw(id),
+            Some(planned) => {
+                let mut s = String::new();
+                for pc in planned {
+                    match pc {
+                        PlannedChild::Existing(c) => s.push_str(&self.planned_raw(*c, children_of)),
+                        PlannedChild::New(spec, _) => s.push_str(&spec.spec_raw()),
+                    }
+                }
+                s
+            }
+        }
+    }
+
+    /// Predicted document-order source fixes with the plan overlaid.
+    fn planned_source_fixes(
+        &self,
+        id: NodeId,
+        children_of: &HashMap<NodeId, Vec<PlannedChild>>,
+        out: &mut Vec<SourceFixSpec>,
+    ) {
+        if let Some(fixes) = self.source_fixes.get(&id) {
+            out.extend(fixes.iter().cloned());
+        }
+        match children_of.get(&id) {
+            None => {
+                for &c in self.children(id) {
+                    self.planned_source_fixes(c, children_of, out);
+                }
+            }
+            Some(planned) => {
+                for pc in planned {
+                    match pc {
+                        PlannedChild::Existing(c) => {
+                            self.planned_source_fixes(*c, children_of, out)
+                        }
+                        PlannedChild::New(spec, _) => spec.spec_source_fixes(out),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Install the staged plan.  Returns the new epoch, or `None` if nothing
+    /// was staged.
+    pub(crate) fn commit_staged(&mut self) -> Option<u64> {
+        let staged = self.staged.take()?;
+
+        // 1. Tombstone removed subtrees FIRST: purge every uuid in each
+        //    subtree from `by_uuid` and unlink the root.  Purging before spec
+        //    ingest lets a replacement copy REUSE the anchor's uuid (native
+        //    `copy()` preserves uuids), keeping identity continuity for
+        //    subsequent crawls without tripping the collision policy.
+        for &t in &staged.tombstones {
+            self.purge_uuids(t);
+            self.nodes[t.idx()].parent = None;
+        }
+
+        // 2. Install planned child lists.  Containers are independent — a
+        //    node moved by bubble-up is simply present in its new parent's
+        //    list and absent from the old one; whichever installs last sets
+        //    the final parent link, and both lists agree by construction.
+        let containers: Vec<NodeId> = staged.children_of.keys().copied().collect();
+        for (&container, planned) in &staged.children_of {
+            let mut final_children: Vec<NodeId> = Vec::with_capacity(planned.len());
+            for (idx, pc) in planned.iter().enumerate() {
+                let cid = match pc {
+                    PlannedChild::Existing(c) => *c,
+                    PlannedChild::New(spec, marker) => {
+                        let nid = self.ingest_spec(spec, Some(container), idx);
+                        if let Some(m) = marker {
+                            self.nodes[nid.idx()].pos_marker = Some(m.clone());
+                        }
+                        nid
+                    }
+                };
+                final_children.push(cid);
+            }
+            for (idx, &cid) in final_children.iter().enumerate() {
+                self.nodes[cid.idx()].parent = Some(container);
+                self.nodes[cid.idx()].parent_idx = idx;
+            }
+            self.nodes[container.idx()].children = final_children;
+        }
+
+        // 3. Invalidate subtree-derived caches on every changed container and
+        //    every ancestor up to the root (both are functions of the whole
+        //    subtree below a node).
+        for container in containers {
+            let mut cur = Some(container);
+            while let Some(c) = cur {
+                *self.nodes[c.idx()].cached_raw.borrow_mut() = None;
+                *self.nodes[c.idx()].descendant_types.borrow_mut() = None;
+                cur = self.nodes[c.idx()].parent;
+            }
+        }
+
+        // 4. Position pass (synthesise markers for new nodes, re-infer
+        //    working positions) — lands with the next milestone phase.
+
+        self.epoch += 1;
+        Some(self.epoch)
+    }
+
+    /// Drop the staged plan without mutating.
+    pub(crate) fn discard_staged(&mut self) {
+        self.staged = None;
+    }
+
+    /// Whether a batch is currently staged.
+    pub(crate) fn has_staged(&self) -> bool {
+        self.staged.is_some()
+    }
+
+    /// Remove a subtree's uuids from `by_uuid` (the nodes stay allocated and
+    /// internally linked so outstanding handles keep reading).
+    fn purge_uuids(&mut self, id: NodeId) {
+        let uuid = self.nodes[id.idx()].uuid;
+        // Only remove if the map still points at THIS node (a replacement may
+        // have re-claimed the uuid — never clobber the live mapping).
+        if self.by_uuid.get(&uuid) == Some(&id) {
+            self.by_uuid.remove(&uuid);
+        }
+        let children = self.nodes[id.idx()].children.clone();
+        for c in children {
+            self.purge_uuids(c);
         }
     }
 
@@ -1483,6 +2100,395 @@ mod tests {
         let fixes = arena.node_source_fixes(id);
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].edit, "{%+ if true -%}");
+    }
+
+
+    // -- splice engine tests --------------------------------------------------
+
+    fn file_tree() -> Node {
+        // file( statement( select( kw "SELECT", ws " ", ident "a" ) ), newline "\n" )
+        let kw = raw("KeywordSegment", "keyword", "SELECT", &["keyword"]);
+        let ws = raw("WhitespaceSegment", "whitespace", " ", &["whitespace"]);
+        let ident = raw(
+            "IdentifierSegment",
+            "naked_identifier",
+            "a",
+            &["identifier"],
+        );
+        let select = Node::Segment {
+            segment_class: "SelectStatementSegment".into(),
+            segment_type: Some("select_statement".into()),
+            pos_marker: None,
+            class_types: vec!["select_statement".to_string(), "statement".to_string()],
+            children: vec![kw, ws, ident],
+        };
+        let stmt = Node::Segment {
+            segment_class: "StatementSegment".into(),
+            segment_type: Some("statement".into()),
+            pos_marker: None,
+            class_types: vec!["statement".to_string()],
+            children: vec![select],
+        };
+        let nl = raw("NewlineSegment", "newline", "\n", &["newline"]);
+        Node::Segment {
+            segment_class: "FileSegment".into(),
+            segment_type: Some("file".into()),
+            pos_marker: None,
+            class_types: vec!["file".to_string()],
+            children: vec![stmt, nl],
+        }
+    }
+
+    /// Find the first leaf under root whose raw matches.
+    fn leaf_by_raw(arena: &Arena, text: &str) -> NodeId {
+        *arena
+            .raw_segments(arena.root())
+            .iter()
+            .find(|&&l| arena.raw(l) == text)
+            .expect("leaf found")
+    }
+
+    fn op(anchor: u128, kind: EditKind, edits: Vec<NodeSpec>) -> EditOp {
+        EditOp {
+            anchor_uuid: anchor,
+            kind,
+            edits,
+        }
+    }
+
+    #[test]
+    fn stage_delete_and_commit() {
+        let mut arena = Arena::from_node(&file_tree());
+        let ws = leaf_by_raw(&arena, " ");
+        let ws_uuid = arena.uuid(ws);
+        let summary = arena.stage_edit_batch(vec![op(ws_uuid, EditKind::Delete, vec![])], false);
+        assert!(summary.changed);
+        assert_eq!(summary.applied, 1);
+        assert_eq!(summary.staged_raw, "SELECTa\n");
+        assert!(summary.unapplied_anchors.is_empty());
+        // Nothing mutated yet.
+        assert_eq!(arena.raw(arena.root()), "SELECT a\n");
+        assert_eq!(arena.epoch(), 0);
+        // Commit.
+        let epoch = arena.commit_staged().expect("committed");
+        assert_eq!(epoch, 1);
+        assert_eq!(arena.raw(arena.root()), "SELECTa\n");
+        // Tombstone: detached, uuid purged, payload intact.
+        assert!(arena.is_detached(ws));
+        assert_eq!(arena.node_by_uuid(ws_uuid), None);
+        assert_eq!(arena.raw(ws), " ");
+        // parent_idx renumbered for the sibling after the deleted node.
+        let select = arena.parent(leaf_by_raw(&arena, "SELECT")).unwrap();
+        let kids = arena.children(select).to_vec();
+        assert_eq!(kids.len(), 2);
+        for (i, &k) in kids.iter().enumerate() {
+            assert_eq!(arena.get_parent(k).unwrap().1, i);
+            assert_eq!(arena.parent(k), Some(select));
+        }
+    }
+
+    #[test]
+    fn stage_discard_is_identity() {
+        let mut arena = Arena::from_node(&file_tree());
+        let before_raw = arena.raw(arena.root());
+        let before_len = arena.len();
+        let ws_uuid = arena.uuid(leaf_by_raw(&arena, " "));
+        let _ = arena.stage_edit_batch(vec![op(ws_uuid, EditKind::Delete, vec![])], false);
+        assert!(arena.has_staged());
+        arena.discard_staged();
+        assert!(!arena.has_staged());
+        assert_eq!(arena.raw(arena.root()), before_raw);
+        assert_eq!(arena.len(), before_len);
+        assert_eq!(arena.epoch(), 0);
+        assert_eq!(arena.node_by_uuid(ws_uuid), Some(leaf_by_raw(&arena, " ")));
+    }
+
+    #[test]
+    fn replace_preserves_uuid_and_consumed_pos_matches_native() {
+        let mut arena = Arena::from_node(&file_tree());
+        let kw = leaf_by_raw(&arena, "SELECT");
+        let kw_uuid = arena.uuid(kw);
+        // Replace "SELECT" with "select" — a copy-style edit reusing the
+        // anchor''s uuid (native copy() preserves uuids).
+        let mut spec = raw_spec(kw_uuid, "keyword", "select");
+        // give the spec the same class_types as the arena node so the
+        // validate-skip path is exercised (single same-type replace).
+        if let SpecKind::Raw { class_types, .. } = &mut spec.kind {
+            *class_types = arena.class_types(kw);
+        }
+        let summary =
+            arena.stage_edit_batch(vec![op(kw_uuid, EditKind::Replace, vec![spec])], false);
+        assert_eq!(summary.staged_raw, "select a\n");
+        arena.commit_staged().unwrap();
+        assert_eq!(arena.raw(arena.root()), "select a\n");
+        // uuid continuity: the anchor''s uuid now resolves to the NEW node.
+        let new_node = arena.node_by_uuid(kw_uuid).expect("uuid reused");
+        assert_ne!(new_node, kw);
+        assert_eq!(arena.raw(new_node), "select");
+        // consumed_pos only fires on raw equality — raws differ here, so the
+        // new node has no marker yet (position pass is a later phase).
+        assert!(arena.pos_marker(new_node).is_none());
+    }
+
+    #[test]
+    fn consumed_pos_inherits_marker_on_raw_match() {
+        // Build a tree WITH markers via a real parse-like marker.
+        use sqlfluffrs_types::TemplatedFile;
+        let tf = std::sync::Arc::new(TemplatedFile::new(
+            "SELECT a\n".to_string(),
+            "<test>".to_string(),
+            None,
+            None,
+            None,
+        ));
+        let mk = |start: usize, stop: usize| {
+            PositionMarker::new(
+                Slice { start, stop },
+                Slice { start, stop },
+                &tf,
+                None,
+                None,
+            )
+        };
+        let mut node = file_tree();
+        // attach a marker to the keyword leaf
+        fn set_marker(n: &mut Node, raw_text: &str, pm: PositionMarker) -> bool {
+            match n {
+                Node::Raw {
+                    raw, pos_marker, ..
+                } if raw == raw_text => {
+                    *pos_marker = Some(pm);
+                    true
+                }
+                Node::Segment { children, .. } | Node::Unparsable { children, .. } => {
+                    for c in children {
+                        if set_marker(c, raw_text, pm.clone()) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        assert!(set_marker(&mut node, "SELECT", mk(0, 6)));
+        let mut arena = Arena::from_node(&node);
+        let kw = leaf_by_raw(&arena, "SELECT");
+        let kw_uuid = arena.uuid(kw);
+        // Replace with same-raw edit (e.g. a source_fixes-only edit).
+        let spec = raw_spec((1u128 << 120) | 7, "keyword", "SELECT");
+        arena.stage_edit_batch(vec![op(kw_uuid, EditKind::Replace, vec![spec])], false);
+        arena.commit_staged().unwrap();
+        let new_node = arena.node_by_uuid((1u128 << 120) | 7).expect("new node");
+        // consumed_pos: full marker inherited.
+        let pm = arena.pos_marker(new_node).expect("marker inherited");
+        assert_eq!(pm.source_slice, Slice { start: 0, stop: 6 });
+    }
+
+    #[test]
+    fn create_before_and_after_ordering() {
+        let mut arena = Arena::from_node(&file_tree());
+        let ident = leaf_by_raw(&arena, "a");
+        let u = arena.uuid(ident);
+        // Paired create_before + create_after (submitted after-first to check
+        // the reorder).
+        let before = raw_spec(9001, "whitespace", "<");
+        let after = raw_spec(9002, "whitespace", ">");
+        let summary = arena.stage_edit_batch(
+            vec![
+                op(u, EditKind::CreateAfter, vec![after]),
+                op(u, EditKind::CreateBefore, vec![before]),
+            ],
+            false,
+        );
+        // "<" and ">" are non-code (whitespace instance type is only set via
+        // instance_types in raw_spec? they are type whitespace) — they would
+        // bubble out of select_statement... use the raw prediction to check
+        // ordering regardless of trim behaviour.
+        assert!(summary.staged_raw.contains("<a>") || summary.staged_raw.contains("< a>") || {
+            // if trimmed and bubbled, the order must still be < before a, > after a
+            let s = &summary.staged_raw;
+            let (ib, ia, ig) = (
+                s.find('<').unwrap(),
+                s.find('a').unwrap(),
+                s.find('>').unwrap(),
+            );
+            ib < ia && ia < ig
+        });
+    }
+
+    #[test]
+    fn anchor_inside_deleted_subtree_is_unapplied() {
+        // AL07''s canonical nested case: delete a container AND replace a
+        // child inside it in the same batch → the inner op is dropped.
+        let mut arena = Arena::from_node(&file_tree());
+        let select = arena.parent(leaf_by_raw(&arena, "SELECT")).unwrap();
+        let ident = leaf_by_raw(&arena, "a");
+        let select_uuid = arena.uuid(select);
+        let ident_uuid = arena.uuid(ident);
+        let inner_edit = raw_spec(9010, "naked_identifier", "b");
+        let summary = arena.stage_edit_batch(
+            vec![
+                op(select_uuid, EditKind::Delete, vec![]),
+                op(ident_uuid, EditKind::Replace, vec![inner_edit]),
+            ],
+            false,
+        );
+        assert_eq!(summary.applied, 1);
+        assert_eq!(summary.unapplied_anchors, vec![ident_uuid]);
+        assert_eq!(summary.staged_raw, "\n");
+    }
+
+    #[test]
+    fn root_anchor_never_applies() {
+        let mut arena = Arena::from_node(&file_tree());
+        let root_uuid = arena.uuid(arena.root());
+        let summary = arena.stage_edit_batch(vec![op(root_uuid, EditKind::Delete, vec![])], false);
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.unapplied_anchors, vec![root_uuid]);
+        assert!(!summary.changed);
+    }
+
+    #[test]
+    fn nonconde_bubble_up_to_file_root() {
+        // Replace the identifier with (ident, trailing whitespace): the
+        // whitespace may not end select_statement/statement, so it bubbles up
+        // to the file root (which can hold it).
+        let mut arena = Arena::from_node(&file_tree());
+        let ident = leaf_by_raw(&arena, "a");
+        let u = arena.uuid(ident);
+        let e1 = raw_spec(9020, "naked_identifier", "b");
+        let e2 = raw_spec(9021, "whitespace", "  ");
+        let summary =
+            arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![e1, e2])], false);
+        // The whitespace ends up between the statement and the newline at the
+        // FILE level: "SELECT b" + "  " + "\n".
+        assert_eq!(summary.staged_raw, "SELECT b  \n");
+        arena.commit_staged().unwrap();
+        assert_eq!(arena.raw(arena.root()), "SELECT b  \n");
+        // The whitespace node''s parent is the file root, not the select.
+        let file_kids = arena.children(arena.root()).to_vec();
+        assert_eq!(file_kids.len(), 3);
+        assert_eq!(arena.raw(file_kids[1]), "  ");
+        for (i, &k) in file_kids.iter().enumerate() {
+            assert_eq!(arena.parent(k), Some(arena.root()));
+            assert_eq!(arena.get_parent(k).unwrap().1, i);
+        }
+    }
+
+    #[test]
+    fn unparsable_scope_reverts_silently() {
+        // statement contains an unparsable container; a fix inside it is
+        // consumed but the subtree plan is discarded (native fix.py:317-330).
+        let kw = raw("KeywordSegment", "keyword", "SELEC", &["keyword"]);
+        let unp = Node::Unparsable {
+            expected: "select".to_string(),
+            pos_marker: None,
+            children: vec![kw],
+        };
+        let stmt = Node::Segment {
+            segment_class: "StatementSegment".into(),
+            segment_type: Some("statement".into()),
+            pos_marker: None,
+            class_types: vec!["statement".to_string()],
+            children: vec![unp],
+        };
+        let tree = Node::Segment {
+            segment_class: "FileSegment".into(),
+            segment_type: Some("file".into()),
+            pos_marker: None,
+            class_types: vec!["file".to_string()],
+            children: vec![stmt],
+        };
+        let mut arena = Arena::from_node(&tree);
+        let kw_id = leaf_by_raw(&arena, "SELEC");
+        let u = arena.uuid(kw_id);
+        let edit = raw_spec(9030, "keyword", "SELECT");
+        let summary = arena.stage_edit_batch(vec![op(u, EditKind::Replace, vec![edit])], false);
+        assert_eq!(summary.reverted_containers, 1);
+        assert_eq!(summary.staged_raw, "SELEC");
+        assert!(!summary.changed);
+        // fix_even_unparsable=true applies it.
+        let mut arena2 = Arena::from_node(&tree);
+        let kw2 = leaf_by_raw(&arena2, "SELEC");
+        let u2 = arena2.uuid(kw2);
+        let edit2 = raw_spec(9031, "keyword", "SELECT");
+        let summary2 = arena2.stage_edit_batch(vec![op(u2, EditKind::Replace, vec![edit2])], false);
+        // note: the unparsable IS the direct parent — requires_validate at the
+        // unparsable container... with feu=false it reverted; retry with true:
+        let _ = summary2;
+        arena2.discard_staged();
+        let edit3 = raw_spec(9032, "keyword", "SELECT");
+        let summary3 = arena2.stage_edit_batch(vec![op(u2, EditKind::Replace, vec![edit3])], true);
+        assert_eq!(summary3.staged_raw, "SELECT");
+        assert!(summary3.changed);
+    }
+
+    #[test]
+    fn op_inside_replacement_copy_applies() {
+        // Native recurses into spliced edit segments; uuids preserved by
+        // copy() let remaining anchors match INSIDE the replacement.
+        let mut arena = Arena::from_node(&file_tree());
+        let select = arena.parent(leaf_by_raw(&arena, "SELECT")).unwrap();
+        let select_uuid = arena.uuid(select);
+        let kw = leaf_by_raw(&arena, "SELECT");
+        let kw_uuid = arena.uuid(kw);
+        // Replacement copy of the select (same uuids for children, native
+        // copy-style), plus a second op anchored on the keyword INSIDE it.
+        let copy_spec = NodeSpec {
+            uuid: select_uuid,
+            kind: SpecKind::Segment {
+                segment_class: "SelectStatementSegment".to_string(),
+                segment_type: Some("select_statement".to_string()),
+                class_types: vec!["select_statement".to_string()],
+            },
+            source_fixes: Vec::new(),
+            children: vec![
+                raw_spec(kw_uuid, "keyword", "SELECT"),
+                raw_spec(9040, "whitespace", " "),
+                raw_spec(9041, "naked_identifier", "z"),
+            ],
+        };
+        let kw_edit = raw_spec(9042, "keyword", "select");
+        let summary = arena.stage_edit_batch(
+            vec![
+                op(select_uuid, EditKind::Replace, vec![copy_spec]),
+                op(kw_uuid, EditKind::Replace, vec![kw_edit]),
+            ],
+            false,
+        );
+        assert_eq!(summary.applied, 2);
+        assert!(summary.unapplied_anchors.is_empty());
+        assert_eq!(summary.staged_raw, "select z\n");
+        arena.commit_staged().unwrap();
+        assert_eq!(arena.raw(arena.root()), "select z\n");
+    }
+
+    #[test]
+    fn commit_invalidates_ancestor_caches() {
+        let mut arena = Arena::from_node(&file_tree());
+        let root = arena.root();
+        // Prime the caches.
+        let _ = arena.raw(root);
+        let _ = arena.descendant_type_set(root);
+        let ws_uuid = arena.uuid(leaf_by_raw(&arena, " "));
+        arena.stage_edit_batch(vec![op(ws_uuid, EditKind::Delete, vec![])], false);
+        arena.commit_staged().unwrap();
+        // Raw must reflect the mutation (stale cache would return the old).
+        assert_eq!(arena.raw(root), "SELECTa\n");
+    }
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let mut arena = Arena::from_node(&file_tree());
+        let summary = arena.stage_edit_batch(vec![], false);
+        assert!(!summary.changed);
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.staged_raw, "SELECT a\n");
+        // commit of an unchanged plan still bumps epoch (Python discards
+        // no-op stages instead).
+        arena.discard_staged();
+        assert_eq!(arena.epoch(), 0);
     }
 
     #[test]
