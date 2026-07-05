@@ -19,7 +19,7 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_ENGINE = False
 
-from sqlfluff.core import Linter
+from sqlfluff.core import FluffConfig, Linter
 from sqlfluff.core.rules.rs_lint import FACADE_SAFE_RULES, facade_fix_loop
 from sqlfluff.utils.testing.rules import _setup_config, load_test_cases
 
@@ -57,3 +57,40 @@ def test_facade_fix_matches_native(test_case) -> None:
     fixed = facade_fix_loop(src, "<test>", config, rules, limit)
     expected = test_case.fix_str if test_case.fix_str is not None else src
     assert fixed == expected
+
+
+def _facade_fix(src, dialect, rule):
+    config = FluffConfig(overrides={"dialect": dialect, "rules": rule})
+    linter = Linter(config=config)
+    rules = list(linter.get_rulepack(config=config).rules)
+    limit = int(config.get("runaway_limit"))
+    return facade_fix_loop(src, "<test>", config, rules, limit)
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_rf06_keeps_quoted_routine_name() -> None:
+    """RF06 façade fix must NOT strip backticks from a routine name.
+
+    Unquoting the backtick-quoted name reparses as ``function_name_identifier``
+    (not the ``naked_identifier`` the fix specifies), so native rejects the fix
+    and leaves the file unchanged. The façade's grammar re-validation
+    (``validate_staged``) must reproduce that rejection — the corruption this
+    whole path guards against.
+    """
+    src = "CREATE PROCEDURE `my_proc`() BEGIN SELECT 1; END\n"
+    assert _facade_fix(src, "mysql", "RF06") == src  # backticks kept, like native
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_rf06_unquotes_plain_identifier() -> None:
+    """RF06 façade fix STILL unquotes a legitimate identifier.
+
+    Regression guard that the grammar re-validation doesn't over-reject.
+    """
+    assert (
+        _facade_fix("SELECT `foo` FROM t\n", "mysql", "RF06") == "SELECT foo FROM t\n"
+    )

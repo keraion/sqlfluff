@@ -55,15 +55,16 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # detection-verified subset (this set minus the DETECTION_UNSAFE members below,
 # plus rules using ``isinstance`` on concrete classes a duck-type can't satisfy).
 #
-# RF06 was DROPPED from this set: it strips backtick quotes from
-# mysql/mariadb/tsql stored-procedure/function *names* that native LEAVES quoted.
-# Native reports the violation but its ``apply_fixes`` rejects the fix — unquoting
-# ``\`name\``` reparses as ``function_name_identifier`` not the ``naked_identifier``
-# the fix specifies, so ``validate_segment_with_reparse`` fails. The façade's
-# source-patch path skips that grammar validation (arena/materialised segments have
-# no ``match_grammar``), so it applies a fix native won't. Faithfully replicating
-# the validation needs full real-dialect-class materialisation (real leaves too),
-# which defeats the façade; deferring RF06 to the Python path is the safe fix.
+# RF06 is façade-safe via arena grammar re-validation. It strips backtick quotes
+# from mysql/mariadb/tsql stored-procedure/function *names* that native LEAVES
+# quoted: unquoting ``\`name\``` reparses as ``function_name_identifier`` not the
+# ``naked_identifier`` the fix specifies, so native ``validate_segment_with_reparse``
+# rejects it. The façade now reproduces that check — ``RsTree.validate_staged``
+# (parser ``revalidate`` + the arena stage/commit path) re-matches each edited
+# container's grammar against its own typed arena leaves and discards a batch that
+# would corrupt the tree — so the façade rejects exactly the fixes native does.
+# Verified byte-identical to native over the whole ``test/fixtures/dialects/*``
+# corpus (2144 façade-eligible files, 0 divergences).
 #
 # TQ02 was also DROPPED, for a *different* reason — a reparse-vs-mutate fixed-point
 # divergence, not a validation gap. On a tsql procedure body its fix reorders
@@ -119,6 +120,7 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "PG01",
         "RF02",
         "RF04",
+        "RF06",
         "ST01",
         "ST03",
         "ST04",
