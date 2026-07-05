@@ -92,8 +92,8 @@ FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
 # rules LT01, LT05 and LT09 are DEFERRED: each has a multi-pass reflow
 # convergence interaction where the façade reaches a different fixed point than
 # native (e.g. LT05 line-splitting on bigquery, LT09 ``INTERSECT (`` on
-# postgres), the same class as TQ02. LT02 (indentation), ST05 (subquery->CTE)
-# and ST12 also stay deferred.
+# postgres), the same class as TQ02. LT02 (indentation) and ST05 (subquery->CTE)
+# also stay deferred.
 FACADE_SAFE_RULES: frozenset[str] = frozenset(
     {
         "AL01",
@@ -163,6 +163,7 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "ST09",
         "ST10",
         "ST11",
+        "ST12",
         "TQ01",
         "TQ02",
         "TQ03",
