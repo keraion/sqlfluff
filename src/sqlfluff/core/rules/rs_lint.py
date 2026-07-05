@@ -1221,6 +1221,14 @@ def facade_fix_loop(
 
     import sqlfluffrs
 
+    # An empty file has nothing to fix. Short-circuit before the arena path: the
+    # Rust engine's empty ``file`` node carries no pos_marker (native's
+    # FileSegment gets a zero-width one), so the reconstruction pass
+    # (``generate_source_patches``) would assert on it. Native returns the empty
+    # source unchanged here too.
+    if not source:
+        return source
+
     if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
         return facade_fix_loop_v3(source, fname, config, rules, limit)
 

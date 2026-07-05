@@ -94,3 +94,17 @@ def test_facade_rf06_unquotes_plain_identifier() -> None:
     assert (
         _facade_fix("SELECT `foo` FROM t\n", "mysql", "RF06") == "SELECT foo FROM t\n"
     )
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+@pytest.mark.parametrize("rule", ["CP01", "AL01", "RF06"])
+def test_facade_fix_empty_file(rule) -> None:
+    """An empty file returns unchanged instead of crashing reconstruction.
+
+    The arena's empty ``file`` node carries no pos_marker (native's FileSegment
+    gets a zero-width one), so ``generate_source_patches`` used to assert. The
+    short-circuit returns the empty source, matching native.
+    """
+    assert _facade_fix("", "ansi", rule) == ""
