@@ -25,6 +25,7 @@ use sqlfluffrs_types::token::CaseFold;
 use sqlfluffrs_types::Slice;
 
 use super::arena::{Arena, EditKind, EditOp, NodeId, NodeSpec, SourceFixSpec, SpecKind};
+use super::revalidate::ParseLimits;
 use super::types::{MetaType, RawSegmentKwargs};
 
 /// The arena is shared behind `Arc<Mutex<…>>` rather than `Rc<RefCell<…>>` so
@@ -198,9 +199,23 @@ impl PyTree {
     /// Returns `Ok(true)` if nothing is staged, or if the staged batch has no
     /// validation targets (type-preserving edits — e.g. CP01 — never validate).
     /// An unknown dialect name falls back to `ansi` (matching `PyParser`).
-    fn validate_staged(&self, dialect: &str) -> PyResult<bool> {
+    ///
+    /// `max_parse_depth` / `max_parse_nodes` are the file's configured parse
+    /// ceilings (from `.sqlfluff`); they are threaded into the re-match so
+    /// re-validation honours the same limits as the initial parse. `0` disables
+    /// the respective limit.
+    fn validate_staged(
+        &self,
+        dialect: &str,
+        max_parse_depth: usize,
+        max_parse_nodes: usize,
+    ) -> PyResult<bool> {
         let dialect = Dialect::from_str(dialect).unwrap_or(Dialect::Ansi);
-        Ok(self.inner.lock().unwrap().validate_staged(&dialect))
+        let limits = ParseLimits {
+            max_parse_depth,
+            max_parse_nodes,
+        };
+        Ok(self.inner.lock().unwrap().validate_staged(&dialect, limits))
     }
 
     /// Whether an edit batch is currently staged.

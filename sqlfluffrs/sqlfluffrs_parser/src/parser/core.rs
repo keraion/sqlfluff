@@ -241,7 +241,7 @@ impl<'a> Parser<'a> {
         self
     }
 
-    fn check_parse_node_limit(
+    pub(crate) fn check_parse_node_limit(
         &self,
         match_result: &MatchResult,
         base_node_count: usize,

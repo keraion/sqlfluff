@@ -280,11 +280,14 @@ class RsTree:
         ...
 
     def has_staged(self) -> bool: ...
-    def validate_staged(self, dialect: str) -> bool:
+    def validate_staged(
+        self, dialect: str, max_parse_depth: int, max_parse_nodes: int
+    ) -> bool:
         """Whether the staged plan re-matches its own grammar.
 
         Rust analogue of native ``validate_segment_with_reparse``; returns
-        ``True`` when nothing is staged.
+        ``True`` when nothing is staged. ``max_parse_depth`` / ``max_parse_nodes``
+        are the file's configured parse ceilings (``0`` disables a limit).
         """
         ...
 

@@ -48,6 +48,31 @@ pub enum RevalidateOutcome {
     Skipped,
 }
 
+/// Parse limits carried into a re-validation re-match, mirroring the
+/// `ParseContext` native seeds in `validate_segment_with_reparse` (`base.py:1256,
+/// 1269`): `max_parse_depth` bounds the frame stack and `max_parse_nodes` bounds
+/// the accepted node count (seeded with the trimmed leaf count, then enforced
+/// after the re-match).  Callers thread the file's configured values so a user
+/// who lowered either limit sees the same ceiling on re-validation as on the
+/// initial parse.  `max_parse_nodes == 0` disables the node ceiling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParseLimits {
+    pub(crate) max_parse_depth: usize,
+    pub(crate) max_parse_nodes: usize,
+}
+
+impl Default for ParseLimits {
+    /// The parser's own defaults: depth 600 (`Parser::DEFAULT_MAX_PARSE_DEPTH`),
+    /// no node ceiling.  Used by unit tests; the façade always passes the
+    /// file's configured limits.
+    fn default() -> Self {
+        ParseLimits {
+            max_parse_depth: Parser::DEFAULT_MAX_PARSE_DEPTH,
+            max_parse_nodes: 0,
+        }
+    }
+}
+
 /// A single ordered leaf's re-validation-relevant payload, sourced either from a
 /// committed arena leaf (`revalidate_container`) or from a staged plan's leaf
 /// (`revalidate_planned_container`).  Metas are included here (the shared
@@ -70,6 +95,7 @@ pub(crate) fn revalidate_leaf_descriptors(
     dialect: &Dialect,
     grammar_id: sqlfluffrs_types::GrammarId,
     tables: &'static sqlfluffrs_types::GrammarTables,
+    limits: ParseLimits,
 ) -> RevalidateOutcome {
     // -- drop metas, trim non-code from both ends (base.py:1263-1264) ---------
     let non_meta: Vec<&LeafDescriptor> = leaves.iter().filter(|l| !l.is_meta).collect();
@@ -108,11 +134,26 @@ pub(crate) fn revalidate_leaf_descriptors(
     compute_bracket_pairs(&mut tokens);
 
     // -- re-match the grammar against exactly those tokens --------------------
-    let mut parser = Parser::new(&tokens, *dialect, Default::default());
+    // Thread the file's configured parse limits so re-validation honours the
+    // same ceilings as the initial parse (native seeds these into the
+    // `ParseContext` at base.py:1256).
+    let mut parser =
+        Parser::new_with_max_parse_depth(&tokens, *dialect, Default::default(), limits.max_parse_depth)
+            .with_node_limit(limits.max_parse_nodes);
     let rematch = match parser.match_grammar(grammar_id, tables) {
         Ok(mr) => mr,
+        // A depth-limit (or other) matcher error can't be a complete, clean
+        // match, so it fails re-validation rather than propagating.
         Err(_) => return RevalidateOutcome::Invalid,
     };
+
+    // Enforce the node ceiling, seeded with the trimmed leaf count — native
+    // `ctx.seed_parse_nodes(len(trimmed_content))` before matching (base.py:1269).
+    // Exceeding it means the re-match is unexpectedly large; treat as Invalid
+    // (native raises here — rejecting the fix is the conservative analogue).
+    if parser.check_parse_node_limit(&rematch, tokens.len()).is_err() {
+        return RevalidateOutcome::Invalid;
+    }
 
     let complete = rematch.end() == tokens.len() && !rematch.is_empty();
     if complete && !rematch.contains_unparsable() {
@@ -164,7 +205,12 @@ impl Arena {
     /// `validate_segment_with_reparse` (`base.py:1249`).
     ///
     /// See the module docs for the full algorithm and native-parity intent.
-    pub fn revalidate_container(&self, id: NodeId, dialect: &Dialect) -> RevalidateOutcome {
+    pub(crate) fn revalidate_container(
+        &self,
+        id: NodeId,
+        dialect: &Dialect,
+        limits: ParseLimits,
+    ) -> RevalidateOutcome {
         // -- 1. resolve grammar (base.py: segments without match_grammar are
         //       not re-checked) ------------------------------------------------
         let Some(class) = self.segment_class(id) else {
@@ -194,6 +240,7 @@ impl Arena {
             dialect,
             root_grammar.grammar_id,
             root_grammar.tables,
+            limits,
         )
     }
 
@@ -276,7 +323,7 @@ mod tests {
         )]);
         let arena = Arena::from_node(&tree);
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Invalid,
         );
     }
@@ -296,8 +343,39 @@ mod tests {
         )]);
         let arena = Arena::from_node(&tree);
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Valid,
+        );
+    }
+
+    /// The configured node ceiling is honoured (native seeds it with the leaf
+    /// count then enforces `max_parse_nodes`, base.py:1269): the same shape that
+    /// is `Valid` under default limits becomes `Invalid` when the ceiling is set
+    /// below the re-match's node count.
+    #[test]
+    fn node_budget_below_rematch_is_invalid() {
+        let dialect = Dialect::Ansi;
+        let tree = function_name(vec![leaf(
+            "WordSegment",
+            "function_name_identifier",
+            "foo",
+            &["function_name_identifier"],
+            &["word", "raw", "base"],
+        )]);
+        let arena = Arena::from_node(&tree);
+        // No ceiling => the clean re-match validates.
+        assert_eq!(
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
+            RevalidateOutcome::Valid,
+        );
+        // A ceiling of 1 node is below the seeded + matched count => Invalid.
+        let tight = ParseLimits {
+            max_parse_depth: Parser::DEFAULT_MAX_PARSE_DEPTH,
+            max_parse_nodes: 1,
+        };
+        assert_eq!(
+            arena.revalidate_container(arena.root(), &dialect, tight),
+            RevalidateOutcome::Invalid,
         );
     }
 
@@ -321,7 +399,7 @@ mod tests {
         };
         let arena = Arena::from_node(&tree);
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Skipped,
         );
     }
@@ -336,7 +414,7 @@ mod tests {
         let arena = Arena::from_node(&tree);
         // "RawSegment" has no segment grammar → Skipped.
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Skipped,
         );
     }
@@ -370,7 +448,7 @@ mod tests {
         ]);
         let arena = Arena::from_node(&tree);
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Valid,
         );
     }
@@ -400,7 +478,7 @@ mod tests {
         ]);
         let arena = Arena::from_node(&tree);
         assert_eq!(
-            arena.revalidate_container(arena.root(), &dialect),
+            arena.revalidate_container(arena.root(), &dialect, ParseLimits::default()),
             RevalidateOutcome::Valid,
         );
     }

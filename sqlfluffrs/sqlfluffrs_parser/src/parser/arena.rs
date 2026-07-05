@@ -31,7 +31,7 @@ use sqlfluffrs_dialects::Dialect;
 use sqlfluffrs_types::token::CaseFold;
 use sqlfluffrs_types::{PositionMarker, Slice};
 
-use super::revalidate::{revalidate_leaf_descriptors, LeafDescriptor, RevalidateOutcome};
+use super::revalidate::{revalidate_leaf_descriptors, LeafDescriptor, ParseLimits, RevalidateOutcome};
 use super::types::{MetaType, Node, RawSegmentKwargs};
 
 /// A source-level edit attached to a segment, mirroring Python's ``SourceFix``
@@ -1213,6 +1213,7 @@ impl Arena {
         id: NodeId,
         children_of: &HashMap<NodeId, Vec<PlannedChild>>,
         dialect: &Dialect,
+        limits: ParseLimits,
     ) -> RevalidateOutcome {
         let Some(class) = self.segment_class(id) else {
             return RevalidateOutcome::Skipped;
@@ -1227,6 +1228,7 @@ impl Arena {
             dialect,
             root_grammar.grammar_id,
             root_grammar.tables,
+            limits,
         )
     }
 
@@ -1242,7 +1244,10 @@ impl Arena {
     ///
     /// Returns true when nothing is staged or there are no validate-containers
     /// (type-preserving batches — e.g. CP01 — never validate, matching native).
-    pub(crate) fn validate_staged(&self, dialect: &Dialect) -> bool {
+    ///
+    /// `limits` carries the file's configured parse ceilings so re-validation
+    /// re-matches under the same limits as the initial parse.
+    pub(crate) fn validate_staged(&self, dialect: &Dialect, limits: ParseLimits) -> bool {
         let Some(staged) = self.staged.as_ref() else {
             return true;
         };
@@ -1250,7 +1255,7 @@ impl Arena {
             let mut cur = Some(cp);
             let mut hit_invalid = false;
             while let Some(c) = cur {
-                match self.revalidate_planned_container(c, &staged.children_of, dialect) {
+                match self.revalidate_planned_container(c, &staged.children_of, dialect, limits) {
                     // Clean re-match rescues (or the container never failed).
                     RevalidateOutcome::Valid => break,
                     RevalidateOutcome::Invalid => {
@@ -3113,7 +3118,7 @@ mod tests {
         );
         arena.stage_edit_batch(vec![op(leaf_uuid, EditKind::Replace, vec![spec])], false);
         assert!(
-            !arena.validate_staged(&Dialect::Ansi),
+            !arena.validate_staged(&Dialect::Ansi, ParseLimits::default()),
             "type-changing replace should fail grammar re-validation"
         );
     }
@@ -3144,7 +3149,7 @@ mod tests {
         );
         arena.stage_edit_batch(vec![op(leaf_uuid, EditKind::Replace, vec![spec])], false);
         assert!(
-            arena.validate_staged(&Dialect::Ansi),
+            arena.validate_staged(&Dialect::Ansi, ParseLimits::default()),
             "type-preserving replace should pass re-validation"
         );
     }
@@ -3153,6 +3158,7 @@ mod tests {
     #[test]
     fn validate_staged_true_when_nothing_staged() {
         let arena = Arena::from_node(&file_tree());
-        assert!(arena.validate_staged(&Dialect::Ansi));
+        assert!(arena.validate_staged(&Dialect::Ansi, ParseLimits::default()));
     }
+
 }

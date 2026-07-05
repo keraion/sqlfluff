@@ -1172,7 +1172,11 @@ def facade_fix_loop_v3(
                 # Native ``apply_fixes`` grammar re-validation (linter.py:637-645):
                 # reject a staged batch that would produce an unparsable file,
                 # leave the tree untouched, and warn on the same channel/text.
-                if not rst.validate_staged(dialect_name):
+                if not rst.validate_staged(
+                    dialect_name,
+                    int(config.get("max_parse_depth") or 0),
+                    int(config.get("max_parse_nodes") or 0),
+                ):
                     rst.discard_staged()
                     linter_logger.warning(
                         "Fixes for %s not applied, as it would result in an "
