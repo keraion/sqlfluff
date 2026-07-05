@@ -87,9 +87,13 @@ FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
 # method), so ``.Value()``/``.VALUE()`` parsed differently and a CP rule
 # casefolded the schema name. The parser now honours ``ignore_case`` (RegexParser
 # ``CASE_SENSITIVE`` grammar flag), so the 62-rule set is divergence-clean.
-# The deferred LAYOUT rules (LT01/03-05/07-10/12-14) verify clean INDIVIDUALLY
-# but have a cross-rule fix-loop interaction when combined with the non-layout
-# set (e.g. LT05 line-splitting on bigquery), so they stay deferred.
+# Also added 8 LAYOUT rules — LT03, LT04, LT07, LT08, LT10, LT12, LT13, LT14 —
+# verified 0 corpus divergences combined with the rest. The remaining layout
+# rules LT01, LT05 and LT09 are DEFERRED: each has a multi-pass reflow
+# convergence interaction where the façade reaches a different fixed point than
+# native (e.g. LT05 line-splitting on bigquery, LT09 ``INTERSECT (`` on
+# postgres), the same class as TQ02. LT02 (indentation), ST05 (subquery->CTE)
+# and ST12 also stay deferred.
 FACADE_SAFE_RULES: frozenset[str] = frozenset(
     {
         "AL01",
@@ -129,8 +133,16 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "CV11",
         "CV12",
         "JJ01",
+        "LT03",
+        "LT04",
         "LT06",
+        "LT07",
+        "LT08",
+        "LT10",
         "LT11",
+        "LT12",
+        "LT13",
+        "LT14",
         "LT15",
         "OR01",
         "PG01",
