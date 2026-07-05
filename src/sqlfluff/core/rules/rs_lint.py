@@ -79,17 +79,17 @@ FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
     {"AL04", "AL10", "CP01", "CV09", "RF02", "ST03"}
 )
 # Batch added (verified 0 NEW whole-corpus divergences over the prior set):
-# AL05, AM04, AM07, CV06, PG02, RF01, RF03, RF05, ST02, ST10, ST11. The one
-# combined-run divergence is PRE-EXISTING and not introduced by these — on
-# ``tsql/datatype_methods.sql`` the Rust parser matches T-SQL data-type methods
-# (``.value()`` etc.) case-INSENSITIVELY, but native honours their
-# ``ignore_case=False`` (only lowercase ``.value()`` is a method). So
-# ``.Value()``/``.VALUE()`` parse differently and a CP rule casefolds the schema
-# name; the prior 51-rule set already diverges there. Fixing it needs the parser
-# to honour ``ignore_case`` (codegen flag + RegexParser handler) — tracked
-# separately. The deferred LAYOUT rules (LT01/03-05/07-10/12-14) verify clean
-# INDIVIDUALLY but have a cross-rule fix-loop interaction when combined with the
-# non-layout set (e.g. LT05 line-splitting on bigquery), so they stay deferred.
+# AL05, AM04, AM07, CV06, PG02, RF01, RF03, RF05, ST02, ST10, ST11. Triage
+# surfaced (and fixed) the sole combined-run divergence, which was PRE-EXISTING
+# in the prior 51-rule set: on ``tsql/datatype_methods.sql`` the Rust parser
+# matched T-SQL data-type methods (``.value()`` etc.) case-INSENSITIVELY, but
+# native honours their ``ignore_case=False`` (only lowercase ``.value()`` is a
+# method), so ``.Value()``/``.VALUE()`` parsed differently and a CP rule
+# casefolded the schema name. The parser now honours ``ignore_case`` (RegexParser
+# ``CASE_SENSITIVE`` grammar flag), so the 62-rule set is divergence-clean.
+# The deferred LAYOUT rules (LT01/03-05/07-10/12-14) verify clean INDIVIDUALLY
+# but have a cross-rule fix-loop interaction when combined with the non-layout
+# set (e.g. LT05 line-splitting on bigquery), so they stay deferred.
 FACADE_SAFE_RULES: frozenset[str] = frozenset(
     {
         "AL01",
