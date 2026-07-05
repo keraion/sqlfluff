@@ -180,7 +180,7 @@ impl NodeSpec {
 /// (read-only); generational keys will be introduced alongside deletion in the
 /// fixing milestone so that stale ids fail loudly instead of aliasing.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct NodeId(u32);
+pub struct NodeId(u32);
 
 impl NodeId {
     #[inline]
@@ -240,7 +240,7 @@ struct ArenaNode {
 }
 
 /// A flattened, parent-linked, id-addressable parse tree.
-pub(crate) struct Arena {
+pub struct Arena {
     nodes: Vec<ArenaNode>,
     root: NodeId,
     by_uuid: HashMap<u128, NodeId>,
@@ -565,7 +565,7 @@ impl Arena {
     // -- basic access --------------------------------------------------------
 
     #[inline]
-    pub(crate) fn root(&self) -> NodeId {
+    pub fn root(&self) -> NodeId {
         self.root
     }
 
@@ -575,7 +575,7 @@ impl Arena {
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
@@ -583,11 +583,11 @@ impl Arena {
     // Python side (the façade will use it), so allow it to be unused for now.
     #[inline]
     #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    pub(crate) fn node_by_uuid(&self, uuid: u128) -> Option<NodeId> {
+    pub fn node_by_uuid(&self, uuid: u128) -> Option<NodeId> {
         self.by_uuid.get(&uuid).copied()
     }
 
@@ -1282,29 +1282,29 @@ impl Arena {
     }
 
     #[inline]
-    pub(crate) fn children(&self, id: NodeId) -> &[NodeId] {
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id.idx()].children
     }
 
     #[inline]
-    pub(crate) fn parent(&self, id: NodeId) -> Option<NodeId> {
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.nodes[id.idx()].parent
     }
 
     #[inline]
-    pub(crate) fn uuid(&self, id: NodeId) -> u128 {
+    pub fn uuid(&self, id: NodeId) -> u128 {
         self.nodes[id.idx()].uuid
     }
 
     #[inline]
-    pub(crate) fn pos_marker(&self, id: NodeId) -> Option<PositionMarker> {
+    pub fn pos_marker(&self, id: NodeId) -> Option<PositionMarker> {
         self.nodes[id.idx()].pos_marker.clone()
     }
 
     // -- payload accessors (mirror Node / BaseSegment) -----------------------
 
     /// Joined raw text (cached for containers).
-    pub(crate) fn raw(&self, id: NodeId) -> String {
+    pub fn raw(&self, id: NodeId) -> String {
         let n = self.node(id);
         match &n.kind {
             ArenaKind::Raw { raw, .. } => raw.clone(),
@@ -1323,12 +1323,12 @@ impl Arena {
         }
     }
 
-    pub(crate) fn raw_upper(&self, id: NodeId) -> String {
+    pub fn raw_upper(&self, id: NodeId) -> String {
         self.raw(id).to_uppercase()
     }
 
     /// Semantic type string (mirrors [`Node::get_type`]).
-    pub(crate) fn get_type(&self, id: NodeId) -> String {
+    pub fn get_type(&self, id: NodeId) -> String {
         match &self.node(id).kind {
             ArenaKind::Raw { segment_type, .. } => segment_type.to_string(),
             ArenaKind::Segment { segment_type, .. } => {
@@ -1383,7 +1383,7 @@ impl Arena {
     }
 
     /// Mirrors [`Node::is_type`], plus the structural hierarchy types.
-    pub(crate) fn is_type(&self, id: NodeId, target: &str) -> bool {
+    pub fn is_type(&self, id: NodeId, target: &str) -> bool {
         if self.structural_types(id).contains(&target) {
             return true;
         }
@@ -1402,7 +1402,7 @@ impl Arena {
         }
     }
 
-    pub(crate) fn is_any_type(&self, id: NodeId, targets: &[String]) -> bool {
+    pub fn is_any_type(&self, id: NodeId, targets: &[String]) -> bool {
         targets.iter().any(|t| self.is_type(id, t))
     }
 
@@ -1426,18 +1426,18 @@ impl Arena {
         out
     }
 
-    pub(crate) fn class_types(&self, id: NodeId) -> Vec<String> {
+    pub fn class_types(&self, id: NodeId) -> Vec<String> {
         self.node_type_set(id)
     }
 
-    pub(crate) fn instance_types(&self, id: NodeId) -> Vec<String> {
+    pub fn instance_types(&self, id: NodeId) -> Vec<String> {
         match &self.node(id).kind {
             ArenaKind::Raw { instance_types, .. } => instance_types.clone(),
             _ => Vec::new(),
         }
     }
 
-    pub(crate) fn segment_class(&self, id: NodeId) -> Option<String> {
+    pub fn segment_class(&self, id: NodeId) -> Option<String> {
         match &self.node(id).kind {
             ArenaKind::Raw { segment_class, .. } | ArenaKind::Segment { segment_class, .. } => {
                 Some(segment_class.to_string())
@@ -1447,7 +1447,7 @@ impl Arena {
     }
 
     /// `is_implicit` flag for Indent/Dedent meta nodes (`None` for non-metas).
-    pub(crate) fn is_implicit(&self, id: NodeId) -> Option<bool> {
+    pub fn is_implicit(&self, id: NodeId) -> Option<bool> {
         match &self.node(id).kind {
             ArenaKind::Meta {
                 meta_type: MetaType::Indent { is_implicit } | MetaType::Dedent { is_implicit },
@@ -1458,7 +1458,7 @@ impl Arena {
     }
 
     /// Characters to trim from both ends of a raw token (if set on the token).
-    pub(crate) fn trim_chars(&self, id: NodeId) -> Option<Vec<String>> {
+    pub fn trim_chars(&self, id: NodeId) -> Option<Vec<String>> {
         match &self.node(id).kind {
             ArenaKind::Raw { kwargs, .. } => kwargs.trim_chars.clone(),
             _ => None,
@@ -1466,7 +1466,7 @@ impl Arena {
     }
 
     /// The `(pattern, group)` quote-extraction spec for a quoted raw token.
-    pub(crate) fn quoted_value(&self, id: NodeId) -> Option<(String, String)> {
+    pub fn quoted_value(&self, id: NodeId) -> Option<(String, String)> {
         match &self.node(id).kind {
             ArenaKind::Raw { kwargs, .. } => kwargs.quoted_value.clone(),
             _ => None,
@@ -1474,7 +1474,7 @@ impl Arena {
     }
 
     /// The escape `(pattern, replacement)` pairs for a raw token.
-    pub(crate) fn escape_replacements(&self, id: NodeId) -> Option<Vec<(String, String)>> {
+    pub fn escape_replacements(&self, id: NodeId) -> Option<Vec<(String, String)>> {
         match &self.node(id).kind {
             ArenaKind::Raw { kwargs, .. } => kwargs.escape_replacements.clone(),
             _ => None,
@@ -1525,18 +1525,18 @@ impl Arena {
         }
     }
 
-    pub(crate) fn is_raw(&self, id: NodeId) -> bool {
+    pub fn is_raw(&self, id: NodeId) -> bool {
         // Mirrors `BaseSegment.is_raw` (`len(self.segments) == 0`): any leaf,
         // including meta segments (which are RawSegment subclasses in Python).
         self.children(id).is_empty()
     }
 
-    pub(crate) fn is_meta(&self, id: NodeId) -> bool {
+    pub fn is_meta(&self, id: NodeId) -> bool {
         matches!(self.node(id).kind, ArenaKind::Meta { .. })
     }
 
     /// Mirrors [`Node::is_code`].
-    pub(crate) fn is_code(&self, id: NodeId) -> bool {
+    pub fn is_code(&self, id: NodeId) -> bool {
         match &self.node(id).kind {
             ArenaKind::Meta { .. } | ArenaKind::Empty => false,
             ArenaKind::Raw {
@@ -1566,7 +1566,7 @@ impl Arena {
         }
     }
 
-    pub(crate) fn is_whitespace(&self, id: NodeId) -> bool {
+    pub fn is_whitespace(&self, id: NodeId) -> bool {
         match &self.node(id).kind {
             ArenaKind::Raw {
                 segment_type,
@@ -1590,7 +1590,7 @@ impl Arena {
         }
     }
 
-    pub(crate) fn is_comment(&self, id: NodeId) -> bool {
+    pub fn is_comment(&self, id: NodeId) -> bool {
         match &self.node(id).kind {
             ArenaKind::Raw {
                 segment_type,
@@ -1607,7 +1607,7 @@ impl Arena {
 
     /// Whether any descendant raw carries templated source (best-effort mirror
     /// of `BaseSegment.is_templated`: a non-literal, non-point source slice).
-    pub(crate) fn is_templated(&self, id: NodeId) -> bool {
+    pub fn is_templated(&self, id: NodeId) -> bool {
         match self.node(id).pos_marker.as_ref() {
             Some(pm) => !pm.is_literal() && !pm.is_point(),
             None => false,
@@ -1617,7 +1617,7 @@ impl Arena {
     // -- navigation ----------------------------------------------------------
 
     /// First child matching any of `seg_type` (mirrors `get_child`).
-    pub(crate) fn get_child(&self, id: NodeId, seg_type: &[String]) -> Option<NodeId> {
+    pub fn get_child(&self, id: NodeId, seg_type: &[String]) -> Option<NodeId> {
         self.children(id)
             .iter()
             .copied()
@@ -1625,7 +1625,7 @@ impl Arena {
     }
 
     /// All children matching any of `seg_type` (mirrors `get_children`).
-    pub(crate) fn get_children(&self, id: NodeId, seg_type: &[String]) -> Vec<NodeId> {
+    pub fn get_children(&self, id: NodeId, seg_type: &[String]) -> Vec<NodeId> {
         self.children(id)
             .iter()
             .copied()
@@ -1634,7 +1634,7 @@ impl Arena {
     }
 
     /// Depth-first leaf nodes (mirrors `raw_segments` / `get_raw_segments`).
-    pub(crate) fn raw_segments(&self, id: NodeId) -> Vec<NodeId> {
+    pub fn raw_segments(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         self.collect_raw_segments(id, &mut out);
         out
@@ -1654,7 +1654,7 @@ impl Arena {
 
     /// Mirrors `BaseSegment.recursive_crawl`.  `no_recursive_seg_type` stops
     /// recursion (but the stopping node is still yielded if it matches).
-    pub(crate) fn recursive_crawl(
+    pub fn recursive_crawl(
         &self,
         id: NodeId,
         seg_type: &[String],
@@ -1714,7 +1714,7 @@ impl Arena {
     }
 
     /// All descendants in document order (mirrors `recursive_crawl_all`).
-    pub(crate) fn recursive_crawl_all(&self, id: NodeId) -> Vec<NodeId> {
+    pub fn recursive_crawl_all(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         self.crawl_all_into(id, &mut out);
         out
@@ -1729,7 +1729,7 @@ impl Arena {
 
     /// Mirrors `BaseSegment.descendant_type_set` — the union over direct
     /// children of `(child.class_types ∪ child.descendant_type_set)`.
-    pub(crate) fn descendant_type_set(&self, id: NodeId) -> Arc<HashSet<String>> {
+    pub fn descendant_type_set(&self, id: NodeId) -> Arc<HashSet<String>> {
         if let Some(cached) = self.node(id).descendant_types.borrow().as_ref() {
             return cached.clone();
         }
@@ -1748,7 +1748,7 @@ impl Arena {
     }
 
     /// Parent and the index of `id` within it (mirrors `get_parent`).
-    pub(crate) fn get_parent(&self, id: NodeId) -> Option<(NodeId, usize)> {
+    pub fn get_parent(&self, id: NodeId) -> Option<(NodeId, usize)> {
         self.parent(id).map(|p| (p, self.node(id).parent_idx))
     }
 
