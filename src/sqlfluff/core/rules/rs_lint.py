@@ -201,11 +201,12 @@ class RsSegment:
     # so the arena node's type set never changes under it) so is_type/class_types
     # become Python set operations instead of per-call FFI — the hot path in
     # rule crawling.
-    __slots__ = ("_h", "_uid", "_segments", "_ct", "_rwa", "__weakref__")
+    __slots__ = ("_h", "_uid", "_segments", "_ct", "_dts", "_rwa", "__weakref__")
     _h: Any
     _uid: int
     _segments: Optional[tuple["RsSegment", ...]]
     _ct: Optional[frozenset[str]]
+    _dts: Optional[frozenset[str]]
     _rwa: Optional[list[tuple["RsSegment", list[Any]]]]
 
     def __new__(cls, handle: Any) -> "RsSegment":
@@ -220,6 +221,7 @@ class RsSegment:
             obj._uid = uid
             obj._segments = None
             obj._ct = None
+            obj._dts = None
             obj._rwa = None
             _INTERN[uid] = obj
         return obj
@@ -353,7 +355,13 @@ class RsSegment:
 
     @property
     def descendant_type_set(self) -> frozenset[str]:
-        return frozenset(self._h.descendant_type_set())
+        # Subtree-derived (aggregates over all descendants) and hit heavily by the
+        # crawler's subtree-pruning, so cache it on the wrapper. Goes stale on
+        # mutation → cleared by ``_sweep_wrapper_caches`` like ``_segments``.
+        dts = self._dts
+        if dts is None:
+            dts = self._dts = frozenset(self._h.descendant_type_set())
+        return dts
 
     @property
     def direct_descendant_type_set(self) -> set[str]:
@@ -1081,14 +1089,15 @@ def _anchor_info_to_ops(anchor_info: Any) -> list[tuple[int, str, list[Any]]]:
 def _sweep_wrapper_caches() -> None:
     """Invalidate interned ``RsSegment`` caches after an arena commit.
 
-    ``_segments`` (children tuple) and ``_rwa`` (raw_segments_with_ancestors)
-    are subtree-derived and go stale on mutation; ``_ct``/``_uid`` stay — a
-    surviving node never changes kind or uuid in place (replace creates new
-    nodes).  An explicit sweep at the single mutation point beats per-access
-    epoch checks, which would tax the hot crawl path.
+    ``_segments`` (children tuple), ``_dts`` (descendant_type_set) and ``_rwa``
+    (raw_segments_with_ancestors) are subtree-derived and go stale on mutation;
+    ``_ct``/``_uid`` stay — a surviving node never changes kind or uuid in place
+    (replace creates new nodes).  An explicit sweep at the single mutation point
+    beats per-access epoch checks, which would tax the hot crawl path.
     """
     for seg in list(_INTERN.values()):
         seg._segments = None
+        seg._dts = None
         seg._rwa = None
 
 
