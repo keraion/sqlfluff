@@ -37,8 +37,14 @@ def _facade_safe_cases():
         ids, cases = load_test_cases(yaml_path)
         for cid, tc in zip(ids, cases):
             src = tc.fail_str if tc.fail_str is not None else tc.pass_str
-            if isinstance(src, str):
-                collected.append(pytest.param(tc, id=cid))
+            if not isinstance(src, str):
+                continue
+            # Templated (Jinja) cases route to native in production (the façade
+            # path only handles files whose source == templated), so they are not
+            # the fix fast path's responsibility — skip them here.
+            if "{%" in src or "{{" in src:
+                continue
+            collected.append(pytest.param(tc, id=cid))
     return collected
 
 
