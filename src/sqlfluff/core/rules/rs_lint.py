@@ -24,9 +24,10 @@ Detection and fixing match native SQLFluff for the covered rules.
 from __future__ import annotations
 
 import logging
-import re
 import weakref
 from typing import Any, Iterator, Optional, cast
+
+import regex
 
 # Same logger native ``apply_fixes`` uses, so the "unparsable file" warning is
 # emitted on the identical channel (``src/sqlfluff/core/linter/fix.py``).
@@ -272,7 +273,11 @@ class RsSegment:
         raw_buff = value or self._h.raw
         qv = self._h.quoted_value()
         if qv:
-            _match = re.match(qv[0], raw_buff)
+            # The arena's quoted_value/escape patterns come from the Rust regex
+            # crate, which uses ``(?<name>...)`` named-group syntax that Python's
+            # ``re`` rejects ("unknown extension ?<"). The ``regex`` module (a
+            # sqlfluff dependency) accepts that syntax, so use it here.
+            _match = regex.match(qv[0], raw_buff)
             if _match:
                 group = qv[1]
                 # The arena stores the capture group as a string; a numeric
@@ -285,7 +290,7 @@ class RsSegment:
                 if isinstance(_group_match, str):
                     raw_buff = _group_match
         for old, new in self._h.escape_replacements() or []:
-            raw_buff = re.sub(old, new, raw_buff)
+            raw_buff = regex.sub(old, new, raw_buff)
         return raw_buff
 
     def raw_normalized(self, casefold: bool = True) -> str:
