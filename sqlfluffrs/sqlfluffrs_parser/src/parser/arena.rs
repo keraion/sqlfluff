@@ -27,9 +27,11 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
+use sqlfluffrs_dialects::Dialect;
 use sqlfluffrs_types::token::CaseFold;
 use sqlfluffrs_types::{PositionMarker, Slice};
 
+use super::revalidate::{revalidate_leaf_descriptors, LeafDescriptor, RevalidateOutcome};
 use super::types::{MetaType, Node, RawSegmentKwargs};
 
 /// A source-level edit attached to a segment, mirroring Python's ``SourceFix``
@@ -166,6 +168,50 @@ impl NodeSpec {
         }
     }
 
+    /// Emit this spec subtree's ordered LEAF descriptors (specs with no
+    /// children: Raw / Meta) for planned re-validation — the spec analogue of
+    /// [`Arena::planned_leaves`]'s existing-leaf branch.  A Segment spec
+    /// recurses into its children; a Raw/Meta is itself a leaf.
+    fn spec_leaves(&self, out: &mut Vec<LeafDescriptor>) {
+        match &self.kind {
+            SpecKind::Raw {
+                raw,
+                segment_type,
+                instance_types,
+                class_types,
+                ..
+            } => {
+                // Some fix-edit leaves (notably indent/dedent metas copied via
+                // `RsSegment.copy`) arrive as `SpecKind::Raw` with meta types
+                // rather than `SpecKind::Meta`.  Re-validation must still treat
+                // them as metas (native drops `is_meta` leaves before the
+                // re-match), so classify by type like native's `is_meta`: a
+                // `meta` class-type or an indent/dedent segment-type.
+                let is_meta = class_types.iter().any(|t| t == "meta")
+                    || matches!(segment_type.as_str(), "indent" | "dedent");
+                out.push(LeafDescriptor {
+                    raw: raw.clone(),
+                    instance_types: instance_types.clone(),
+                    class_types: class_types.clone(),
+                    is_code: !is_meta && self.is_code(),
+                    is_meta,
+                });
+            }
+            SpecKind::Meta { .. } => out.push(LeafDescriptor {
+                raw: String::new(),
+                instance_types: Vec::new(),
+                class_types: Vec::new(),
+                is_code: false,
+                is_meta: true,
+            }),
+            SpecKind::Segment { .. } => {
+                for c in &self.children {
+                    c.spec_leaves(out);
+                }
+            }
+        }
+    }
+
     /// Subtree source fixes in document order (spec analogue of
     /// [`Arena::node_source_fixes`]).
     fn spec_source_fixes(&self, out: &mut Vec<SourceFixSpec>) {
@@ -274,6 +320,13 @@ enum PlannedChild {
 pub(crate) struct StagedBatch {
     children_of: HashMap<NodeId, Vec<PlannedChild>>,
     tombstones: Vec<NodeId>,
+    /// The lowest containers whose child list changed in a way that native
+    /// marks `requires_validate` (delete / create / type-CHANGING replace) —
+    /// i.e. each such op's anchor's PARENT (captured pre-mutation, so ids are
+    /// still valid).  `validate_staged` runs the native bottom-up rescue walk
+    /// from each of these.  Deduped.  Empty for purely type-preserving edits
+    /// (e.g. CP01 keyword-case), which native never re-validates.
+    validate_containers: Vec<NodeId>,
 }
 
 /// What staging predicts, so Python can gate the commit (native's
@@ -697,6 +750,42 @@ impl Arena {
             ops_map.entry(op.anchor_uuid).or_default().push(op);
         }
 
+        // Validation targets (native `requires_validate`): the anchor's PARENT
+        // for every op that native re-validates — delete, create_before,
+        // create_after, or a type-CHANGING single/multi replace.  A single
+        // replace whose sole edit has the SAME class_types as the anchor is
+        // type-preserving and skipped (fix.py:223-227) — this is what keeps
+        // CP01 keyword-case fixes from ever re-validating.  Captured here, on
+        // the pre-mutation tree, so parents/uuids are still valid.  These are
+        // only the DIRECT parents; `validate_staged` walks ancestors upward.
+        let mut validate_containers: Vec<NodeId> = Vec::new();
+        let mut seen_vc: HashSet<NodeId> = HashSet::new();
+        for ops in ops_map.values() {
+            for op in ops {
+                let Some(anchor) = self.node_by_uuid(op.anchor_uuid) else {
+                    continue;
+                };
+                let requires_validate = match op.kind {
+                    EditKind::Delete | EditKind::CreateBefore | EditKind::CreateAfter => true,
+                    EditKind::Replace => {
+                        !(op.edits.len() == 1
+                            && op.edits[0].class_type_set()
+                                == self
+                                    .class_types(anchor)
+                                    .into_iter()
+                                    .collect::<HashSet<String>>())
+                    }
+                };
+                if requires_validate {
+                    if let Some(parent) = self.parent(anchor) {
+                        if seen_vc.insert(parent) {
+                            validate_containers.push(parent);
+                        }
+                    }
+                }
+            }
+        }
+
         // Dirty set: every ancestor chain from each anchor's PARENT to the
         // root (fixes are applied from the parent; native visits everything
         // but only paths towards remaining anchors can match).
@@ -744,6 +833,7 @@ impl Arena {
         self.staged = Some(StagedBatch {
             children_of,
             tombstones: plan.tombstones,
+            validate_containers,
         });
 
         StageSummary {
@@ -1070,6 +1160,116 @@ impl Arena {
                 }
             }
         }
+    }
+
+    /// The ordered LEAF descriptors of a container under the staged plan —
+    /// the planned analogue of the leaf gathering in [`Self::revalidate_container`].
+    /// For a container with no planned override this reads the committed
+    /// subtree leaves; for a planned position it emits: `Existing(c)` → if `c`
+    /// is a leaf, itself, else recurse over its planned/committed children;
+    /// `New(spec, _)` → the spec subtree's leaves.  Metas are included; the
+    /// shared verdict fn drops them.
+    fn planned_leaves(
+        &self,
+        id: NodeId,
+        children_of: &HashMap<NodeId, Vec<PlannedChild>>,
+        out: &mut Vec<LeafDescriptor>,
+    ) {
+        match children_of.get(&id) {
+            None => {
+                // No planned override at this container: source from committed
+                // leaves (recurse over real children until we hit leaves).
+                if self.children(id).is_empty() {
+                    out.push(LeafDescriptor {
+                        raw: self.raw(id),
+                        instance_types: self.instance_types(id),
+                        class_types: self.class_types(id),
+                        is_code: self.is_code(id),
+                        is_meta: self.is_meta(id),
+                    });
+                } else {
+                    for &c in self.children(id) {
+                        self.planned_leaves(c, children_of, out);
+                    }
+                }
+            }
+            Some(planned) => {
+                for pc in planned {
+                    match pc {
+                        PlannedChild::Existing(c) => self.planned_leaves(*c, children_of, out),
+                        PlannedChild::New(spec, _) => spec.spec_leaves(out),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-validate a container under the STAGED plan — the planned counterpart
+    /// of [`Self::revalidate_container`].  Sources leaves from the plan
+    /// (`planned_leaves`) instead of the committed tree, then funnels through
+    /// the same shared verdict core.
+    fn revalidate_planned_container(
+        &self,
+        id: NodeId,
+        children_of: &HashMap<NodeId, Vec<PlannedChild>>,
+        dialect: &Dialect,
+    ) -> RevalidateOutcome {
+        let Some(class) = self.segment_class(id) else {
+            return RevalidateOutcome::Skipped;
+        };
+        let Some(root_grammar) = dialect.get_segment_grammar(&class) else {
+            return RevalidateOutcome::Skipped;
+        };
+        let mut leaves = Vec::new();
+        self.planned_leaves(id, children_of, &mut leaves);
+        revalidate_leaf_descriptors(
+            &leaves,
+            dialect,
+            root_grammar.grammar_id,
+            root_grammar.tables,
+        )
+    }
+
+    /// Run native's bottom-up rescue walk over the staged plan and decide
+    /// whether the whole batch is grammar-valid (native `apply_fixes`
+    /// validation, fix.py:253-270 / 316-340).
+    ///
+    /// For each recorded validate-container `Cp` (the anchor's direct parent),
+    /// walk ancestors upward: the FIRST clean re-match RESCUES the fix; a
+    /// `Skipped` (no grammar) keeps propagating; an `Invalid` propagates to the
+    /// parent.  The chain only REJECTS if it runs off the top of the tree still
+    /// having seen an `Invalid`.  Returns true iff every chain is OK.
+    ///
+    /// Returns true when nothing is staged or there are no validate-containers
+    /// (type-preserving batches — e.g. CP01 — never validate, matching native).
+    pub(crate) fn validate_staged(&self, dialect: &Dialect) -> bool {
+        let Some(staged) = self.staged.as_ref() else {
+            return true;
+        };
+        for &cp in &staged.validate_containers {
+            let mut cur = Some(cp);
+            let mut hit_invalid = false;
+            while let Some(c) = cur {
+                match self.revalidate_planned_container(c, &staged.children_of, dialect) {
+                    // Clean re-match rescues (or the container never failed).
+                    RevalidateOutcome::Valid => break,
+                    RevalidateOutcome::Invalid => {
+                        hit_invalid = true;
+                        cur = self.parent(c);
+                    }
+                    // No grammar here: keep propagating upward.
+                    RevalidateOutcome::Skipped => {
+                        cur = self.parent(c);
+                    }
+                }
+            }
+            // The chain rejects iff we ran off the top having seen an Invalid.
+            let chain_ok = !(cur.is_none() && hit_invalid);
+            if !chain_ok {
+                return false;
+            }
+        }
+        true
     }
 
     /// Install the staged plan.  Returns the new epoch, or `None` if nothing
@@ -2821,5 +3021,138 @@ mod tests {
             arena.meta_source_str(kids[1]).as_deref(),
             Some("{{ ref('a') }}")
         );
+    }
+
+    // -- validate_staged (Phase 2 grammar re-validation) ----------------------
+
+    /// A leaf Node with an explicit class-type hierarchy (the shape a real
+    /// dialect assigns), so re-validation sees the right typed leaves.
+    fn typed_leaf(
+        class: &str,
+        ty: &str,
+        text: &str,
+        instance: &[&str],
+        class_hierarchy: &[&str],
+    ) -> Node {
+        Node::new_raw_with_class_types(
+            class.to_string(),
+            ty.to_string(),
+            ty.to_string(),
+            text.to_string(),
+            None,
+            instance.iter().map(|s| s.to_string()).collect(),
+            &class_hierarchy
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            RawSegmentKwargs::default(),
+        )
+    }
+
+    /// A raw edit spec carrying an explicit `class_types` set (the edit
+    /// segment's declared types — what native compares for validate-skip and
+    /// what re-validation feeds the grammar).
+    fn typed_raw_spec(
+        uuid: u128,
+        ty: &str,
+        text: &str,
+        instance: &[&str],
+        class_types: &[&str],
+    ) -> NodeSpec {
+        NodeSpec {
+            uuid,
+            kind: SpecKind::Raw {
+                segment_class: "RawSegment".to_string(),
+                segment_type: ty.to_string(),
+                class_type: ty.to_string(),
+                raw: text.to_string(),
+                instance_types: instance.iter().map(|s| s.to_string()).collect(),
+                class_types: class_types.iter().map(|s| s.to_string()).collect(),
+                kwargs: RawSegmentKwargs::default(),
+            },
+            source_fixes: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// A `FunctionNameSegment` container whose grammar (ANSI) expects a
+    /// `TypedParser("word")` for its identifier — the RF06 shape.
+    fn function_name_tree(leaf: Node) -> Node {
+        Node::Segment {
+            segment_class: "FunctionNameSegment".into(),
+            segment_type: Some("function_name".into()),
+            pos_marker: None,
+            class_types: vec!["function_name".to_string()],
+            children: vec![leaf],
+        }
+    }
+
+    /// A type-CHANGING replace (word `function_name_identifier` → bare
+    /// `naked_identifier`) corrupts the `FunctionNameSegment`: its grammar
+    /// can no longer re-match its own leaf, so `validate_staged` REJECTS it.
+    /// This is the RF06 backtick-strip case in miniature.
+    #[test]
+    fn validate_staged_rejects_type_changing_replace() {
+        let tree = function_name_tree(typed_leaf(
+            "WordSegment",
+            "function_name_identifier",
+            "foo",
+            &["function_name_identifier"],
+            &["word", "raw", "base"],
+        ));
+        let mut arena = Arena::from_node(&tree);
+        let leaf = leaf_by_raw(&arena, "foo");
+        let leaf_uuid = arena.uuid(leaf);
+        // Replace with a bare naked_identifier (DIFFERENT class_types).
+        let spec = typed_raw_spec(
+            leaf_uuid,
+            "naked_identifier",
+            "foo",
+            &["naked_identifier"],
+            &["identifier", "raw", "base"],
+        );
+        arena.stage_edit_batch(vec![op(leaf_uuid, EditKind::Replace, vec![spec])], false);
+        assert!(
+            !arena.validate_staged(&Dialect::Ansi),
+            "type-changing replace should fail grammar re-validation"
+        );
+    }
+
+    /// A type-PRESERVING replace (word → word, same class_types) still
+    /// re-matches — `validate_staged` ACCEPTS it.  Also exercises the
+    /// legitimate-unquote shape (RF06 on a real identifier).
+    #[test]
+    fn validate_staged_accepts_type_preserving_replace() {
+        let tree = function_name_tree(typed_leaf(
+            "WordSegment",
+            "function_name_identifier",
+            "foo",
+            &["function_name_identifier"],
+            &["word", "raw", "base"],
+        ));
+        let mut arena = Arena::from_node(&tree);
+        let leaf = leaf_by_raw(&arena, "foo");
+        let leaf_uuid = arena.uuid(leaf);
+        // Same class_types => native marks it type-preserving => no validate
+        // target => validate_staged trivially true.
+        let spec = typed_raw_spec(
+            leaf_uuid,
+            "function_name_identifier",
+            "bar",
+            &["function_name_identifier"],
+            &["word", "raw", "base"],
+        );
+        arena.stage_edit_batch(vec![op(leaf_uuid, EditKind::Replace, vec![spec])], false);
+        assert!(
+            arena.validate_staged(&Dialect::Ansi),
+            "type-preserving replace should pass re-validation"
+        );
+    }
+
+    /// Nothing staged / no validate-containers => trivially valid.
+    #[test]
+    fn validate_staged_true_when_nothing_staged() {
+        let arena = Arena::from_node(&file_tree());
+        assert!(arena.validate_staged(&Dialect::Ansi));
     }
 }

@@ -19,6 +19,7 @@ mod core;
 mod frame;
 mod helpers; // Utility methods for Parser
 mod match_result;
+pub(crate) mod revalidate;
 mod table_driven;
 pub(crate) mod types;
 

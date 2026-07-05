@@ -239,6 +239,73 @@ impl Token {
         self.token_type.to_string()
     }
 
+    /// Build a minimal synthetic *leaf* token from already-known type
+    /// information, without a source position or a real lexer origin.
+    ///
+    /// This exists for the Rust re-validation path (mirroring Python's
+    /// `validate_segment_with_reparse`, `base.py:1249`), which re-matches a
+    /// fixed segment's *own already-typed leaves* against its own grammar.  We
+    /// need `Token`s that the table-driven matcher can inspect via `is_type`,
+    /// `raw()`, `is_code()`, `is_meta` and `casefold()` — but that carry no
+    /// position, no children, and no normalization spec.  All other machinery
+    /// (positions, source fixes, brackets) is deliberately left inert.
+    ///
+    /// `is_whitespace`/`is_comment` are derived from the supplied types so that
+    /// non-code trimming and comment handling behave the same as for a lexed
+    /// token: whitespace/newline types imply whitespace; any `comment`-flavoured
+    /// type implies a comment.
+    pub fn synthetic_leaf(
+        raw: String,
+        instance_types: Vec<String>,
+        class_types: Vec<String>,
+        is_code: bool,
+        is_meta: bool,
+    ) -> Token {
+        let all_types = |t: &str| {
+            instance_types.iter().any(|x| x == t) || class_types.iter().any(|x| x == t)
+        };
+        let is_whitespace = all_types("whitespace") || all_types("newline");
+        let is_comment = all_types("comment")
+            || all_types("inline_comment")
+            || all_types("block_comment");
+        Token {
+            token_type: Cow::Owned(
+                instance_types
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "raw".to_string()),
+            ),
+            class_name: Cow::Borrowed("RawSegment"),
+            instance_types,
+            class_types: Arc::new(class_types.into_iter().collect()),
+            comment_separate: false,
+            is_meta,
+            allow_empty: false,
+            pos_marker: None,
+            // No transform spec: casefold defaults to None, raw is verbatim.
+            raw: RawString::new(raw, None, None, CaseFold::None),
+            is_whitespace,
+            is_code,
+            is_comment,
+            _default_raw: Cow::Borrowed(""),
+            indent_value: 0,
+            is_templated: false,
+            block_uuid: None,
+            source_str: None,
+            block_type: None,
+            parent: None,
+            parent_idx: None,
+            segments: Vec::new(),
+            preface_modifier: Cow::Borrowed(""),
+            suffix: Cow::Borrowed(""),
+            uuid: crate::identity::next_id(),
+            source_fixes: None,
+            trim_start: None,
+            trim_chars: None,
+            matching_bracket_idx: None,
+        }
+    }
+
     /// Get all types for this token (instance_types + class_types)
     /// This is equivalent to Python's class_types property
     pub fn get_all_types(&self) -> hashbrown::HashSet<String> {

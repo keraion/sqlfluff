@@ -280,6 +280,13 @@ class RsTree:
         ...
 
     def has_staged(self) -> bool: ...
+    def validate_staged(self, dialect: str) -> bool:
+        """Whether the staged plan re-matches its own grammar.
+
+        Rust analogue of native ``validate_segment_with_reparse``; returns
+        ``True`` when nothing is staged.
+        """
+        ...
 
 class RsParseError(Exception):
     """Exception raised by Rust parser when parsing fails.

@@ -647,45 +647,7 @@ impl PyParser {
 ///
 /// This is necessary when tokens come from Python (via PyToken -> Token conversion)
 /// because the Python lexer doesn't compute these indices.
-fn compute_bracket_pairs(tokens: &mut [Token]) {
-    // Stack to track opening brackets: (index, bracket_char)
-    let mut bracket_stack: Vec<(usize, char)> = Vec::new();
-
-    for idx in 0..tokens.len() {
-        // Only code tokens can be brackets. Skipping non-code tokens (notably
-        // comments) prevents bracket characters inside a block/inline comment -
-        // e.g. `min(` / `)` - from being paired with real brackets in the SQL.
-        if !tokens[idx].is_code() {
-            continue;
-        }
-
-        let raw = tokens[idx].raw();
-
-        // Check if this is an opening bracket
-        if let Some(open_char) = match raw {
-            "(" => Some('('),
-            "[" => Some('['),
-            "{" => Some('{'),
-            _ => None,
-        } {
-            bracket_stack.push((idx, open_char));
-        }
-        // Check if this is a closing bracket
-        else if let Some(expected_open) = match raw {
-            ")" => Some('('),
-            "]" => Some('['),
-            "}" => Some('{'),
-            _ => None,
-        } {
-            // Try to match with the most recent opening bracket of the same type
-            if let Some(pos) = bracket_stack.iter().rposition(|(_, c)| *c == expected_open) {
-                let (open_idx, _) = bracket_stack.remove(pos);
-                // Set bidirectional pointers
-                tokens[open_idx].matching_bracket_idx = Some(idx);
-                tokens[idx].matching_bracket_idx = Some(open_idx);
-            }
-            // If no matching opening bracket, leave as None (syntax error)
-        }
-    }
-    // Any remaining opening brackets on the stack are unmatched - leave as None
-}
+// The canonical implementation lives in `super::revalidate` (always compiled,
+// so the re-validation verdict path can share it); re-exported here for the
+// existing Python-token entry points.
+pub(crate) use super::revalidate::compute_bracket_pairs;

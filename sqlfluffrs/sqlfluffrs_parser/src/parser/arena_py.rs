@@ -14,10 +14,12 @@
 //! single-threaded in practice, so the mutex is uncontended; no lock is ever
 //! held across a call back into Python.
 
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 
+use sqlfluffrs_dialects::Dialect;
 use sqlfluffrs_python::marker::PyPositionMarker;
 use sqlfluffrs_types::token::CaseFold;
 use sqlfluffrs_types::Slice;
@@ -184,6 +186,21 @@ impl PyTree {
     /// Drop the staged plan without mutating.
     fn discard_staged(&self) {
         self.inner.lock().unwrap().discard_staged();
+    }
+
+    /// Native `apply_fixes` grammar validation over the STAGED plan
+    /// (fix.py:253-270 / 316-340): re-match each fix's affected container's own
+    /// grammar against its planned typed leaves, walking ancestors upward until
+    /// one re-matches cleanly (rescue) or the top is reached still invalid
+    /// (reject).  Returns `true` if the batch is grammar-valid (commit it),
+    /// `false` if it would corrupt the tree (discard it + warn, like native).
+    ///
+    /// Returns `Ok(true)` if nothing is staged, or if the staged batch has no
+    /// validation targets (type-preserving edits — e.g. CP01 — never validate).
+    /// An unknown dialect name falls back to `ansi` (matching `PyParser`).
+    fn validate_staged(&self, dialect: &str) -> PyResult<bool> {
+        let dialect = Dialect::from_str(dialect).unwrap_or(Dialect::Ansi);
+        Ok(self.inner.lock().unwrap().validate_staged(&dialect))
     }
 
     /// Whether an edit batch is currently staged.

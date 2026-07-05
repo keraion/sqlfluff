@@ -366,6 +366,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Match a specific grammar (identified by `grammar_id` within `tables`)
+    /// against the parser's *current* `self.tokens`, starting at token 0.
+    ///
+    /// Unlike [`call_rule_as_root`], this does no trailing-non-code trimming and
+    /// no root-grammar lookup: the caller has already prepared the exact token
+    /// slice (see the arena re-validation path in
+    /// [`crate::parser::revalidate`]) and wants that grammar run verbatim, the
+    /// way Python's `BaseSegment.match(self.match_grammar, ...)` does when
+    /// re-checking a fixed segment (`base.py:1249`
+    /// `validate_segment_with_reparse`).  Grammar-context installation is kept
+    /// here so the private `grammar_ctx` field stays encapsulated in `core`.
+    pub fn match_grammar(
+        &mut self,
+        grammar_id: GrammarId,
+        tables: &'static sqlfluffrs_types::GrammarTables,
+    ) -> Result<MatchResult, ParseError> {
+        self.pos = 0;
+        self.grammar_ctx = GrammarContext::new(tables);
+        self.parse_table_iterative_match_result(grammar_id, &[])
+    }
+
     pub fn root_parse(&mut self) -> Result<Node, ParseError> {
         // Obtain the root grammar for this dialect
         let root_grammar = self.dialect.get_root_grammar().clone();

@@ -23,9 +23,14 @@ Detection and fixing match native SQLFluff for the covered rules.
 
 from __future__ import annotations
 
+import logging
 import re
 import weakref
 from typing import Any, Iterator, Optional, cast
+
+# Same logger native ``apply_fixes`` uses, so the "unparsable file" warning is
+# emitted on the identical channel (``src/sqlfluff/core/linter/fix.py``).
+linter_logger = logging.getLogger("sqlfluff.linter")
 
 # Interning cache so the same arena node always yields the same RsSegment object.
 # Keyed by node uuid (a globally-unique monotonic counter), held weakly so
@@ -1101,6 +1106,7 @@ def facade_fix_loop_v3(
     from sqlfluff.core.linter.patch import generate_source_patches
 
     dialect_obj = config.get("dialect_obj")
+    dialect_name = config.get("dialect")
     rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
     if rst is None:
         return source
@@ -1162,6 +1168,18 @@ def facade_fix_loop_v3(
                     or staged_version in previous_versions
                 ):
                     rst.discard_staged()
+                    continue
+                # Native ``apply_fixes`` grammar re-validation (linter.py:637-645):
+                # reject a staged batch that would produce an unparsable file,
+                # leave the tree untouched, and warn on the same channel/text.
+                if not rst.validate_staged(dialect_name):
+                    rst.discard_staged()
+                    linter_logger.warning(
+                        "Fixes for %s not applied, as it would result in an "
+                        "unparsable file. Please report this as a bug with a "
+                        "minimal query which demonstrates this warning.",
+                        rule.code,
+                    )
                     continue
                 rst.commit_staged()
                 _sweep_wrapper_caches()
