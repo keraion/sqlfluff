@@ -78,12 +78,25 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
     {"AL04", "AL10", "CP01", "CV09", "RF02", "ST03"}
 )
+# Batch added (verified 0 NEW whole-corpus divergences over the prior set):
+# AL05, AM04, AM07, CV06, PG02, RF01, RF03, RF05, ST02, ST10, ST11. The one
+# combined-run divergence is PRE-EXISTING and not introduced by these — on
+# ``tsql/datatype_methods.sql`` the Rust parser matches T-SQL data-type methods
+# (``.value()`` etc.) case-INSENSITIVELY, but native honours their
+# ``ignore_case=False`` (only lowercase ``.value()`` is a method). So
+# ``.Value()``/``.VALUE()`` parse differently and a CP rule casefolds the schema
+# name; the prior 51-rule set already diverges there. Fixing it needs the parser
+# to honour ``ignore_case`` (codegen flag + RegexParser handler) — tracked
+# separately. The deferred LAYOUT rules (LT01/03-05/07-10/12-14) verify clean
+# INDIVIDUALLY but have a cross-rule fix-loop interaction when combined with the
+# non-layout set (e.g. LT05 line-splitting on bigquery), so they stay deferred.
 FACADE_SAFE_RULES: frozenset[str] = frozenset(
     {
         "AL01",
         "AL02",
         "AL03",
         "AL04",
+        "AL05",
         "AL06",
         "AL07",
         "AL08",
@@ -92,8 +105,10 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "AM01",
         "AM02",
         "AM03",
+        "AM04",
         "AM05",
         "AM06",
+        "AM07",
         "AM08",
         "AM09",
         "CP01",
@@ -106,6 +121,7 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "CV03",
         "CV04",
         "CV05",
+        "CV06",
         "CV07",
         "CV08",
         "CV09",
@@ -118,16 +134,23 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "LT15",
         "OR01",
         "PG01",
+        "PG02",
+        "RF01",
         "RF02",
+        "RF03",
         "RF04",
+        "RF05",
         "RF06",
         "ST01",
+        "ST02",
         "ST03",
         "ST04",
         "ST06",
         "ST07",
         "ST08",
         "ST09",
+        "ST10",
+        "ST11",
         "TQ01",
         "TQ02",
         "TQ03",
