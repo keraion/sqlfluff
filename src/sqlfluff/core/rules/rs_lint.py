@@ -880,16 +880,22 @@ def facade_violations(
     fname: str,
     config: Any,
     rules: list[Any],
+    rst: Any = None,
 ) -> Optional[list[Any]]:
     """Crawl ``rules`` over the arena façade and return their ``SQLLintError``s.
 
     Returns ``None`` if the source can't be parsed via the engine (the caller
     should fall back to the Python path). ``ignore_mask`` is not applied here —
     callers relying on ``noqa`` must handle it separately.
+
+    ``rst`` may be a tree already parsed from ``source`` (the crawl is read-only,
+    so a caller can share one parse across the gate checks, the pre-count and the
+    fix loop instead of re-parsing the same source each time).
     """
     import sqlfluffrs
 
-    rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
+    if rst is None:
+        rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
     if rst is None:
         return None
     dialect_obj = config.get("dialect_obj")
@@ -1092,6 +1098,7 @@ def facade_fix_loop_v3(
     config: Any,
     rules: list[Any],
     limit: int,
+    rst: Any = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1109,7 +1116,11 @@ def facade_fix_loop_v3(
 
     dialect_obj = config.get("dialect_obj")
     dialect_name = config.get("dialect")
-    rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
+    # ``rst`` may be a fresh (unmutated) tree already parsed from ``source`` by
+    # the caller — reuse it rather than re-parsing the same source. The loop
+    # mutates it in place, so it must not be crawled again by the caller after.
+    if rst is None:
+        rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
     if rst is None:
         return source
     tf = rst.templated_file
@@ -1209,6 +1220,7 @@ def facade_fix_loop(
     config: Any,
     rules: list[Any],
     limit: int,
+    rst: Any = None,
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
@@ -1230,7 +1242,7 @@ def facade_fix_loop(
         return source
 
     if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
-        return facade_fix_loop_v3(source, fname, config, rules, limit)
+        return facade_fix_loop_v3(source, fname, config, rules, limit, rst=rst)
 
     dialect_obj = config.get("dialect_obj")
     by_phase = {

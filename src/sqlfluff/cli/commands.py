@@ -1153,10 +1153,13 @@ def _try_facade_stdin_fix(
             return None
         import sqlfluffrs
 
-        if sqlfluffrs.engine_parse_to_tree(source, "stdin", config, None, True) is None:
+        rst = sqlfluffrs.engine_parse_to_tree(source, "stdin", config, None, True)
+        if rst is None:
             return None  # unparsable / templater error -> let Python handle it
         limit = int(config.get("runaway_limit"))
-        fixed = facade_fix_loop(source, "stdin", config, rules, limit)
+        # Reuse the tree just parsed for the gate check (the fix loop mutates it)
+        # instead of re-parsing the same source.
+        fixed = facade_fix_loop(source, "stdin", config, rules, limit, rst=rst)
         remaining = facade_violations(fixed, "stdin", config, rules)
         if remaining is None or remaining:
             return None  # unfixable violations remain -> defer to Python
@@ -1273,13 +1276,24 @@ def _try_facade_paths_fix(
                     remaining.append(fname)
                     continue
                 # Count the fixable violations *before* fixing (this is what the
-                # native summary reports) and use it as the parse/validity gate.
-                pre = facade_violations(raw_file, fname, cfg, rules)
+                # native summary reports). Reuse the tree we already parsed above
+                # for the gate checks — the crawl is read-only — instead of
+                # re-parsing the same source.
+                pre = facade_violations(raw_file, fname, cfg, rules, rst=rst)
                 if pre is None:
                     remaining.append(fname)
                     continue
-                fixed = facade_fix_loop(raw_file, fname, cfg, rules, limit)
-                post = facade_violations(fixed, fname, cfg, rules)
+                # The fix loop mutates ``rst`` in place; hand it the same tree so
+                # it needn't re-parse ``raw_file`` a third time.
+                fixed = facade_fix_loop(raw_file, fname, cfg, rules, limit, rst=rst)
+                # Self-guard: no violations may remain. If the fix changed nothing
+                # the residual is identical to ``pre`` (same source, same tree), so
+                # skip the re-parse; only a *changed* result needs a fresh parse to
+                # catch any reparse-vs-mutate divergence.
+                if fixed != raw_file:
+                    post = facade_violations(fixed, fname, cfg, rules)
+                else:
+                    post = pre
                 if post is None or post:
                     remaining.append(fname)  # unfixable violations remain
                     continue
