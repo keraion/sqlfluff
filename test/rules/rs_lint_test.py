@@ -108,3 +108,23 @@ def test_facade_fix_empty_file(rule) -> None:
     short-circuit returns the empty source, matching native.
     """
     assert _facade_fix("", "ansi", rule) == ""
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_tq02_wraps_multiple_procedures() -> None:
+    """TQ02 façade fix wraps a multi-procedure file, matching native.
+
+    Regression for the non-convergence that made native runaway-revert (leaving
+    the body unwrapped): the façade must produce the same wrapped result native
+    now produces (both apply the BEGIN/END wrap once).
+    """
+    src = (
+        "CREATE PROCEDURE dbo.a AS\nSELECT 1;\nSELECT 2;\nGO\n"
+        "CREATE PROCEDURE dbo.b AS\nSELECT 1;\nSELECT 2;\nGO\n"
+    )
+    config = FluffConfig(overrides={"dialect": "tsql", "rules": "TQ02"})
+    native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
+    assert native != src  # native now wraps (previously reverted on runaway)
+    assert _facade_fix(src, "tsql", "TQ02") == native

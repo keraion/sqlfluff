@@ -81,6 +81,23 @@ class Rule_TQ02(BaseRule):
         if not procedure_statement:
             return None  # pragma: no cover
 
+        # If the body is already led by a bare BEGIN keyword, treat it as wrapped.
+        # This only occurs on the *mutated* tree mid-fix-loop: this rule's own fix
+        # inserts a loose BEGIN ... END, which a reparse would fold into a
+        # begin_end_block but native's no-reparse ``apply_fixes`` loop does not.
+        # Without recognising it, the loose keyword is never seen as a block, so
+        # the fix re-fires every pass -> runaway_limit -> the whole fix is
+        # reverted and the body is left UNwrapped. On a freshly parsed tree the
+        # body's first code child is always a ``statement`` (a bare BEGIN parses
+        # into a statement/begin_end_block), so this never changes lint results.
+        body_code = [seg for seg in procedure_statement.segments if seg.is_code]
+        if (
+            body_code
+            and body_code[0].is_type("keyword")
+            and body_code[0].raw_upper == "BEGIN"
+        ):
+            return None
+
         # Get direct statement children (excluding whitespace, newlines, meta, etc.)
         statements = [
             seg for seg in procedure_statement.segments if seg.is_type("statement")
