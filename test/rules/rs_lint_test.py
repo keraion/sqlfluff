@@ -134,3 +134,126 @@ def test_facade_tq02_wraps_multiple_procedures() -> None:
     native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
     assert native != src  # native now wraps (previously reverted on runaway)
     assert _facade_fix(src, "tsql", "TQ02") == native
+
+
+def _multi_rule_fix(src, dialect, rules_str):
+    """Run both engines with a multi-rule set; return (native, facade)."""
+    config = FluffConfig(overrides={"dialect": dialect, "rules": rules_str})
+    native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
+    rs_config = FluffConfig(
+        overrides={
+            "dialect": dialect,
+            "rules": rules_str,
+            "use_rust_parser": True,
+            "use_rust_engine": True,
+            "use_rust_rules": True,
+        }
+    )
+    linter = Linter(config=rs_config)
+    rules = list(linter.get_rulepack(config=rs_config).rules)
+    limit = int(rs_config.get("runaway_limit"))
+    facade = facade_fix_loop(src, "<test>", rs_config, rules, limit)
+    return native, facade
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_st05_clone_keeps_existing_space() -> None:
+    """ST05's clone inspection must see existing whitespace as whitespace.
+
+    ``RsSegment.copy`` builds synthetic classes; without the raw flag attrs
+    (``_is_whitespace`` etc.) a cloned whitespace token reported
+    ``is_whitespace=False`` and ST05 injected a duplicate space after ``FROM``
+    (``FROM  A_TABLE``) that native doesn't.
+    """
+    src = (
+        "SELECT *\nFROM A_TABLE\nINNER JOIN (\n    SELECT margin\n"
+        "    FROM B_TABLE\n) USING (SOME_COLUMN)\n"
+    )
+    fixed = _facade_fix(src, "ansi", "ST05")
+    assert "FROM A_TABLE" in fixed  # exactly one space, not two
+    assert "FROM  A_TABLE" not in fixed
+    config = FluffConfig(overrides={"dialect": "ansi", "rules": "ST05"})
+    native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
+    assert fixed == native
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_runaway_limit_reverts_to_original() -> None:
+    """Exhausting the loop limit returns the ORIGINAL source, like native.
+
+    Native returns ``save_tree`` (pre-fix) when the main phase never
+    stabilises within ``runaway_limit`` loops (linter.py:673-699); the façade
+    must revert identically rather than emit the half-churned tree.
+    """
+    src = "select a FROM tbl\n"  # CP01 needs one fix loop; limit=1 can't settle
+    config = FluffConfig(
+        overrides={"dialect": "ansi", "rules": "CP01", "runaway_limit": 1}
+    )
+    native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
+    assert native == src  # native reverts on runaway
+    rs_config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "CP01",
+            "runaway_limit": 1,
+            "use_rust_parser": True,
+            "use_rust_engine": True,
+            "use_rust_rules": True,
+        }
+    )
+    linter = Linter(config=rs_config)
+    rules = list(linter.get_rulepack(config=rs_config).rules)
+    assert facade_fix_loop(src, "<test>", rs_config, rules, 1) == src
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_native_lt11_converges_after_lt09() -> None:
+    """LT09+LT11 fix in one run reaches the fixed point, both engines agree.
+
+    Regression for stale parent references after ``copy(segments=...)``:
+    ``path_to`` climbed out of the fixed tree, reflow lost its depth info, and
+    native LT11 missed 3 of 4 ``INTERSECT (`` violations after an LT09 fix in
+    the same pass — so ``sqlfluff fix`` changed the file again on a second run.
+    """
+    src = (
+        "SELECT DISTINCT\n    field_1\nFROM table_1\nEXCEPT (\n"
+        "    SELECT DISTINCT field_1\n    FROM table_2\n);\n\n"
+        "SELECT field_1\nFROM table_1\nINTERSECT (\n"
+        "    SELECT field_1\n    FROM table_2\n);\n"
+    )
+    native, facade = _multi_rule_fix(src, "postgres", "LT09,LT11")
+    assert "INTERSECT (" not in native  # all set operators get their newline
+    config = FluffConfig(overrides={"dialect": "postgres", "rules": "LT09,LT11"})
+    refixed = Linter(config=config).lint_string(native, fix=True).fix_string()[0]
+    assert refixed == native  # native fix is idempotent again
+    assert facade == native
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_native_cv11_lt01_converges() -> None:
+    """CV11+LT01 fix in one run reaches the fixed point, both engines agree.
+
+    Regression for CV11's flat fix construction: without the
+    ``function_name``/``function_contents`` nesting, LT01's reflow saw no
+    "touch" configuration and inserted a stray space after the constructed
+    ``cast`` (``cast (col1 as integer)``) that a second run removed again.
+    """
+    src = (
+        "select cast(col1 as integer)\nfrom tbl1;\n\n"
+        "select convert(integer, col1)\nfrom tbl1;\n"
+    )
+    native, facade = _multi_rule_fix(src, "redshift", "CV11,LT01")
+    assert "cast(col1 as integer)" in native
+    assert "cast (" not in native
+    config = FluffConfig(overrides={"dialect": "redshift", "rules": "CV11,LT01"})
+    refixed = Linter(config=config).lint_string(native, fix=True).fix_string()[0]
+    assert refixed == native  # native fix is idempotent again
+    assert facade == native

@@ -88,13 +88,31 @@ FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
 # casefolded the schema name. The parser now honours ``ignore_case`` (RegexParser
 # ``CASE_SENSITIVE`` grammar flag), so the 62-rule set is divergence-clean.
 # Also added 8 LAYOUT rules — LT03, LT04, LT07, LT08, LT10, LT12, LT13, LT14 —
-# verified 0 corpus divergences combined with the rest. The remaining layout
-# rules LT01, LT05 and LT09 are DEFERRED: each has a multi-pass reflow
-# convergence interaction where the façade reaches a different fixed point than
-# native (e.g. LT05 line-splitting on bigquery, LT09 ``INTERSECT (`` on
-# postgres), the same class as TQ02. ST05 (subquery->CTE) also stays deferred.
+# verified 0 corpus divergences combined with the rest.
 # (LT02's only façade-safe-suite failures are Jinja-templated cases, which route
 # to native in production — skipped in the parity harness — so it is safe.)
+#
+# The FINAL batch — LT01, LT05, LT09 and ST05 — closed out every fixable rule.
+# What unblocked them:
+# * ST05 needed ``RsSegment.copy``'s synthetic classes to carry the raw flag
+#   attrs (``_is_whitespace``/``_is_code``/``_is_comment``): without them a
+#   cloned whitespace token reported ``is_whitespace=False`` and ST05 injected a
+#   duplicate space after ``FROM`` when inspecting its clone.
+# * The remaining combined-run divergences were NATIVE non-idempotency bugs
+#   (native's own second fix run produced the façade's output — the façade was
+#   already at the fixed point). Both were fixed native-side, TQ02-precedent:
+#   (1) ``BaseSegment.copy(segments=...)`` didn't re-parent the provided
+#   children, so after a mid-loop fix ``path_to`` could climb stale parent refs
+#   into the old tree and reflow silently lost its depth info (LT11 missing
+#   ``INTERSECT (`` violations after an LT09 fix); (2) CV11 built its cast()/
+#   convert() replacements as FLAT token runs, so in the no-reparse loop LT01
+#   saw no ``function_name``/``function_contents`` containers and added a stray
+#   space after ``cast`` that a fresh parse would remove — CV11 now constructs
+#   the parse-shaped nested subtree.
+# ``facade_fix_loop_v3`` also gained native's runaway-limit revert (return the
+# ORIGINAL source when the main phase never stabilises, linter.py:673-699) and
+# its warning parity (``_warn_unfixable`` on a previously-seen version), so
+# loop-prone reflow rules degrade exactly like native.
 FACADE_SAFE_RULES: frozenset[str] = frozenset(
     {
         "AL01",
@@ -134,12 +152,15 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "CV11",
         "CV12",
         "JJ01",
+        "LT01",
         "LT02",
         "LT03",
         "LT04",
+        "LT05",
         "LT06",
         "LT07",
         "LT08",
+        "LT09",
         "LT10",
         "LT11",
         "LT12",
@@ -159,6 +180,7 @@ FACADE_SAFE_RULES: frozenset[str] = frozenset(
         "ST02",
         "ST03",
         "ST04",
+        "ST05",
         "ST06",
         "ST07",
         "ST08",
@@ -182,18 +204,32 @@ def _typename(t: Any) -> str:
 
 # Cache of synthetic segment classes used by ``RsSegment.copy`` to materialise a
 # real Python ``BaseSegment`` tree from an arena subtree. Keyed by
-# (class-name, type, class_types, is_raw) so identical arena nodes reuse the same
-# class. We build synthetic classes (rather than resolving the concrete dialect
-# class) because ``RsSegment`` holds no dialect reference; setting ``_class_types``
-# directly guarantees ``is_type``/``class_types`` parity with the façade node
-# without needing the dialect registry.
-_SYNTH_CLASSES: dict[tuple[str, str, frozenset[str], bool], type] = {}
+# (class-name, type, class_types, is_raw, raw_flags) so identical arena nodes
+# reuse the same class. We build synthetic classes (rather than resolving the
+# concrete dialect class) because ``RsSegment`` holds no dialect reference;
+# setting ``_class_types`` directly guarantees ``is_type``/``class_types`` parity
+# with the façade node without needing the dialect registry.
+_SYNTH_CLASSES: dict[
+    tuple[str, str, frozenset[str], bool, Optional[tuple[bool, bool, bool]]], type
+] = {}
 
 
 def _synth_segment_class(
-    name: str, seg_type: str, class_types: frozenset[str], is_raw: bool
+    name: str,
+    seg_type: str,
+    class_types: frozenset[str],
+    is_raw: bool,
+    raw_flags: Optional[tuple[bool, bool, bool]] = None,
 ) -> type:
-    """Return (cached) a real segment class reporting the given type/class_types."""
+    """Return (cached) a real segment class reporting the given type/class_types.
+
+    ``raw_flags`` is ``(is_code, is_comment, is_whitespace)`` for raw classes —
+    ``RawSegment`` reports these from class attributes (``_is_code`` etc.), so a
+    synthetic class must carry the arena node's values or a cloned whitespace
+    token would report ``is_whitespace=False`` (which e.g. makes ST05 mis-read
+    its clone and inject a duplicate space). Container classes derive these from
+    their children, so pass ``None``.
+    """
     from sqlfluff.core.parser import RawSegment
     from sqlfluff.core.parser.segments.base import BaseSegment
 
@@ -201,7 +237,7 @@ def _synth_segment_class(
         # Meta/whitespace/newline tokens carry no class name in the arena;
         # derive a stable one from the type so `type()` gets a valid str.
         name = "".join(p.capitalize() for p in seg_type.split("_")) + "Segment"
-    key = (name, seg_type, class_types, is_raw)
+    key = (name, seg_type, class_types, is_raw, raw_flags)
     cls = _SYNTH_CLASSES.get(key)
     if cls is None:
         base = RawSegment if is_raw else BaseSegment
@@ -212,11 +248,15 @@ def _synth_segment_class(
         # copied segments (which are these synthetic classes, not the concrete
         # dialect class): CTEDefinitionSegment.get_identifier (used by ST05 on a
         # cloned CTE). These are navigation-only so they work on any real segment.
-        cls = type(
-            name,
-            (base,),
-            {"type": seg_type, "get_identifier": _synth_get_identifier},
-        )
+        namespace: dict[str, Any] = {
+            "type": seg_type,
+            "get_identifier": _synth_get_identifier,
+        }
+        if raw_flags is not None:
+            namespace["_is_code"] = raw_flags[0]
+            namespace["_is_comment"] = raw_flags[1]
+            namespace["_is_whitespace"] = raw_flags[2]
+        cls = type(name, (base,), namespace)
         cls._class_types = class_types  # type: ignore[attr-defined]
         _SYNTH_CLASSES[key] = cls
     return cls
@@ -702,7 +742,7 @@ class RsSegment:
         segments: Optional[tuple[Any, ...]] = None,
         parent: Optional[Any] = None,
         parent_idx: Optional[int] = None,
-        preserve_uuid: bool = False,
+        preserve_uuid: bool = True,
     ) -> Any:
         """Materialise a real Python ``BaseSegment`` tree from this arena subtree.
 
@@ -717,12 +757,24 @@ class RsSegment:
         line up 1:1 with the façade original (as ``ST05.SegmentCloneMap`` relies
         on) while every leaf carries the right ``raw``/``pos_marker`` and each
         node's ``pos_marker`` remains assignable.
+
+        ``preserve_uuid`` defaults to True because native ``BaseSegment.copy``
+        ALWAYS keeps the uuid (the ``__dict__`` transfer carries it) — and fix
+        application depends on it: a rule may anchor one fix on a live tree
+        segment that another fix's replacement CLONE contains (e.g. ST05's
+        space-after-FROM ``create_after`` inside the CTE it also rewrites);
+        the anchor is found inside the spliced clone by uuid.
         """
         from sqlfluff.core.helpers.identity import get_next_id
 
         h = self._h
+        is_raw = h.is_raw()
         cls = _synth_segment_class(
-            h.segment_class, h.type, self.class_types, h.is_raw()
+            h.segment_class,
+            h.type,
+            self.class_types,
+            is_raw,
+            (h.is_code, h.is_comment, h.is_whitespace) if is_raw else None,
         )
 
         if h.is_raw():
@@ -812,7 +864,13 @@ class RsSegment:
         # `whitespace` on the mutated tree and re-trigger spacing rules forever
         # (the v1 source-patch loop masked this by re-lexing on reparse).
         h = self._h
-        cls = _synth_segment_class(h.segment_class, h.type, self.class_types, True)
+        cls = _synth_segment_class(
+            h.segment_class,
+            h.type,
+            self.class_types,
+            True,
+            (h.is_code, h.is_comment, h.is_whitespace),
+        )
         seg = cls(
             raw=raw if raw is not None else self.raw,
             pos_marker=self.pos_marker,
@@ -945,6 +1003,12 @@ def facade_violations(
     """
     import sqlfluffrs
 
+    # An empty file has nothing to lint — native returns no violations. The
+    # arena's empty ``file`` node carries no pos_marker (native's gets a
+    # zero-width one), which some rule crawls assert on (e.g. JJ01), so don't
+    # crawl it at all. Mirrors the guard in ``facade_fix_loop``.
+    if not source:
+        return []
     if rst is None:
         rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
     if rst is None:
@@ -1021,10 +1085,18 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
     Layout (matching ``extract_node_spec`` in arena_py.rs)::
 
         (tag, uuid, segment_class, segment_type, class_type, raw,
-         instance_types, class_types, kwargs, meta, source_fixes, children)
+         instance_types, class_types, kwargs, meta, source_fixes, children,
+         marker)
 
     Works for real dialect segments, ``RawSegment``s from ``RsSegment.edit``,
     and the synthetic classes from ``RsSegment.copy``.
+
+    ``marker`` carries the segment's ``pos_marker`` (or ``None``). ``LintFix``
+    strips markers from the TOP-LEVEL edit segments, but descendants keep
+    theirs (e.g. ST05 nests clones of real tree segments inside a new CTE) and
+    native ``apply_fixes`` splices them in as-is — rules then read those
+    positions off the mutated tree (ST05's ``_is_child`` CTE ordering), so
+    the arena must preserve them identically.
     """
     seg_type = seg.get_type()
     cls_type = getattr(type(seg), "type", None) or seg_type
@@ -1037,6 +1109,19 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
         for sf in (getattr(seg, "source_fixes", None) or [])
     ]
     class_types = sorted(seg.class_types)
+    pm = seg.pos_marker
+    marker = (
+        (
+            pm.source_slice.start,
+            pm.source_slice.stop,
+            pm.templated_slice.start,
+            pm.templated_slice.stop,
+            pm.working_line_no,
+            pm.working_line_pos,
+        )
+        if pm is not None
+        else None
+    )
     if seg.is_meta:
         kind = seg_type
         if kind not in (
@@ -1069,6 +1154,7 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
             meta,
             src_fixes,
             [],
+            marker,
         )
     if not seg.segments:
         # Raw leaf.
@@ -1097,6 +1183,7 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
             None,
             src_fixes,
             [],
+            marker,
         )
     return (
         "segment",
@@ -1111,6 +1198,7 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
         None,
         src_fixes,
         [_segment_to_spec(c) for c in seg.segments],
+        marker,
     )
 
 
@@ -1227,16 +1315,15 @@ def facade_fix_loop_v3(
                     st_changed,
                 ) = rst.stage_edit_batch(ops, feu)
                 staged_version = (staged_raw, tuple(staged_sfx))
-                if (
-                    not st_changed
-                    or staged_version == current_version()
-                    or staged_version in previous_versions
-                ):
+                if not st_changed or staged_version == current_version():
                     rst.discard_staged()
                     continue
                 # Native ``apply_fixes`` grammar re-validation (linter.py:637-645):
                 # reject a staged batch that would produce an unparsable file,
                 # leave the tree untouched, and warn on the same channel/text.
+                # Ordered before the previous-versions check, like native, so a
+                # batch that is both invalid and version-revisiting warns the
+                # same way on both engines.
                 if not rst.validate_staged(
                     dialect_name,
                     int(config.get("max_parse_depth") or 0),
@@ -1250,12 +1337,32 @@ def facade_fix_loop_v3(
                         rule.code,
                     )
                     continue
+                if staged_version in previous_versions:
+                    # Applying these fixes would take us back to a state we've
+                    # seen before -> we're in a loop; don't apply (native
+                    # linter.py:653-657 + ``_warn_unfixable``).
+                    rst.discard_staged()
+                    linter_logger.warning(
+                        "One fix for %s not applied, it would re-cause the same error.",
+                        rule.code,
+                    )
+                    continue
                 rst.commit_staged()
                 _sweep_wrapper_caches()
                 previous_versions.add(staged_version)
                 changed = True
             if not changed:
                 break
+        else:
+            # The phase hit its loop limit while fixes were still being applied
+            # — one or more rules aren't converging. Native (linter.py:673-699)
+            # warns and returns ``save_tree``, the tree from BEFORE any fixes,
+            # so the user never sees the half-churned file. Returning the
+            # original source reproduces that exactly; the CLI fast path then
+            # sees its violations remain and defers the file to the native
+            # fixer (which reverts the same way — byte- and exit-code parity).
+            linter_logger.warning("Loop limit on fixes reached [%s].", limit)
+            return source
 
     # Reconstruction: native patch generation over the mutated façade.
     patches = generate_source_patches(root, tf)  # type: ignore[arg-type]

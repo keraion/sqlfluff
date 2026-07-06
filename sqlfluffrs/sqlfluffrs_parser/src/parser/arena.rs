@@ -87,11 +87,19 @@ pub(crate) enum SpecKind {
     },
 }
 
+/// A position marker carried on a fix-edit spec, as plain scalars:
+/// `(source_start, source_stop, templated_start, templated_stop,
+/// working_line_no, working_line_pos)`.  Rehydrated against the tree's
+/// `TemplatedFile` on ingest.
+pub(crate) type MarkerSpec = (usize, usize, usize, usize, usize, usize);
+
 /// A recursive description of a Python fix *edit* segment to ingest into the
 /// arena.  Built by the façade (`_segment_to_spec`) from `LintFix.edit`
-/// segments.  `pos_marker` is deliberately absent: native strips edit markers
-/// in the `LintFix` constructor and relies on the position pass to synthesise
-/// them (`fix.py:53-75`).
+/// segments.  `marker` mirrors the segment's `pos_marker`: native strips it
+/// from the TOP-LEVEL edit segments in the `LintFix` constructor
+/// (`fix.py:53-75`) but *descendants* keep theirs (e.g. ST05 nests clones of
+/// real tree segments inside a new CTE) — and rules read those positions on
+/// the mutated tree (`_is_child` CTE ordering), so they must survive ingest.
 #[derive(Debug, Clone)]
 pub(crate) struct NodeSpec {
     /// The Python segment's uuid (PYTHON_TAG space — disjoint from arena-minted
@@ -100,6 +108,7 @@ pub(crate) struct NodeSpec {
     /// `BaseSegment.copy()` keeps uuids) is re-minted instead.
     pub(crate) uuid: u128,
     pub(crate) kind: SpecKind,
+    pub(crate) marker: Option<MarkerSpec>,
     pub(crate) source_fixes: Vec<SourceFixSpec>,
     pub(crate) children: Vec<NodeSpec>,
 }
@@ -290,6 +299,15 @@ pub struct Arena {
     nodes: Vec<ArenaNode>,
     root: NodeId,
     by_uuid: HashMap<u128, NodeId>,
+    /// Uuids of tombstoned (replaced/deleted) nodes.  An ingested spec may
+    /// carry one of these — `RsSegment.copy()` preserves uuids like native
+    /// `BaseSegment.copy()`, so a fix edit cloned from the very subtree it
+    /// replaces re-presents the old uuids.  They must NOT be re-registered:
+    /// the Python façade interns `RsSegment` wrappers by uuid, and reusing a
+    /// retired uuid would resurrect the dead node's wrapper (whose handle
+    /// still points at the tombstoned subtree), making re-crawls see stale
+    /// content.  `alloc_with_uuid` mints a fresh uuid instead.
+    retired_uuids: HashSet<u128>,
     /// Mutation epoch: bumped once per committed edit batch.  Python-side
     /// wrapper caches key their validity off this (and tests assert on it).
     epoch: u64,
@@ -394,6 +412,7 @@ impl Arena {
             nodes: Vec::new(),
             root: NodeId(0),
             by_uuid: HashMap::new(),
+            retired_uuids: HashSet::new(),
             epoch: 0,
             source_fixes: HashMap::new(),
             staged: None,
@@ -448,7 +467,7 @@ impl Arena {
         uuid: u128,
     ) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
-        let uuid = if self.by_uuid.contains_key(&uuid) {
+        let uuid = if self.by_uuid.contains_key(&uuid) || self.retired_uuids.contains(&uuid) {
             self.next_uuid()
         } else {
             uuid
@@ -514,6 +533,24 @@ impl Arena {
             },
         };
         let id = self.alloc_with_uuid(kind, None, parent, parent_idx, spec.uuid);
+        // Rehydrate the spec's own position marker (a descendant clone of a
+        // real tree segment keeps its marker through `LintFix`, and native
+        // apply_fixes splices it in as-is — `_position_segments` only
+        // synthesises for marker-LESS segments). Without this, rules reading
+        // positions off the mutated tree (e.g. ST05's `_is_child` CTE
+        // ordering) see synthesised insert-point markers instead.
+        if let Some((s0, s1, t0, t1, wln, wlp)) = spec.marker {
+            if let Some(root_pm) = self.nodes[self.root.idx()].pos_marker.as_ref() {
+                let tf = Arc::clone(&root_pm.templated_file);
+                self.nodes[id.idx()].pos_marker = Some(PositionMarker::new(
+                    Slice { start: s0, stop: s1 },
+                    Slice { start: t0, stop: t1 },
+                    &tf,
+                    Some(wln),
+                    Some(wlp),
+                ));
+            }
+        }
         if !spec.source_fixes.is_empty() {
             self.source_fixes.insert(id, spec.source_fixes.clone());
         }
@@ -1373,6 +1410,9 @@ impl Arena {
         // have re-claimed the uuid — never clobber the live mapping).
         if self.by_uuid.get(&uuid) == Some(&id) {
             self.by_uuid.remove(&uuid);
+            // Never reissue it: the façade's wrapper interning is uuid-keyed,
+            // so a reused uuid would resurrect the dead node's wrapper.
+            self.retired_uuids.insert(uuid);
         }
         let children = self.nodes[id.idx()].children.clone();
         for c in children {
@@ -2336,6 +2376,7 @@ mod tests {
     fn raw_spec(uuid: u128, ty: &str, text: &str) -> NodeSpec {
         NodeSpec {
             uuid,
+            marker: None,
             kind: SpecKind::Raw {
                 segment_class: "RawSegment".to_string(),
                 segment_type: ty.to_string(),
@@ -2354,6 +2395,7 @@ mod tests {
     fn spec_raw_joins_subtree() {
         let spec = NodeSpec {
             uuid: 1,
+            marker: None,
             kind: SpecKind::Segment {
                 segment_class: "CastExpressionSegment".to_string(),
                 segment_type: Some("cast_expression".to_string()),
@@ -2366,6 +2408,7 @@ mod tests {
         // Metas contribute nothing.
         let meta = NodeSpec {
             uuid: 4,
+            marker: None,
             kind: SpecKind::Meta {
                 meta_type: MetaType::Indent { is_implicit: false },
                 block_uuid: None,
@@ -2382,6 +2425,7 @@ mod tests {
         let before_len = arena.len();
         let spec = NodeSpec {
             uuid: (1u128 << 120) | 42, // PYTHON_TAG-style uuid
+            marker: None,
             kind: SpecKind::Segment {
                 segment_class: "ColumnReferenceSegment".to_string(),
                 segment_type: Some("column_reference".to_string()),
@@ -2542,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_preserves_uuid_and_consumed_pos_matches_native() {
+    fn replace_retires_uuid_and_consumed_pos_matches_native() {
         let mut arena = Arena::from_node(&file_tree());
         let kw = leaf_by_raw(&arena, "SELECT");
         let kw_uuid = arena.uuid(kw);
@@ -2559,10 +2603,14 @@ mod tests {
         assert_eq!(summary.staged_raw, "select a\n");
         arena.commit_staged().unwrap();
         assert_eq!(arena.raw(arena.root()), "select a\n");
-        // uuid continuity: the anchor''s uuid now resolves to the NEW node.
-        let new_node = arena.node_by_uuid(kw_uuid).expect("uuid reused");
+        // The anchor''s uuid is RETIRED (not reissued to the replacement):
+        // the Python façade interns wrappers by uuid, so reissuing it would
+        // resurrect the dead node''s wrapper and re-crawls would see the old
+        // subtree. The replacement gets a fresh uuid instead.
+        assert_eq!(arena.node_by_uuid(kw_uuid), None);
+        let new_node = leaf_by_raw(&arena, "select");
         assert_ne!(new_node, kw);
-        assert_eq!(arena.raw(new_node), "select");
+        assert_ne!(arena.uuid(new_node), kw_uuid);
         // consumed_pos only fires on raw equality — raws differ here, so the
         // new node has no marker yet (position pass is a later phase).
         assert!(arena.pos_marker(new_node).is_none());
@@ -2776,6 +2824,7 @@ mod tests {
         // copy-style), plus a second op anchored on the keyword INSIDE it.
         let copy_spec = NodeSpec {
             uuid: select_uuid,
+            marker: None,
             kind: SpecKind::Segment {
                 segment_class: "SelectStatementSegment".to_string(),
                 segment_type: Some("select_statement".to_string()),
@@ -2972,6 +3021,7 @@ mod tests {
         // Replace "a" with a container( b, ws, c ) — every node unpositioned.
         let sub = NodeSpec {
             uuid: 9120,
+            marker: None,
             kind: SpecKind::Segment {
                 segment_class: "ColumnReferenceSegment".to_string(),
                 segment_type: Some("column_reference".to_string()),
@@ -3066,6 +3116,7 @@ mod tests {
     ) -> NodeSpec {
         NodeSpec {
             uuid,
+            marker: None,
             kind: SpecKind::Raw {
                 segment_class: "RawSegment".to_string(),
                 segment_type: ty.to_string(),

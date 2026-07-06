@@ -592,13 +592,17 @@ impl PyHandle {
 //
 // NodeSpec tuple layout (one per edit segment, recursive in `children`):
 //   (tag, uuid, segment_class, segment_type, class_type, raw,
-//    instance_types, class_types, kwargs, meta, source_fixes, children)
+//    instance_types, class_types, kwargs, meta, source_fixes, children,
+//    marker)
 // where tag ∈ {"raw", "segment", "meta"}; `kwargs` is
 //   (trim_chars, trim_start, quoted_value, escape_replacements, casefold)
 // for raws (else None); `meta` is
 //   (meta_kind, source_str, block_type, is_implicit, block_uuid)
 // for metas (else None); `source_fixes` is
-//   [(edit, (src_start, src_stop), (tpl_start, tpl_stop)), …].
+//   [(edit, (src_start, src_stop), (tpl_start, tpl_stop)), …]; `marker` is
+//   the segment's pos_marker as (src_start, src_stop, tpl_start, tpl_stop,
+//   working_line_no, working_line_pos), or None (LintFix strips it from
+//   top-level edits; descendants — e.g. ST05's clones — keep theirs).
 //
 // EditOp tuple layout: (anchor_uuid, kind, edits) with
 // kind ∈ {"delete", "replace", "create_before", "create_after"}.
@@ -645,6 +649,11 @@ type PyMetaTuple = (String, Option<String>, Option<String>, bool, Option<u128>);
 type PySourceFixTuple = (String, (usize, usize), (usize, usize));
 
 fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
+    // PyO3 tuple extraction caps at 12 elements; the spec tuple has 13, so
+    // pull the trailing `marker` off separately and extract the head as 12.
+    let tuple = obj.cast::<pyo3::types::PyTuple>()?;
+    let marker: Option<(usize, usize, usize, usize, usize, usize)> =
+        tuple.get_item(12)?.extract()?;
     #[allow(clippy::type_complexity)]
     let (
         tag,
@@ -672,7 +681,7 @@ fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
         Option<PyMetaTuple>,
         Vec<PySourceFixTuple>,
         Bound<'_, PyAny>,
-    ) = obj.extract()?;
+    ) = tuple.get_slice(0, 12).extract()?;
 
     let kind = match tag.as_str() {
         "raw" => {
@@ -743,6 +752,7 @@ fn extract_node_spec(obj: &Bound<'_, PyAny>) -> PyResult<NodeSpec> {
     Ok(NodeSpec {
         uuid,
         kind,
+        marker,
         source_fixes: source_fixes
             .into_iter()
             .map(|(edit, (s0, s1), (t0, t1))| SourceFixSpec {
