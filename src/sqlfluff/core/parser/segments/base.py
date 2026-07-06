@@ -968,6 +968,13 @@ class BaseSegment(metaclass=SegmentMetaclass):
         # If segments were provided, use them.
         elif segments:
             new_segment.segments = segments
+            # Reset the parent references of the provided children. Without
+            # this they keep pointing at the segment they were copied from
+            # (via the __dict__ transfer above), which is still a valid child
+            # of the *old* tree — so upward navigation (e.g. `path_to`, and
+            # through it `DepthMap.from_raws_and_root`) would climb out of the
+            # new tree and wrongly report no path.
+            new_segment.set_as_parent(recurse=False)
         # Otherwise we should handle recursive segment coping.
         # We use the native .copy() method (this method!) appropriately
         # so that the same logic is applied in recursion.
