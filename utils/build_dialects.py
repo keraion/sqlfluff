@@ -46,6 +46,14 @@ def generate_dialect_enum():
             for d in dialect_readout()
         ]
     )
+    dialect_segment_has_match_grammar = ",\n            ".join(
+        [
+            f"Dialect::{d.label.capitalize()} => "
+            f"crate::dialect::{d.label.lower()}::"
+            f"parser::get_{d.label.lower()}_segment_has_match_grammar(name)"
+            for d in dialect_readout()
+        ]
+    )
     dialect_get_segment_types = ",\n            ".join(
         [
             f"Dialect::{d.label.capitalize()} => "
@@ -97,6 +105,18 @@ impl Dialect {{
     pub fn get_segment_type(&self, name: &str) -> Option<&'static str> {{
         match self {{
             {dialect_get_segment_types},
+        }}
+    }}
+
+    /// Whether the named segment class defines its OWN ``match_grammar``
+    /// (Python ``hasattr(cls, "match_grammar")``). Grammar re-validation must
+    /// SKIP classes without one — native ``apply_fixes`` does (fix.py:331-334,
+    /// "for example with the BracketedSegment") — even though
+    /// ``get_segment_grammar`` still resolves an id for them (the parser's
+    /// Ref-by-name resolution needs one).
+    pub fn segment_has_match_grammar(&self, name: &str) -> bool {{
+        match self {{
+            {dialect_segment_has_match_grammar},
         }}
     }}
 

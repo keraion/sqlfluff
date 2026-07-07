@@ -1252,11 +1252,33 @@ impl Arena {
         dialect: &Dialect,
         limits: ParseLimits,
     ) -> RevalidateOutcome {
-        let Some(class) = self.segment_class(id) else {
-            return RevalidateOutcome::Skipped;
-        };
-        let Some(root_grammar) = dialect.get_segment_grammar(&class) else {
-            return RevalidateOutcome::Skipped;
+        let root_grammar = if id == self.root && self.get_type(id) == "file" {
+            // The arena's file node reports class "Root", which resolves no
+            // segment grammar — but native's FileSegment HAS a match_grammar
+            // and file-level re-validation is the final gate of the rescue
+            // walk (it's what makes e.g. RF06's corrupting unquote get
+            // rejected). Re-match the dialect's root grammar. (The type gate
+            // keeps subtree-rooted arenas — e.g. unit tests — on the normal
+            // per-class path.)
+            dialect.get_root_grammar()
+        } else {
+            let Some(class) = self.segment_class(id) else {
+                return RevalidateOutcome::Skipped;
+            };
+            // Native only validates segments with their OWN match_grammar
+            // (`hasattr`, fix.py:331-334 — "for example with the
+            // BracketedSegment"). `get_segment_grammar` resolves an id for
+            // grammar-less classes too (the parser's Ref-by-name resolution
+            // needs one — for BracketedSegment it's a single-token type
+            // match that can never re-match real bracket content), so gate
+            // on the generated hasattr predicate first.
+            if !dialect.segment_has_match_grammar(&class) {
+                return RevalidateOutcome::Skipped;
+            }
+            let Some(root_grammar) = dialect.get_segment_grammar(&class) else {
+                return RevalidateOutcome::Skipped;
+            };
+            root_grammar
         };
         let mut leaves = Vec::new();
         self.planned_leaves(id, children_of, &mut leaves);
@@ -1274,10 +1296,15 @@ impl Arena {
     /// validation, fix.py:253-270 / 316-340).
     ///
     /// For each recorded validate-container `Cp` (the anchor's direct parent),
-    /// walk ancestors upward: the FIRST clean re-match RESCUES the fix; a
-    /// `Skipped` (no grammar) keeps propagating; an `Invalid` propagates to the
-    /// parent.  The chain only REJECTS if it runs off the top of the tree still
-    /// having seen an `Invalid`.  Returns true iff every chain is OK.
+    /// walk ancestors upward: the FIRST clean re-match RESCUES the fix, and so
+    /// does a `Skipped` (no own grammar) — in native, a container without
+    /// `match_grammar` never reassigns `validated`, which then holds the last
+    /// child's result (True in all but pathological orderings), so the failure
+    /// is SWALLOWED there rather than propagated (fix.py:331-340). An
+    /// `Invalid` propagates to the parent. The chain only REJECTS if it runs
+    /// off the top of the tree still having seen an `Invalid` — and since the
+    /// root re-matches the dialect's ROOT grammar (native FileSegment has
+    /// one), that effectively means the file-level re-match failed.
     ///
     /// Returns true when nothing is staged or there are no validate-containers
     /// (type-preserving batches — e.g. CP01 — never validate, matching native).
@@ -1299,10 +1326,9 @@ impl Arena {
                         hit_invalid = true;
                         cur = self.parent(c);
                     }
-                    // No grammar here: keep propagating upward.
-                    RevalidateOutcome::Skipped => {
-                        cur = self.parent(c);
-                    }
+                    // No own grammar: native swallows the failure here
+                    // (validated is never reassigned) — rescued.
+                    RevalidateOutcome::Skipped => break,
                 }
             }
             // The chain rejects iff we ran off the top having seen an Invalid.

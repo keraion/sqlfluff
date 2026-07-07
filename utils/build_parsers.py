@@ -1682,6 +1682,12 @@ def generate_parser_table_driven(dialect: str):
     builder = TableBuilder()
     segment_to_id = {}
     segment_types = []
+    # Library entries that are segment CLASSES without their own
+    # ``match_grammar`` (native ``hasattr`` is False, e.g. BracketedSegment).
+    # Grammar re-validation must SKIP these, mirroring native apply_fixes
+    # (fix.py:331-334), even though they still get a grammar id below for the
+    # parser's Ref-by-name resolution.
+    grammarless_segments = []
 
     # Phase 1: Flatten all segment grammars
     print("// Flattening grammar tree...")
@@ -1737,6 +1743,8 @@ def generate_parser_table_driven(dialect: str):
             segment_type = getattr(match_grammar, "type", None)
             if segment_type:
                 segment_types.append((name, segment_type))
+            if not hasattr(match_grammar, "match_grammar"):
+                grammarless_segments.append(name)
 
     # Validate tables
     print("// Validating tables...")
@@ -1764,6 +1772,19 @@ def generate_parser_table_driven(dialect: str):
         )
     print("        _ => None,")
     print("    }")
+    print("}")
+    print()
+
+    # Generate the native ``hasattr(cls, "match_grammar")`` predicate.
+    print(
+        f"pub fn get_{dialect.lower()}_segment_has_match_grammar(name: &str) -> bool {{"
+    )
+    if grammarless_segments:
+        joined = " | ".join(f'"{n}"' for n in sorted(grammarless_segments))
+        print(f"    !matches!(name, {joined})")
+    else:
+        print("    let _ = name;")
+        print("    true")
     print("}")
     print()
 
