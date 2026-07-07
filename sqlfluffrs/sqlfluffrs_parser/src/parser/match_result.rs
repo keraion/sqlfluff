@@ -582,6 +582,11 @@ impl MatchResult {
                 && self.insert_segments.is_empty()
                 && self.matched_slice.end == self.matched_slice.start + 1
                 && result_nodes.len() == 1
+                // Guard BEFORE popping: a single Meta node (e.g. the root file
+                // match over just an end_of_file token in an empty jinja
+                // render) must not be consumed by the retag `pop()` below —
+                // it falls through to the Segment wrap and stays a child.
+                && matches!(result_nodes.first(), Some(Node::Raw { .. }))
                 && !match_class.is_unparsable()
                 && match_class.segment_type.is_some()
             {

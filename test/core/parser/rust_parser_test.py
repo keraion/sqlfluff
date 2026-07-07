@@ -707,3 +707,34 @@ def test__rust_parser__tsql_datatype_method_case_sensitive(method, is_datatype_m
     native_ids = method_ids(False)
     assert rust_ids == native_ids  # parity with native
     assert (method in rust_ids) is is_datatype_method
+
+
+@pytest.mark.skipif(not _HAS_RUST_PARSER, reason="Rust parser not available")
+@pytest.mark.parametrize("templater", ["jinja", "raw"])
+def test__rust_parser__empty_file_keeps_metas(templater):
+    """An empty file parses to the same meta-only tree as native.
+
+    Regression test: the single-token retag path in `MatchResult::apply`
+    popped the sole child node before checking it was a `Node::Raw`, silently
+    dropping a lone Meta — so a zero-byte jinja render (whose only token is
+    `end_of_file`) parsed to a bare `file` node with no children. Native (and
+    the raw templater, whose zero-length literal slice adds a `placeholder`
+    token, taking the count past one) keeps the metas as children.
+    """
+    from sqlfluff.core import FluffConfig, Linter
+
+    def tree_types(rust: bool):
+        cfg = FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "templater": templater,
+                "use_rust_parser": rust,
+                "use_rust_engine": False,
+            }
+        )
+        tree = Linter(config=cfg).parse_string("").tree
+        return [seg.get_type() for seg in tree.recursive_crawl_all()]
+
+    rust_types = tree_types(True)
+    assert rust_types == tree_types(False)  # parity with native
+    assert "end_of_file" in rust_types  # the meta survives
