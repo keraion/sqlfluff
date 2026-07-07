@@ -8,8 +8,10 @@ file (mirroring the CLI routing gates). Run from the repo root:
     python utils/facade_fix_parity.py "$(python -c 'from sqlfluff.core.rules.rs_lint import FACADE_SAFE_RULES; print(",".join(sorted(FACADE_SAFE_RULES)))')"
 
 Optionally pass a single dialect name as argv[2]. Expected result: 0
-divergences (postgres/array.sql errors in the NATIVE baseline — it needs a
-templater this harness doesn't configure — and is a known artifact).
+divergences and 0 errors. Uses the raw templater (like the dialect test
+suite) so fixture SQL containing jinja-lookalike text (e.g.
+postgres/array.sql's ``{{{...}}}`` array literal) doesn't error out —
+see PARITY_NOTES.md.
 """
 
 import glob
@@ -35,6 +37,7 @@ def cfg(dialect, rust):
     return FluffConfig(
         overrides={
             "dialect": dialect,
+            "templater": "raw",
             "rules": RULESET,
             "use_rust_parser": rust,
             "use_rust_engine": rust,
@@ -57,6 +60,8 @@ def facade_fix(src, fname, dialect):
     byte-compared here); only a runaway revert, unparsable/templated sources
     and engine-parse failures route to native.
     """
+    if not src:
+        return None  # empty files route to native (LT12 under raw templating)
     c = cfg(dialect, True)
     lnt = Linter(config=c)
     rules = list(lnt.get_rulepack(config=c).rules)

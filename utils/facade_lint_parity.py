@@ -11,7 +11,10 @@ Run from the repo root:
     python utils/facade_lint_parity.py [RULESET] [DIALECT]
 
 RULESET defaults to all rules; expected result: 0 detection and 0 text
-divergences.
+divergences and 0 errors. Uses the raw templater (like the dialect test
+suite) so fixture SQL containing jinja-lookalike text (e.g.
+postgres/array.sql's ``{{{...}}}`` array literal) doesn't error out —
+see PARITY_NOTES.md.
 """
 
 import glob
@@ -38,7 +41,7 @@ for dialect in sorted(os.listdir(CORPUS)):
     dpath = os.path.join(CORPUS, dialect)
     if not os.path.isdir(dpath) or (DIALECT_FILTER and dialect != DIALECT_FILTER):
         continue
-    overrides = {"dialect": dialect}
+    overrides = {"dialect": dialect, "templater": "raw"}
     if RULESET:
         overrides["rules"] = RULESET
     cfg_nat = FluffConfig(overrides=dict(overrides))

@@ -6,7 +6,8 @@ Context for the corpus parity harnesses in this directory
 `0cb6c9f41`): whole-corpus **fix parity 0/2168**, **lint parity 0/2166**,
 raw-token sweep (type + class_types + raw, pure-python vs rust)
 **0/2170** — with exactly ONE recurring "error" (not a divergence),
-documented below.
+documented below (since fixed: the harnesses now use the raw
+templater, so `errors=0` is the expected baseline).
 
 ## Known artifact: `test/fixtures/dialects/postgres/array.sql`
 
@@ -45,21 +46,71 @@ res = Linter(config=c).lint_string(src, fix=True)
 # res.templated_file is None; violations == [TMP L49]
 ```
 
-**Fix options** (none applied yet — pick one):
+**Fix applied (2026-07-07)**: option 1 — `templater = raw` is now
+configured in `facade_fix_parity.py` and `facade_lint_parity.py`
+(matches what the dialect test suite does; makes the corpus 100% clean,
+so `errors=0` is the expected baseline). Any future ad-hoc token-sweep
+script over this corpus should do the same. Known downside: hides
+genuine templater-path behavior for every OTHER file (today none of
+them template, so this is currently free).
 
-1. Configure `templater = raw` in the harnesses (matches what the
-   dialect test suite does; makes the corpus 100% clean). Applies to
-   `facade_fix_parity.py`, `facade_lint_parity.py`, and the token-sweep
-   script. Downside: hides genuine templater-path behavior for every
-   OTHER file (today none of them template, so this is currently free).
-2. Per-file skip/allow-list with a comment.
-3. Leave as-is and treat `errors=1` as the expected whole-corpus
-   baseline (what we've been doing).
+Options considered and not taken: per-file skip/allow-list; leaving
+`errors=1` as the expected whole-corpus baseline.
 
 Note the CLI fast paths are already correct here: templated sources
 (`source_str != templated_str`) and templater failures route to native
 by the eligibility gates in `commands.py`, so production behavior is
 identical regardless.
+
+## Empty files are not façade-eligible (found by the raw-templater switch)
+
+Switching the harnesses to `templater = raw` exposed a real façade gap on
+`test/fixtures/dialects/ansi/empty_file.sql` (0 bytes): a raw-templated
+zero-byte render keeps one zero-length literal raw slice, which native's
+lexer turns into a zero-width `placeholder` meta — and **LT12 lints it and
+fixes the file to a single newline** (`'' -> '\n'`). (Under jinja the
+zero-byte render has no raw slices, no placeholder is lexed, and empty
+files lint clean — which is why this never showed before.) The arena's
+bare `file` node carries no pos_marker, so the façade can't reproduce
+that. Resolution: empty sources are routed to native everywhere — the CLI
+gates (`_facade_lint_file`, `_try_facade_stdin_fix`,
+`_try_facade_paths_fix`), `facade_violations` (returns `None`), and the
+fix harness (`facade_fix` returns `None`). `facade_fix_loop` keeps its
+empty-source short-circuit purely as a crash guard for direct callers.
+
+Chasing the same case also exposed a Rust parser bug (affecting the
+standalone `sqlfluff-rs` CLI and `engine_parse_to_tree` alike): the
+single-token retag path in `MatchResult::apply` popped the sole child
+node *before* checking it was a `Node::Raw`, silently dropping a lone
+Meta — so a zero-byte **jinja** render (whose only token is
+`end_of_file`) parsed to a bare `file` node with no children, where
+native keeps `file > end_of_file`. Fixed (guard before pop, mirroring
+the raw-class collapse block below it) + regression test in
+`test/core/parser/rust_parser_test.py`.
+
+## Open upstream bug: `PY_TEMPLATED_FILE_CACHE` key ignores slicing
+
+`PySqlFluffTemplatedFile::extract`
+(`sqlfluffrs/sqlfluffrs_python/src/templater/templatefile.rs`, present on
+upstream main since #7386) memoizes Python→Rust `TemplatedFile`
+conversions keyed by `fname:source_str:templated_str` — the key does
+**not** include `sliced_file`/`raw_sliced`. Two TemplatedFiles with the
+same rendered text but different slicing (e.g. jinja vs raw templater
+over the same source — a zero-byte file is the minimal case) collide, and
+the second lex silently reuses the first's slices. Observable effects in
+one process (found 2026-07-07 while chasing the empty-file divergence):
+
+- `Linter(templater=raw).lint_string("")` returns different trees
+  depending on whether a jinja config linted `""` first (the placeholder
+  meta appears or not — LT12 flips).
+- The mismatched tree/TemplatedFile pair can crash `fix_string` with
+  `IndexError` in `generate_source_patches` (`raw_sliced[-1]` on `[]`).
+- The cache is also never evicted (unbounded growth keyed by full source
+  text).
+
+Any parity probe comparing templaters in one process is affected. Not
+fixed here (rust-side, upstream-shared); the key needs the slicing (or a
+content hash), or the cache needs to go.
 
 ## Pitfall: pinning the native side of ANY parity probe
 
