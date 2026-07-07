@@ -62,15 +62,19 @@ impl PositionMarker {
         line_no: usize,
         line_pos: usize,
     ) -> (usize, usize) {
-        // Placeholder for position inference logic
-        // Example implementation: move forward by the length of the string
+        // Mirrors Python ``PositionMarker.infer_next_position``. Lengths are
+        // CHARACTER counts (Python ``len(str)``), NOT byte lengths — using
+        // ``str::len()`` here inflated working positions on non-ASCII text
+        // (e.g. Greek/Cyrillic identifiers), which made reflow's line-length
+        // decisions diverge from native mid-fix-loop (LT05 splitting a line
+        // native keeps, seen on vertica/utf8.sql).
         let lines: Vec<&str> = raw.split('\n').collect();
         if lines.len() > 1 {
             let num_lines: usize = lines.len();
-            let last_line_len: usize = lines.last().unwrap().len();
+            let last_line_len: usize = lines.last().unwrap().chars().count();
             (line_no + num_lines - 1, last_line_len + 1)
         } else {
-            let first_line_len: usize = raw.len();
+            let first_line_len: usize = raw.chars().count();
             (line_no, line_pos + first_line_len)
         }
     }

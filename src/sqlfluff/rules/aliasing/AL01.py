@@ -86,7 +86,14 @@ class Rule_AL01(BaseRule):
 
             elif self.aliasing != "implicit":
                 self.logger.debug("Inserting AS keyword and respacing.")
-                for identifier in context.segment.raw_segments:
+                # Anchor on the first code DIRECT CHILD, not the first code
+                # raw leaf: for a bracketed alias (e.g. a column alias list
+                # ``(a, b)``) the first leaf is the opening bracket, and
+                # anchoring there put the inserted operator INSIDE the
+                # bracketed segment — where the ``get_child("alias_operator")``
+                # check above never sees it, so the rule re-fired every pass
+                # until the loop limit reverted the whole file.
+                for identifier in context.segment.segments:
                     if identifier.is_code:
                         break
                 else:  # pragma: no cover

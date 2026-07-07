@@ -50,7 +50,13 @@ def native_fix(src, dialect):
 
 
 def facade_fix(src, fname, dialect):
-    """Return facade-fixed source, or None if the file routes to native."""
+    """Return facade-fixed source, or None if the file routes to native.
+
+    Mirrors the CLI fast path's routing (commands.py): gave-up and unfixable
+    residuals COMPLETE on the fast path (their bytes are final and must be
+    byte-compared here); only a runaway revert, unparsable/templated sources
+    and engine-parse failures route to native.
+    """
     c = cfg(dialect, True)
     lnt = Linter(config=c)
     rules = list(lnt.get_rulepack(config=c).rules)
@@ -66,12 +72,14 @@ def facade_fix(src, fname, dialect):
         tf, "templated_str", None
     ):
         return None
-    pre = facade_violations(src, fname, c, rules)
-    if pre is None:
-        return None
-    fixed = facade_fix_loop(src, fname, c, rules, limit)
-    post = facade_violations(fixed, fname, c, rules)
-    if post is None or post:
+    pre = []
+    loop_state = {}
+    fixed = facade_fix_loop(
+        src, fname, c, rules, limit, rst=rst, lint_sink=pre, loop_state=loop_state
+    )
+    if loop_state.get("runaway"):
+        return None  # the CLI defers runaway reverts to native
+    if fixed != src and facade_violations(fixed, fname, c, rules) is None:
         return None
     return fixed
 
