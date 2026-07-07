@@ -50,11 +50,11 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # rest of the set. This is a *fix-output* guarantee, used by the self-guarding
 # stdin/path-fix fast path (which re-checks that no violations remain).
 #
-# NOTE: it is NOT a detection/lint guarantee — some rules over-report violations
-# over the façade (safe for the fix guard, wrong for lint), e.g. CP01
-# double-reports the sparksql ``div`` operator. Wiring `lint` needs the
-# detection-verified subset (this set minus the DETECTION_UNSAFE members below,
-# plus rules using ``isinstance`` on concrete classes a duck-type can't satisfy).
+# DETECTION parity is now ALSO verified: ``facade_violations`` matches native
+# ``lint_string`` violation-for-violation ((rule, line, pos, description)) for
+# every rule across the whole dialects corpus, and the raw token streams match
+# native (type + class_types) on every comparable file. Kept in check by the
+# lint-parity harness and the detection-parity suite in rs_lint_test.py.
 #
 # RF06 is façade-safe via arena grammar re-validation. It strips backtick quotes
 # from mysql/mariadb/tsql stored-procedure/function *names* that native LEAVES
@@ -75,9 +75,17 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # (correct) wrap: a divergence. TQ02 now recognises a body already led by a bare
 # BEGIN keyword as wrapped (see TQ02._eval), so native converges too — both apply
 # the wrap once. Verified byte-identical to native over the whole dialects corpus.
-FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset(
-    {"AL04", "AL10", "CP01", "CV09", "RF02", "ST03"}
-)
+# Rules whose façade LINT detection diverges from native — currently EMPTY:
+# the historical members (AL04, AL10, CP01, CV09, RF02, ST03) were re-audited
+# with the whole-corpus lint-parity harness and all now match native
+# violation-for-violation. (Their original blockers — concrete-class
+# ``isinstance`` in rule/analysis code, CP01's sparksql ``div`` double-report
+# — were fixed by intervening façade work; the last two real divergences were
+# a missing ``deduplicate_in_source_space`` in ``facade_violations``, and
+# arena tokens losing class_types/types on some parse paths.) The constant
+# and its fast-path gating remain for future rules (e.g. plugins) that may
+# need quarantining before their detection is verified.
+FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset()
 # Batch added (verified 0 NEW whole-corpus divergences over the prior set):
 # AL05, AM04, AM07, CV06, PG02, RF01, RF03, RF05, ST02, ST10, ST11. Triage
 # surfaced (and fixed) the sole combined-run divergence, which was PRE-EXISTING
@@ -1002,6 +1010,7 @@ def facade_violations(
     fix loop instead of re-parsing the same source each time).
     """
     import sqlfluffrs
+    from sqlfluff.core.linter.linted_file import LintedFile
 
     # An empty file has nothing to lint — native returns no violations. The
     # arena's empty ``file`` node carries no pos_marker (native's gets a
@@ -1030,7 +1039,13 @@ def facade_violations(
             config=config,
         )
         out.extend(lints)
-    return out
+    # Native passes every file's violations through
+    # ``deduplicate_in_source_space`` (linter.py:848): dedupe on
+    # ``source_signature()`` + sort by position. Without it a rule that
+    # legitimately emits the same result twice diverges — e.g. AL04 anchors one
+    # duplicate-alias result per SELECT-clause subquery on the SAME parent
+    # alias segment, which native collapses to one.
+    return LintedFile.deduplicate_in_source_space(out)
 
 
 def _native_apply_fixes(

@@ -296,3 +296,75 @@ def test_facade_fix_loop_lint_sink_matches_native_initial() -> None:
     clean = facade_fix_loop(fixed, "<test>", rs_config, rules, 10, lint_sink=clean_sink)
     assert clean == fixed
     assert clean_sink == []
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+@pytest.mark.parametrize("test_case", _facade_safe_cases())
+def test_facade_lint_matches_native(test_case) -> None:
+    """Façade DETECTION equals native, violation-for-violation.
+
+    The fix suite (above) locks fix-output parity; this locks lint parity —
+    (rule, line, pos, description) — which the fix fast path relies on for
+    its violation counts/exit codes and any future façade ``lint`` wiring.
+    """
+    from sqlfluff.core.errors import SQLLintError
+    from sqlfluff.core.rules.rs_lint import facade_violations
+
+    src = test_case.fail_str if test_case.fail_str is not None else test_case.pass_str
+    if "noqa" in src.lower():
+        # Ignore masks aren't applied on the façade path; the CLI gates
+        # noqa'd sources to native (commands.py), so they're out of scope.
+        pytest.skip("noqa routes to native in production")
+    config = _setup_config(test_case.rule, test_case.configs)
+    linter = Linter(config=config)
+    rules = list(linter.get_rulepack(config=config).rules)
+
+    fac = facade_violations(src, "<test>", config, rules)
+    if fac is None:
+        # Engine can't parse this case -> routes to native in production.
+        pytest.skip("engine parse unavailable for this case")
+    nat = [v for v in linter.lint_string(src).violations if isinstance(v, SQLLintError)]
+    assert [(v.rule_code(), v.line_no, v.line_pos, v.description) for v in fac] == [
+        (v.rule_code(), v.line_no, v.line_pos, v.description) for v in nat
+    ]
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_lint_dedupes_like_native() -> None:
+    """Duplicate lint results collapse like native's source-space dedupe.
+
+    AL04 legitimately emits one duplicate-alias result per SELECT-clause
+    subquery, anchored on the same parent alias; native collapses them via
+    ``LintedFile.deduplicate_in_source_space`` and ``facade_violations``
+    must too (it previously reported the same violation twice).
+    """
+    from sqlfluff.core.errors import SQLLintError
+    from sqlfluff.core.rules.rs_lint import facade_violations
+
+    src = "SELECT a, a IN (SELECT a FROM t1), a = all (SELECT a FROM t1) FROM t1;\n"
+    rs_config = FluffConfig(
+        overrides={
+            "dialect": "mariadb",
+            "rules": "AL04",
+            "use_rust_parser": True,
+            "use_rust_engine": True,
+            "use_rust_rules": True,
+        }
+    )
+    linter = Linter(config=rs_config)
+    rules = list(linter.get_rulepack(config=rs_config).rules)
+    fac = facade_violations(src, "<test>", rs_config, rules)
+    config = FluffConfig(overrides={"dialect": "mariadb", "rules": "AL04"})
+    nat = [
+        v
+        for v in Linter(config=config).lint_string(src).violations
+        if isinstance(v, SQLLintError)
+    ]
+    assert len(nat) == 1  # native reports the duplicate alias exactly once
+    assert [(v.rule_code(), v.line_no, v.line_pos) for v in fac] == [
+        (v.rule_code(), v.line_no, v.line_pos) for v in nat
+    ]

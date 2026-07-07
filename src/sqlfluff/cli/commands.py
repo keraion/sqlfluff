@@ -1201,6 +1201,12 @@ def _try_facade_stdin_fix(
         fixed = facade_fix_loop(
             source, "stdin", config, rules, limit, rst=rst, lint_sink=pre
         )
+        # Native passes reported violations through
+        # ``deduplicate_in_source_space`` (linter.py:848); mirror it so counts
+        # match when a rule legitimately reports the same result twice (AL04).
+        from sqlfluff.core.linter.linted_file import LintedFile
+
+        pre = LintedFile.deduplicate_in_source_space(pre)
         if fixed != source:
             post = facade_violations(fixed, "stdin", config, rules)
         else:
@@ -1348,6 +1354,11 @@ def _try_facade_paths_fix(
                 fixed = facade_fix_loop(
                     raw_file, fname, cfg, rules, limit, rst=rst, lint_sink=pre
                 )
+                # Native passes reported violations through
+                # ``deduplicate_in_source_space`` (linter.py:848); mirror it so
+                # counts/display match when a rule legitimately reports the
+                # same result twice (AL04).
+                pre = LintedFile.deduplicate_in_source_space(pre)
                 # Self-guard: check what remains. If the fix changed nothing
                 # the residual is identical to ``pre`` (same source, same tree), so
                 # skip the re-parse; only a *changed* result needs a fresh parse to
