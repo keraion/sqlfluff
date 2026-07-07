@@ -1137,6 +1137,7 @@ def _try_facade_stdin_fix(
     try:
         from sqlfluff.core.rules.rs_lint import (
             FACADE_SAFE_RULES,
+            RsSegment,
             facade_fix_loop,
             facade_violations,
         )
@@ -1144,10 +1145,28 @@ def _try_facade_stdin_fix(
         config = linter.config
         if stdin_filename:
             config = config.make_child_from_path(stdin_filename, require_dialect=False)
+            # Respect ignore files exactly as native ``lint_string_wrapped``
+            # does (linter.py:1112-1121): if the named file is excluded by a
+            # ``.sqlfluffignore``, defer — native then emits the advisory
+            # warning and passes the input through untouched.
+            from sqlfluff.core.linter.discovery import paths_from_path
+
+            if not list(
+                paths_from_path(
+                    stdin_filename,
+                    target_file_exts=("",),
+                    check_non_existent_file=True,
+                )
+            ):
+                return None
         if not _use_rust_engine(config, None):
             return None
         if "noqa" in source.lower():
             return None  # ignore masks not applied on the façade path
+        if config.get("warnings"):
+            # ``sqlfluff:warnings:`` demotes matching violations to warnings;
+            # the façade crawl can't apply that -> native.
+            return None
         rules = list(linter.get_rulepack(config=config).rules)
         if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
             return None
@@ -1155,12 +1174,34 @@ def _try_facade_stdin_fix(
 
         rst = sqlfluffrs.engine_parse_to_tree(source, "stdin", config, None, True)
         if rst is None:
-            return None  # unparsable / templater error -> let Python handle it
+            return None  # unrenderable / lexer error -> let Python handle it
+        # Route anything with a parse error to native: the arena still yields
+        # a tree, but native treats these as PRS violations (non-zero exit,
+        # "Unfixable violations detected") and we must not swallow them.
+        if next(RsSegment(rst.root).recursive_crawl("unparsable"), None) is not None:
+            return None
+        # Likewise route any *templated* source to native: the façade path
+        # can't observe templater (TMP) violations — e.g. an undefined jinja
+        # variable renders differently and must abort the fix — so we only
+        # handle sources that are literal (source == templated).
+        tf = rst.templated_file
+        if tf is None or getattr(tf, "source_str", None) != getattr(
+            tf, "templated_str", None
+        ):
+            return None
         limit = int(config.get("runaway_limit"))
         # Reuse the tree just parsed for the gate check (the fix loop mutates it)
-        # instead of re-parsing the same source.
-        fixed = facade_fix_loop(source, "stdin", config, rules, limit, rst=rst)
-        remaining = facade_violations(fixed, "stdin", config, rules)
+        # instead of re-parsing the same source. Harvest the pre-fix violations
+        # from the loop's first pass: when the fix changed nothing they ARE the
+        # residual, so the self-guard needs no second sweep.
+        pre: list = []
+        fixed = facade_fix_loop(
+            source, "stdin", config, rules, limit, rst=rst, lint_sink=pre
+        )
+        if fixed != source:
+            remaining = facade_violations(fixed, "stdin", config, rules)
+        else:
+            remaining = pre
         if remaining is None or remaining:
             return None  # unfixable violations remain -> defer to Python
         return fixed
@@ -1275,17 +1316,16 @@ def _try_facade_paths_fix(
                 ):
                     remaining.append(fname)
                     continue
-                # Count the fixable violations *before* fixing (this is what the
-                # native summary reports). Reuse the tree we already parsed above
-                # for the gate checks — the crawl is read-only — instead of
-                # re-parsing the same source.
-                pre = facade_violations(raw_file, fname, cfg, rules, rst=rst)
-                if pre is None:
-                    remaining.append(fname)
-                    continue
-                # The fix loop mutates ``rst`` in place; hand it the same tree so
-                # it needn't re-parse ``raw_file`` a third time.
-                fixed = facade_fix_loop(raw_file, fname, cfg, rules, limit, rst=rst)
+                # The fix loop mutates ``rst`` in place; hand it the same tree
+                # so it needn't re-parse ``raw_file``. The pre-fix violations
+                # (what the native summary reports — its
+                # ``initial_linting_errors``) are harvested from the loop's own
+                # first pass via ``lint_sink`` rather than paying a separate
+                # whole-ruleset crawl.
+                pre: list = []
+                fixed = facade_fix_loop(
+                    raw_file, fname, cfg, rules, limit, rst=rst, lint_sink=pre
+                )
                 # Self-guard: no violations may remain. If the fix changed nothing
                 # the residual is identical to ``pre`` (same source, same tree), so
                 # skip the re-parse; only a *changed* result needs a fresh parse to

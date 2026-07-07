@@ -1419,6 +1419,12 @@ def test__cli__command_fix_stdin_logging_to_stderr(monkeypatch):
             return super().lint_fix_parsed(*args, **kwargs)
 
     monkeypatch.setattr(sqlfluff.cli.commands, "Linter", MockLinter)
+    # This asserts on the NATIVE fix pipeline's logging (the mock hooks
+    # lint_fix_parsed), so keep the Rust-engine fast path out of the way —
+    # it fixes the (clean) input without ever reaching lint_fix_parsed.
+    monkeypatch.setattr(
+        sqlfluff.cli.commands, "_try_facade_stdin_fix", lambda *a, **k: None
+    )
     result = invoke_assert_code(
         args=[fix, ("-", "--rules=LT02", "--dialect=ansi")],
         cli_input=perfect_sql,

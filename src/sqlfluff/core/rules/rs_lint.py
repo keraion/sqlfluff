@@ -1239,6 +1239,7 @@ def facade_fix_loop_v3(
     rules: list[Any],
     limit: int,
     rst: Any = None,
+    lint_sink: Optional[list[Any]] = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1248,6 +1249,14 @@ def facade_fix_loop_v3(
     ``(raw, source_fixes)`` version set AND the consecutive-identical-fixes
     check — then reconstruct the fixed source with native patch generation
     over the mutated façade.
+
+    ``lint_sink``, if given, collects the lint results from the FIRST pass —
+    exactly native's ``initial_linting_errors`` (linter.py:532-535/573-574:
+    all rules, crawled in fix mode over the progressively-mutated tree). This
+    lets callers get the pre-fix violation set from the crawl the loop already
+    does, instead of paying a separate whole-ruleset sweep. Only valid when
+    the loop actually ran: the caller must have gated on a parseable tree
+    (the early bails below leave the sink empty).
     """
     import sqlfluffrs
     from sqlfluff.core.linter.fix import compute_anchor_edit_info
@@ -1284,6 +1293,7 @@ def facade_fix_loop_v3(
         nloops = limit if phase == "main" else 2
         for loop in range(nloops):
             this = rules if (phase == "main" and loop == 0) else by_phase[phase]
+            first_pass = phase == "main" and loop == 0
             changed = False
             for rule in this:
                 _v, _r, fixes, _m = rule.crawl(
@@ -1295,6 +1305,10 @@ def facade_fix_loop_v3(
                     fname=fname,
                     config=config,
                 )
+                if lint_sink is not None and first_pass:
+                    # Native's ``initial_linting_errors``: only the first pass
+                    # of the main phase reports (linter.py:573-574).
+                    lint_sink.extend(_v)
                 if not fixes:
                     continue
                 anchor_info = compute_anchor_edit_info(fixes)
@@ -1380,13 +1394,19 @@ def facade_fix_loop(
     rules: list[Any],
     limit: int,
     rst: Any = None,
+    lint_sink: Optional[list[Any]] = None,
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
-    Default: arena mutation with no reparse (:func:`facade_fix_loop_v3`) — 2.3×
-    faster than native, byte-identical, guard-clean over the whole dialect
-    corpus.  Set ``SQLFLUFF_RS_FIX_V1=1`` to fall back to the legacy
-    source-patch + re-parse loop (kept one cycle for bisection; retire after).
+    Default: arena mutation with no reparse (:func:`facade_fix_loop_v3`),
+    byte-identical to native and guard-clean over the whole dialect corpus.
+    Set ``SQLFLUFF_RS_FIX_V1=1`` to fall back to the legacy source-patch +
+    re-parse loop (kept one cycle for bisection; retire after).
+
+    ``lint_sink``, if given, collects the pre-fix violations (native's
+    ``initial_linting_errors``) from the first fix pass — see
+    :func:`facade_fix_loop_v3`. On the legacy v1 path this falls back to a
+    separate :func:`facade_violations` sweep (best effort; bisection-only).
     """
     import os
 
@@ -1396,12 +1416,19 @@ def facade_fix_loop(
     # Rust engine's empty ``file`` node carries no pos_marker (native's
     # FileSegment gets a zero-width one), so the reconstruction pass
     # (``generate_source_patches``) would assert on it. Native returns the empty
-    # source unchanged here too.
+    # source unchanged here too — with no violations (the sink stays empty).
     if not source:
         return source
 
     if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
-        return facade_fix_loop_v3(source, fname, config, rules, limit, rst=rst)
+        return facade_fix_loop_v3(
+            source, fname, config, rules, limit, rst=rst, lint_sink=lint_sink
+        )
+
+    if lint_sink is not None:
+        # The v1 loop re-parses per applied fix and has no single "first pass"
+        # tree to harvest from; keep its (legacy) behaviour by sweeping once.
+        lint_sink.extend(facade_violations(source, fname, config, rules) or [])
 
     dialect_obj = config.get("dialect_obj")
     by_phase = {

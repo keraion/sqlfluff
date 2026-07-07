@@ -257,3 +257,42 @@ def test_native_cv11_lt01_converges() -> None:
     refixed = Linter(config=config).lint_string(native, fix=True).fix_string()[0]
     assert refixed == native  # native fix is idempotent again
     assert facade == native
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_fix_loop_lint_sink_matches_native_initial() -> None:
+    """``lint_sink`` collects native's ``initial_linting_errors`` equivalent.
+
+    The CLI fast path harvests the pre-fix violation set from the fix loop's
+    own first pass (instead of a separate whole-ruleset crawl), so the
+    collected results must line up with what native reports for the same fix
+    run — and stay empty for a clean file.
+    """
+    src = "select a FROM tbl\n"
+    rs_config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "CP01,LT12",
+            "use_rust_parser": True,
+            "use_rust_engine": True,
+            "use_rust_rules": True,
+        }
+    )
+    linter = Linter(config=rs_config)
+    rules = list(linter.get_rulepack(config=rs_config).rules)
+    sink: list = []
+    fixed = facade_fix_loop(src, "<test>", rs_config, rules, 10, lint_sink=sink)
+
+    config = FluffConfig(overrides={"dialect": "ansi", "rules": "CP01,LT12"})
+    result = Linter(config=config).lint_string(src, fix=True)
+    assert fixed == result.fix_string()[0]
+    assert [(v.rule_code(), v.line_no, bool(v.fixes)) for v in sink] == [
+        (v.rule_code(), v.line_no, bool(v.fixes)) for v in result.violations
+    ]
+
+    clean_sink: list = []
+    clean = facade_fix_loop(fixed, "<test>", rs_config, rules, 10, lint_sink=clean_sink)
+    assert clean == fixed
+    assert clean_sink == []
