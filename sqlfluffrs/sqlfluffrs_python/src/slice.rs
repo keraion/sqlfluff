@@ -34,12 +34,14 @@ impl<'py> IntoPyObject<'py> for PySlice {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        Ok(PySliceType::new(
-            py,
-            self.0.start.try_into()?,
-            self.0.stop.try_into()?,
-            1,
-        ))
+        // Build ``slice(start, stop)`` with step=None. Native code constructs
+        // 2-arg slices everywhere, and ``slice(a, b, 1) != slice(a, b, None)``
+        // in Python — a step-1 slice here silently broke every downstream
+        // equality against a native-built slice (observed: FixPatch dedupe
+        // over repeated jinja-loop regions applied a patch twice).
+        let ty = py.get_type::<PySliceType>();
+        let obj = ty.call1((self.0.start, self.0.stop))?;
+        obj.cast_into::<PySliceType>().map_err(PyErr::from)
     }
 }
 
