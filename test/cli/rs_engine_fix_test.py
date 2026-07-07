@@ -90,3 +90,46 @@ def test_facade_stdin_fix_falls_back(monkeypatch) -> None:
     assert (
         _try_facade_stdin_fix(_linter("CP01"), "select select select\n", None) is None
     )
+
+
+def test_facade_stdin_fix_completes_gave_up_files() -> None:
+    """Files where the loop gave up on a fix complete on the fast path.
+
+    Native's bookkeeping for a grammar-rejected or loop-detected fix is to
+    keep the violation (counted fixable), write what DID apply, and not fail
+    the exit code — the façade loop gives up in exactly the same places, so
+    the output is final and deferring to native would just re-produce it.
+    ``ansi/modulo.sql`` is such a file (LT02 fixes get grammar-rejected).
+    """
+    src = open("test/fixtures/dialects/ansi/modulo.sql").read()
+    from sqlfluff.core.rules.rs_lint import FACADE_SAFE_RULES
+
+    rules = ",".join(sorted(FACADE_SAFE_RULES))
+    result = _try_facade_stdin_fix(_linter(rules), src, None)
+    assert result is not None
+    fixed, num_unfixable = result
+    config = FluffConfig(overrides={"dialect": "ansi", "rules": rules})
+    native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
+    assert fixed == native
+    assert num_unfixable == 0  # gave-up fixes stay "fixable", like native
+
+
+def test_facade_stdin_fix_defers_on_runaway() -> None:
+    """A loop-limit (runaway) revert defers to native.
+
+    Native's runaway bookkeeping differs from ordinary gave-up fixes: it
+    strips the fixes from every reported violation (all become unfixable and
+    the exit code fails) — so the fast path must not present the reverted
+    source as a final result.
+    """
+    linter = Linter(
+        config=FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "rules": "CP01",
+                "use_rust_engine": "true",
+                "runaway_limit": 1,
+            }
+        )
+    )
+    assert _try_facade_stdin_fix(linter, "select a FROM tbl\n", None) is None

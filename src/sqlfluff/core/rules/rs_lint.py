@@ -786,6 +786,58 @@ class RsSegment:
         from sqlfluff.core.helpers.identity import get_next_id
 
         h = self._h
+        if h.is_meta:
+            # Metas must clone as REAL meta segments (like native ``copy``,
+            # where an ``Indent`` clone IS an ``Indent``). A synthetic RAW
+            # typed "indent" loses ``is_meta`` — and once such a clone rides a
+            # fix edit into the arena, grammar re-validation sees a
+            # zero-length "code" leaf and wrongly rejects later batches (CV07
+            # triple-nested bracket unwrap stalling at the third pass).
+            import uuid as _uuid
+
+            from sqlfluff.core.parser.segments.meta import (
+                Dedent,
+                EndOfFile,
+                ImplicitIndent,
+                Indent,
+                TemplateLoop,
+                TemplateSegment,
+            )
+
+            kind = h.type
+            block_uuid = h.block_uuid()
+            block_uuid = _uuid.UUID(int=block_uuid) if block_uuid is not None else None
+            meta_segment: Any
+            if kind == "placeholder":
+                meta_segment = TemplateSegment(
+                    pos_marker=h.pos_marker,
+                    source_str=self.source_str or "",
+                    block_type=self.block_type or "",
+                    block_uuid=block_uuid,
+                )
+            elif kind == "template_loop":
+                meta_segment = TemplateLoop(
+                    pos_marker=h.pos_marker, block_uuid=block_uuid
+                )
+            elif kind == "end_of_file":
+                meta_segment = EndOfFile(pos_marker=h.pos_marker)
+            else:
+                # Dedent subclasses Indent; classify by class types (mirrors
+                # ``_segment_to_spec``).
+                if self.is_type("dedent"):
+                    meta_cls: type = Dedent
+                elif self.is_implicit:
+                    meta_cls = ImplicitIndent
+                else:
+                    meta_cls = Indent
+                meta_segment = meta_cls(pos_marker=h.pos_marker, block_uuid=block_uuid)
+            if preserve_uuid:
+                meta_segment.uuid = self._uid
+            if parent is not None:
+                assert parent_idx is not None
+                meta_segment.set_parent(parent, parent_idx)
+            return meta_segment
+
         is_raw = h.is_raw()
         cls = _synth_segment_class(
             h.segment_class,
@@ -1227,7 +1279,14 @@ def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
             seg_type,
             cls_type,
             seg.raw,
-            sorted(getattr(seg, "instance_types", ()) or ()),
+            # ORDER MATTERS: instance_types[0] is the segment's primary type
+            # (what ``get_type()`` reports). Sorting here flipped e.g. a
+            # ``numeric_literal`` leaf to ``literal`` on the SECOND
+            # clone→ingest generation ('l' < 'n'), after which grammar
+            # re-validation's ``TypedParser("numeric_literal")`` re-match
+            # failed and multi-pass fixes (CV07 triple-nested brackets) were
+            # wrongly rejected.
+            list(getattr(seg, "instance_types", ()) or ()),
             class_types,
             kwargs,
             None,
@@ -1290,6 +1349,7 @@ def facade_fix_loop_v3(
     limit: int,
     rst: Any = None,
     lint_sink: Optional[list[Any]] = None,
+    loop_state: Optional[dict[str, Any]] = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1307,6 +1367,12 @@ def facade_fix_loop_v3(
     does, instead of paying a separate whole-ruleset sweep. Only valid when
     the loop actually ran: the caller must have gated on a parseable tree
     (the early bails below leave the sink empty).
+
+    ``loop_state``, if given, is set with ``{"runaway": True}`` when a phase
+    exhausted its loop limit and the ORIGINAL source was returned. Native's
+    bookkeeping for that case differs from ordinary gave-up fixes (it strips
+    the fixes from every reported violation, making them all unfixable —
+    linter.py:683-693), so callers must not treat the result as final.
     """
     import sqlfluffrs
     from sqlfluff.core.linter.fix import compute_anchor_edit_info
@@ -1422,10 +1488,12 @@ def facade_fix_loop_v3(
             # — one or more rules aren't converging. Native (linter.py:673-699)
             # warns and returns ``save_tree``, the tree from BEFORE any fixes,
             # so the user never sees the half-churned file. Returning the
-            # original source reproduces that exactly; the CLI fast path then
-            # sees its violations remain and defers the file to the native
+            # original source reproduces that exactly; the ``loop_state``
+            # signal makes the CLI fast path defer the file to the native
             # fixer (which reverts the same way — byte- and exit-code parity).
             linter_logger.warning("Loop limit on fixes reached [%s].", limit)
+            if loop_state is not None:
+                loop_state["runaway"] = True
             return source
 
     # Reconstruction: native patch generation over the mutated façade.
@@ -1445,6 +1513,7 @@ def facade_fix_loop(
     limit: int,
     rst: Any = None,
     lint_sink: Optional[list[Any]] = None,
+    loop_state: Optional[dict[str, Any]] = None,
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
@@ -1454,9 +1523,11 @@ def facade_fix_loop(
     re-parse loop (kept one cycle for bisection; retire after).
 
     ``lint_sink``, if given, collects the pre-fix violations (native's
-    ``initial_linting_errors``) from the first fix pass — see
-    :func:`facade_fix_loop_v3`. On the legacy v1 path this falls back to a
-    separate :func:`facade_violations` sweep (best effort; bisection-only).
+    ``initial_linting_errors``) from the first fix pass, and ``loop_state``
+    reports ``{"runaway": True}`` on a loop-limit revert — see
+    :func:`facade_fix_loop_v3`. On the legacy v1 path the sink falls back to
+    a separate :func:`facade_violations` sweep and ``loop_state`` is never
+    set (best effort; bisection-only).
     """
     import os
 
@@ -1472,7 +1543,14 @@ def facade_fix_loop(
 
     if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
         return facade_fix_loop_v3(
-            source, fname, config, rules, limit, rst=rst, lint_sink=lint_sink
+            source,
+            fname,
+            config,
+            rules,
+            limit,
+            rst=rst,
+            lint_sink=lint_sink,
+            loop_state=loop_state,
         )
 
     if lint_sink is not None:

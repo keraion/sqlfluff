@@ -1484,25 +1484,41 @@ def _try_facade_stdin_fix(
         # from the loop's first pass: when the fix changed nothing they ARE the
         # residual, so the self-guard needs no second sweep.
         pre: list = []
+        loop_state: dict = {}
         fixed = facade_fix_loop(
-            source, "stdin", config, rules, limit, rst=rst, lint_sink=pre
+            source,
+            "stdin",
+            config,
+            rules,
+            limit,
+            rst=rst,
+            lint_sink=pre,
+            loop_state=loop_state,
         )
+        # A runaway revert is the one gave-up case whose bookkeeping we don't
+        # reproduce (native strips the fixes from every reported violation,
+        # making them all unfixable — linter.py:683-693): defer to native,
+        # which reverts identically and reports accordingly.
+        if loop_state.get("runaway"):
+            return None
         # Native passes reported violations through
         # ``deduplicate_in_source_space`` (linter.py:848); mirror it so counts
         # match when a rule legitimately reports the same result twice (AL04).
         from sqlfluff.core.linter.linted_file import LintedFile
 
         pre = LintedFile.deduplicate_in_source_space(pre)
+        # Self-guard: the fixed output must still reparse cleanly over a FRESH
+        # engine parse (catches any mutate-vs-reparse divergence). Residual
+        # violations are expected — unapplied fixes (grammar-rejected or
+        # loop-detected) keep their violations, exactly like native, which
+        # counts them as fixable in the summary and does not fail the exit
+        # code for them.
         if fixed != source:
             post = facade_violations(fixed, "stdin", config, rules)
+            if post is None:
+                return None
         else:
             post = pre
-        if post is None:
-            return None
-        # A residual violation still claiming a fix means the loop gave up on
-        # an applicable fix — native's bookkeeping for those is subtle: defer.
-        if any(getattr(v, "fixes", None) for v in post):
-            return None
         # Unfixable violations are reported from the initial pass, like
         # native (``num_violations(fixable=False)`` over its kept lint
         # errors) — unless one comes from a rule with known detection
@@ -1529,9 +1545,10 @@ def _try_facade_paths_fix(
 
     Mirrors :func:`_try_facade_stdin_fix` but for the file-based ``fix`` command.
     Files the façade can *safely* finish (every selected rule is façade-safe,
-    no ``noqa`` directive, the engine parses them, and after fixing either no
-    violations remain or only UNFIXABLE ones do) are fixed and written in
-    place; every other file is handed back to the native path unchanged.
+    no ``noqa`` directive, the engine parses them, and the fix loop ran to a
+    stable end — applied, unfixable and gave-up-like-native residuals are all
+    fine; only a runaway revert defers) are fixed and written in place; every
+    other file is handed back to the native path unchanged.
 
     Returns ``(remaining_paths, num_facade_fixable, num_facade_unfixable)``.
     ``num_facade_fixable`` is the count of fixable violations the façade fixed
@@ -1637,32 +1654,45 @@ def _try_facade_paths_fix(
                 # first pass via ``lint_sink`` rather than paying a separate
                 # whole-ruleset crawl.
                 pre: list = []
+                loop_state: dict = {}
                 fixed = facade_fix_loop(
-                    raw_file, fname, cfg, rules, limit, rst=rst, lint_sink=pre
+                    raw_file,
+                    fname,
+                    cfg,
+                    rules,
+                    limit,
+                    rst=rst,
+                    lint_sink=pre,
+                    loop_state=loop_state,
                 )
+                # A runaway revert is the one gave-up case whose bookkeeping
+                # we don't reproduce (native strips the fixes from every
+                # reported violation, making them all unfixable —
+                # linter.py:683-693): let native own the file (it reverts
+                # identically and reports accordingly).
+                if loop_state.get("runaway"):
+                    remaining.append(fname)
+                    continue
                 # Native passes reported violations through
                 # ``deduplicate_in_source_space`` (linter.py:848); mirror it so
                 # counts/display match when a rule legitimately reports the
                 # same result twice (AL04).
                 pre = LintedFile.deduplicate_in_source_space(pre)
-                # Self-guard: check what remains. If the fix changed nothing
-                # the residual is identical to ``pre`` (same source, same tree), so
-                # skip the re-parse; only a *changed* result needs a fresh parse to
-                # catch any reparse-vs-mutate divergence.
+                # Self-guard: the fixed output must still reparse cleanly over
+                # a FRESH engine parse (catches any mutate-vs-reparse
+                # divergence). Residual violations are expected — unapplied
+                # fixes (grammar-rejected or loop-detected) keep their
+                # violations, exactly like native, which counts them as
+                # fixable in the summary and does not fail the exit code for
+                # them. If the fix changed nothing the residual is identical
+                # to ``pre`` (same source, same tree), so skip the re-parse.
                 if fixed != raw_file:
                     post = facade_violations(fixed, fname, cfg, rules)
+                    if post is None:
+                        remaining.append(fname)
+                        continue
                 else:
                     post = pre
-                if post is None:
-                    remaining.append(fname)
-                    continue
-                # A residual violation still claiming a fix means the loop gave
-                # up on an applicable fix (runaway / grammar-rejected /
-                # loop-detected); native's bookkeeping for those is subtle, so
-                # let native own the file.
-                if any(getattr(v, "fixes", None) for v in post):
-                    remaining.append(fname)
-                    continue
                 # Unfixable violations get REPORTED (summary count + failure
                 # exit code) from the initial pass, like native's
                 # ``num_unfixable_lint_errors`` (which counts its kept lint
@@ -1682,9 +1712,9 @@ def _try_facade_paths_fix(
                     ):
                         remaining.append(fname)
                         continue
-                # Everything fixable is fixed; anything left is unfixable, which
-                # native would report (and count) without changing the file
-                # further — so the output is FINAL and we can finish here.
+                # Everything fixable was either applied or gave up exactly as
+                # native would; anything unfixable is reported. The output is
+                # FINAL and we can finish here.
                 # Emit the per-file violations exactly as native's runner does
                 # (``dispatch_file_violations`` with ``only_fixable=True``), so the
                 # CLI output matches. Clean files produce an empty (suppressed)
