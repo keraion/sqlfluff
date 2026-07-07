@@ -390,11 +390,12 @@ pub fn engine_parse_to_tree<'py>(
     // `direct_config` uses the passed config as-is (like stdin / `lint_string`),
     // rather than re-resolving per-file via `make_child_from_path`.
     let child = child_config(&config, &fname, direct_config, &raw_sql)?;
-    let (variants, _violations) =
+    let (variants, templater_violations) =
         render_via_python(py, &child, &raw_sql, &fname, formatter.as_ref())?;
     let Some(root) = variants.first() else {
         return Ok(None);
     };
+    let num_variants = variants.len();
 
     let pf: PySqlFluffTemplatedFile = root.extract()?;
     let templated: Arc<TemplatedFile> = pf.into();
@@ -413,10 +414,11 @@ pub fn engine_parse_to_tree<'py>(
         pipeline::parse_tokens(&tokens, dialect, indent, limits)
     }));
     match parsed {
-        Ok(Ok(node)) => Ok(Some(Py::new(
-            py,
-            PyTree::from_node_with_templated_file(&node, tf_obj),
-        )?)),
+        Ok(Ok(node)) => {
+            let mut tree = PyTree::from_node_with_templated_file(&node, tf_obj);
+            tree.set_render_meta(templater_violations.into_any().unbind(), num_variants);
+            Ok(Some(Py::new(py, tree)?))
+        }
         _ => Ok(None),
     }
 }

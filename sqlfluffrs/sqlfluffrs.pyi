@@ -246,6 +246,13 @@ class RsTree:
     # if the tree was not built via an engine render). Passed as
     # ``context.templated_file`` by the facade linting path.
     templated_file: Optional[Any]
+    # Templater violations from the engine render (``None`` when not rendered;
+    # an empty list for a clean render). Native lint reports these, so a
+    # violation-bearing render must route to native.
+    templater_violations: Optional[list[Any]]
+    # Variants the render produced. Native lints EVERY variant; the arena tree
+    # is only the first, so multi-variant renders must route to native.
+    num_variants: int
     # Mutation epoch — bumped once per committed edit batch. Python wrapper
     # caches key their validity off this.
     epoch: int

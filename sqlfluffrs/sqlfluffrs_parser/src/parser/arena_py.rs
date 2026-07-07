@@ -46,6 +46,17 @@ pub struct PyTree {
     /// CV10 read `raw_slices`, which needs it. `None` for trees built without an
     /// engine render (e.g. `apply_as_tree`).
     templated_file: Option<Py<PyAny>>,
+    /// Templater violations the render produced (the Python violation objects
+    /// from `process_with_variants`, unchanged). Native lint reports these
+    /// alongside lint results, so the façade gates must see them — a
+    /// violation-bearing render routes to native rather than dropping them.
+    /// `None` for trees built without an engine render.
+    templater_violations: Option<Py<PyAny>>,
+    /// How many variants the render produced. Native lints EVERY variant and
+    /// merges the results; the arena tree is only the first, so the façade
+    /// gates route multi-variant renders to native. 1 for trees built without
+    /// an engine render.
+    num_variants: usize,
 }
 
 impl PyTree {
@@ -53,6 +64,8 @@ impl PyTree {
         PyTree {
             inner: Arc::new(Mutex::new(arena)),
             templated_file: None,
+            templater_violations: None,
+            num_variants: 1,
         }
     }
 
@@ -72,6 +85,13 @@ impl PyTree {
         let mut tree = PyTree::new(Arena::from_node(node));
         tree.templated_file = Some(templated_file);
         tree
+    }
+
+    /// Attach render metadata (see the field docs): the templater-violation
+    /// objects the render produced and how many variants it yielded.
+    pub fn set_render_meta(&mut self, templater_violations: Py<PyAny>, num_variants: usize) {
+        self.templater_violations = Some(templater_violations);
+        self.num_variants = num_variants;
     }
 
     fn handle(&self, node: NodeId) -> PyHandle {
@@ -108,6 +128,19 @@ impl PyTree {
     #[getter]
     fn templated_file(&self, py: Python) -> Option<Py<PyAny>> {
         self.templated_file.as_ref().map(|t| t.clone_ref(py))
+    }
+
+    /// Templater violations from the engine render (`None` if the tree wasn't
+    /// built via an engine render; an empty list for a clean render).
+    #[getter]
+    fn templater_violations(&self, py: Python) -> Option<Py<PyAny>> {
+        self.templater_violations.as_ref().map(|t| t.clone_ref(py))
+    }
+
+    /// Number of variants the engine render produced (1 when not rendered).
+    #[getter]
+    fn num_variants(&self) -> usize {
+        self.num_variants
     }
 
     /// Number of nodes in the arena.
