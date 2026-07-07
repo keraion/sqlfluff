@@ -6,11 +6,11 @@ duck-type backed by the arena's ``RsHandle`` cursor, so the existing Python
 rules can crawl the Rust tree directly — no Python ``BaseSegment`` tree is built.
 
 Fixes are applied by **mutating the arena in place** (no reparse), mirroring
-native ``apply_fixes`` — :func:`facade_fix_loop` (→ :func:`facade_fix_loop_v3`)
-stages/commits edit batches on the Rust arena and reconstructs the source with
-native ``generate_source_patches``. This is ~2.3× faster than native and
-byte-identical. (Set ``SQLFLUFF_RS_FIX_V1=1`` for the legacy source-patch +
-re-parse loop, kept one cycle for bisection.)
+native ``apply_fixes`` — :func:`facade_fix_loop` stages/commits edit batches on
+the Rust arena and reconstructs the source with native
+``generate_source_patches``. This is ~2.3× faster than native and
+byte-identical. (The legacy v1 source-patch + re-parse loop and its
+``SQLFLUFF_RS_FIX_V1`` escape hatch are retired.)
 
 This covers the rules whose ``BaseSegment`` API surface the façade implements
 (see :data:`FACADE_SAFE_RULES`); other rules should stay on the Python path.
@@ -117,7 +117,7 @@ FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset()
 #   saw no ``function_name``/``function_contents`` containers and added a stray
 #   space after ``cast`` that a fresh parse would remove — CV11 now constructs
 #   the parse-shaped nested subtree.
-# ``facade_fix_loop_v3`` also gained native's runaway-limit revert (return the
+# ``facade_fix_loop`` also gained native's runaway-limit revert (return the
 # ORIGINAL source when the main phase never stabilises, linter.py:673-699) and
 # its warning parity (``_warn_unfixable`` on a previously-seen version), so
 # loop-prone reflow rules degrade exactly like native.
@@ -980,99 +980,6 @@ class RsSegment:
         return f"RsSegment({self._h!r})"
 
 
-def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
-    """Apply ``LintFix`` objects to ``source`` by patching literal source slices.
-
-    Returns the patched source, or ``None`` if any fix targets a non-literal
-    (templated) region or an unsupported edit type — signalling the caller to
-    leave those to the Python path.
-    """
-    # (start, stop, repl, rank). `rank` breaks ties between edits at the SAME
-    # start offset, matching the order native reconstructs from the tree:
-    # create_after (0) attaches to the segment ending at the offset, so it comes
-    # before create_before (1, attaches to the segment starting there), which
-    # comes before replace/delete (2, modifies the segment starting there).
-    edits: list[tuple[int, int, str, int]] = []
-    for fx in fixes:
-        pm = fx.anchor.pos_marker
-        if pm is None:
-            # A freshly-constructed anchor with no source position (e.g. some
-            # reflow indent fixes) can't be source-patched — bail so the caller
-            # falls back to the Python tree-mutation path.
-            return None
-        lit = pm.is_literal
-        sl = pm.source_slice
-        repl = "".join(e.raw for e in (fx.edit or []))
-        et = fx.edit_type
-        if not (lit() if callable(lit) else lit):
-            # Templated (non-literal) anchor. Two safe cases:
-            # 1. The edit segments carry `source_fixes` (SourceFix(edit,
-            #    source_slice, …)) describing the exact source rewrite of a
-            #    `{% %}`/`{{ }}` tag (e.g. JJ01) — apply those.
-            # 2. A create_before/create_after inserts at the source *boundary*
-            #    (before/after the templated region) without touching the
-            #    template itself (e.g. LT12 appending a trailing newline).
-            # A replace/delete on templated content without source_fixes would
-            # corrupt the template → bail so the caller falls back to Python.
-            src_fixes = [
-                sfx
-                for e in (fx.edit or [])
-                for sfx in (getattr(e, "source_fixes", None) or [])
-            ]
-            if src_fixes:
-                for sfx in src_fixes:
-                    ssl = sfx.source_slice
-                    edits.append((ssl.start, ssl.stop, sfx.edit, 2))
-            elif et == "create_before":
-                edits.append((sl.start, sl.start, repl, 1))
-            elif et == "create_after":
-                edits.append((sl.stop, sl.stop, repl, 0))
-            else:
-                return None
-            continue
-        if et == "replace":
-            edits.append((sl.start, sl.stop, repl, 2))
-        elif et == "create_before":
-            edits.append((sl.start, sl.start, repl, 1))
-        elif et == "create_after":
-            edits.append((sl.stop, sl.stop, repl, 0))
-        elif et == "delete":
-            edits.append((sl.start, sl.stop, "", 2))
-        else:
-            return None
-    # Native applies fixes to the tree hierarchically: deleting a parent segment
-    # removes its children too. In source coordinates a `delete` range therefore
-    # subsumes any nested edit — e.g. AL07 deletes an `alias_expression` while
-    # also "replacing" the alias identifier inside it. Drop non-delete edits
-    # fully contained in a delete's range so they don't conflict / double-apply.
-    delete_ranges = [(a, b) for (a, b, r, _rk) in edits if b > a and r == ""]
-    if delete_ranges:
-        edits = [
-            e
-            for e in edits
-            if (e[2] == "" and e[1] > e[0])  # keep the deletes themselves
-            or e[1] == e[0]  # keep zero-width inserts (create_before/after)
-            or not any(
-                da <= e[0] and e[1] <= db and (da, db) != (e[0], e[1])
-                for (da, db) in delete_ranges
-            )
-        ]
-    # Reconstruct left-to-right in ORIGINAL coordinates (a naive per-edit
-    # ``out[:start] + repl + out[stop:]`` shifts later edits' positions and
-    # corrupts adjacent edits at the same offset).
-    edits.sort(key=lambda e: (e[0], e[3], e[1]))
-    out_parts: list[str] = []
-    pos = 0
-    for start, stop, repl, _rank in edits:
-        if start < pos:  # genuinely overlapping edits — can't apply safely
-            return None
-        out_parts.append(source[pos:start])
-        out_parts.append(repl)
-        pos = stop
-    out_parts.append(source[pos:])
-    return "".join(out_parts)
-
-
 def facade_ignore_mask(
     root: "RsSegment", config: Any, reference_map: dict[str, set[str]]
 ) -> tuple[Any, list[Any]]:
@@ -1188,8 +1095,16 @@ def facade_unknown_rule_violations(
             out.extend(crawl(rule, root, templated_file))
 
     if pending:
-        # Native reference parse. A bare Linter: the caller's may carry a
-        # formatter, and ``parse_string`` dispatches output through it.
+        # Native reference parse — a python tree, by design, while these
+        # rules are unproven. INFO (not warning): expected, but visible so
+        # per-file python parses are attributable when profiling.
+        linter_logger.info(
+            "Façade lint: native reference parse of %s for unproven rules %s",
+            fname,
+            [r.code for r in pending],
+        )
+        # A bare Linter: the caller's may carry a formatter, and
+        # ``parse_string`` dispatches output through it.
         parsed = _Linter(config=config).parse_string(source, fname=fname)
         nat_tree = parsed.tree
         if nat_tree is None:
@@ -1315,52 +1230,6 @@ def facade_violations(
     # duplicate-alias result per SELECT-clause subquery on the SAME parent
     # alias segment, which native collapses to one.
     return LintedFile.deduplicate_in_source_space(out)
-
-
-def _native_apply_fixes(
-    rst: Any, rule_code: str, fixes: list[Any], config: Any
-) -> Optional[str]:
-    """uuid-bridge: apply tree-restructuring ``fixes`` via the native machinery.
-
-    For fixes that ``apply_source_fixes`` can't express as source-slice edits
-    (subquery→CTE, reflow indent, …), materialise the arena tree into a real
-    ``BaseSegment`` tree **preserving the arena uuids** so native ``apply_fixes``
-    (which matches fixes by ``anchor.uuid``) lines up with the façade fixes, then
-    reconstruct the fixed source with native ``generate_source_patches`` +
-    ``fix_string`` — the exact, parity-correct path. Returns the fixed source, or
-    ``None`` on any failure so the caller falls back / skips.
-    """
-    try:
-        from sqlfluff.core.linter.fix import apply_fixes, compute_anchor_edit_info
-        from sqlfluff.core.linter.linted_file import LintedFile
-        from sqlfluff.core.linter.patch import generate_source_patches
-
-        tf = rst.templated_file
-        if tf is None:
-            return None
-        anchor_info = compute_anchor_edit_info(fixes)
-        if any(not info.is_valid for info in anchor_info.values()):
-            return None
-        materialised = RsSegment(rst.root).copy(preserve_uuid=True)
-        new_tree, _before, _after, valid = apply_fixes(
-            materialised,
-            config.get("dialect_obj"),
-            rule_code,
-            anchor_info,
-            fix_even_unparsable=config.get("fix_even_unparsable"),
-            max_parse_depth=config.get("max_parse_depth"),
-            max_parse_nodes=config.get("max_parse_nodes"),
-        )
-        if not valid:
-            return None
-        patches = generate_source_patches(new_tree, tf)
-        source_only = tf.source_only_slices()
-        slices = LintedFile._slice_source_file_using_patches(
-            patches, source_only, tf.source_str
-        )
-        return LintedFile._build_up_fixed_source_string(slices, patches, tf.source_str)
-    except Exception:  # noqa: BLE001 — any failure just defers to the caller
-        return None
 
 
 def _segment_to_spec(seg: Any) -> tuple[Any, ...]:
@@ -1523,7 +1392,7 @@ def _sweep_wrapper_caches() -> None:
         seg._rwa = None
 
 
-def facade_fix_loop_v3(
+def facade_fix_loop(
     source: str,
     fname: str,
     config: Any,
@@ -1535,6 +1404,10 @@ def facade_fix_loop_v3(
     ignore_mask: Any = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
+
+    (Formerly ``facade_fix_loop_v3``; the legacy v1 source-patch +
+    re-parse loop and its ``SQLFLUFF_RS_FIX_V1`` escape hatch are retired —
+    this is the only implementation.)
 
     Mirrors ``Linter.lint_fix_parsed`` (linter.py:457-660): parse once; per
     rule crawl the same (mutated) façade tree, stage the fix batch on the
@@ -1556,11 +1429,24 @@ def facade_fix_loop_v3(
     bookkeeping for that case differs from ordinary gave-up fixes (it strips
     the fixes from every reported violation, making them all unfixable —
     linter.py:683-693), so callers must not treat the result as final.
+
+    ``ignore_mask`` (see :func:`facade_ignore_mask`) drops masked results
+    and their fixes inside the crawls, exactly like native.
     """
     import sqlfluffrs
     from sqlfluff.core.linter.fix import compute_anchor_edit_info
     from sqlfluff.core.linter.linted_file import LintedFile
     from sqlfluff.core.linter.patch import generate_source_patches
+
+    # Crash guard for direct callers: the Rust engine's empty ``file`` node
+    # carries no pos_marker (native's FileSegment gets a zero-width one), so
+    # the reconstruction pass (``generate_source_patches``) would assert on
+    # it. NOTE: this does NOT always match native — under a templater whose
+    # zero-byte render keeps a raw slice (e.g. ``raw``), native lexes a
+    # zero-width placeholder that LT12 fixes to a single newline. The CLI
+    # gates therefore route empty sources to native before reaching here.
+    if not source:
+        return source
 
     dialect_obj = config.get("dialect_obj")
     dialect_name = config.get("dialect")
@@ -1707,120 +1593,3 @@ def facade_fix_loop_v3(
         patches, source_only, tf.source_str
     )
     return LintedFile._build_up_fixed_source_string(slices, patches, tf.source_str)
-
-
-def facade_fix_loop(
-    source: str,
-    fname: str,
-    config: Any,
-    rules: list[Any],
-    limit: int,
-    rst: Any = None,
-    lint_sink: Optional[list[Any]] = None,
-    loop_state: Optional[dict[str, Any]] = None,
-    ignore_mask: Any = None,
-) -> str:
-    """Iteratively fix ``source`` over the arena façade.
-
-    Default: arena mutation with no reparse (:func:`facade_fix_loop_v3`),
-    byte-identical to native and guard-clean over the whole dialect corpus.
-    Set ``SQLFLUFF_RS_FIX_V1=1`` to fall back to the legacy source-patch +
-    re-parse loop (kept one cycle for bisection; retire after).
-
-    ``lint_sink``, if given, collects the pre-fix violations (native's
-    ``initial_linting_errors``) from the first fix pass, and ``loop_state``
-    reports ``{"runaway": True}`` on a loop-limit revert — see
-    :func:`facade_fix_loop_v3`. ``ignore_mask`` (see
-    :func:`facade_ignore_mask`) drops masked results and their fixes inside
-    the crawls, exactly like native. On the legacy v1 path the sink falls
-    back to a separate :func:`facade_violations` sweep, ``loop_state`` is
-    never set, and ``ignore_mask`` is NOT applied (best effort;
-    bisection-only).
-    """
-    import os
-
-    import sqlfluffrs
-
-    # Crash guard for direct callers: the Rust engine's empty ``file`` node
-    # carries no pos_marker (native's FileSegment gets a zero-width one), so
-    # the reconstruction pass (``generate_source_patches``) would assert on
-    # it. NOTE: this does NOT always match native — under a templater whose
-    # zero-byte render keeps a raw slice (e.g. ``raw``), native lexes a
-    # zero-width placeholder that LT12 fixes to a single newline. The CLI
-    # gates therefore route empty sources to native before reaching here.
-    if not source:
-        return source
-
-    if os.environ.get("SQLFLUFF_RS_FIX_V1") != "1":
-        return facade_fix_loop_v3(
-            source,
-            fname,
-            config,
-            rules,
-            limit,
-            rst=rst,
-            ignore_mask=ignore_mask,
-            lint_sink=lint_sink,
-            loop_state=loop_state,
-        )
-
-    if lint_sink is not None:
-        # The v1 loop re-parses per applied fix and has no single "first pass"
-        # tree to harvest from; keep its (legacy) behaviour by sweeping once.
-        lint_sink.extend(facade_violations(source, fname, config, rules) or [])
-
-    dialect_obj = config.get("dialect_obj")
-    by_phase = {
-        "main": [r for r in rules if r.lint_phase == "main"],
-        "post": [r for r in rules if r.lint_phase == "post"],
-    }
-    seen = {source}
-
-    def parse(s: str) -> Any:
-        return sqlfluffrs.engine_parse_to_tree(s, fname, config, None, True)
-
-    for phase in ("main", "post"):
-        nloops = limit if phase == "main" else 2
-        for loop in range(nloops):
-            this = rules if (phase == "main" and loop == 0) else by_phase[phase]
-            changed = False
-            # Parse once at the start of the loop and reuse that tree across rules
-            # that make no change; only re-parse when a fix actually rewrites the
-            # source (and reuse *that* parse as both the validity check and the
-            # current tree). This replaces the previous per-rule re-parse — the
-            # dominant cost — with 1 + (number of applied fixes) parses per loop.
-            rst = parse(source)
-            for rule in this:
-                if rst is None:
-                    break
-                _v, _r, fixes, _m = rule.crawl(
-                    tree=RsSegment(rst.root),
-                    dialect=dialect_obj,
-                    fix=True,
-                    templated_file=rst.templated_file,
-                    ignore_mask=None,
-                    fname=fname,
-                    config=config,
-                )
-                if not fixes:
-                    continue
-                new_source = apply_source_fixes(source, fixes)
-                if new_source is None:
-                    # Tree-restructuring fix that source-patching can't express —
-                    # apply it via the native machinery over a uuid-preserving
-                    # materialisation of the current arena tree (approach B).
-                    new_source = _native_apply_fixes(rst, rule.code, fixes, config)
-                if new_source is None or new_source == source:
-                    continue
-                if new_source in seen:  # loop detected -> stop applying
-                    continue
-                new_rst = parse(new_source)  # single parse: validity + next tree
-                if new_rst is None:  # reject unparsable fix (~ _valid)
-                    continue
-                source = new_source
-                seen.add(new_source)
-                changed = True
-                rst = new_rst
-            if not changed:
-                break
-    return source

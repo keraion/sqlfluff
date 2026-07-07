@@ -19,6 +19,12 @@ need deep matcher rework for a ~1-rule payoff, so RF06/TQ02 remain on the native
 fallback (as they were before). Follow-up: retire the legacy v1 source-patch
 machinery (behind `SQLFLUFF_RS_FIX_V1=1` for one bisection cycle).
 
+**2026-07-07: v1 RETIRED.** `apply_source_fixes`, `_native_apply_fixes` (the
+uuid-bridge materialisation) and the `SQLFLUFF_RS_FIX_V1` dispatcher are
+deleted; `facade_fix_loop_v3` is now simply `facade_fix_loop`. (Grammar
+re-validation later landed in Rust after all — `revalidate.rs`, commit
+4141dd03f — so RF06/TQ02 are façade-safe too.)
+
 ---
 
 # Phase 2 — Mutable arena: native-semantics fixing over the Rust parse arena
