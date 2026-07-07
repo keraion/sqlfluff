@@ -272,9 +272,46 @@ pub fn engine_parse_paths<'py>(
         let discovered = discovery::discover_files(&paths, &exts, &ignore_paths, &cwd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         for path in discovered {
+            let fname = path.to_string_lossy().to_string();
+            // Mirror `Linter.load_raw_file_and_config`: the per-file config's
+            // `large_file_skip_byte_limit` is checked against the on-disk size
+            // BEFORE reading; over-limit files are skipped with the same
+            // warning (via the same `sqlfluff.linter` logger) and excluded
+            // from the output, exactly like the native parse path.
+            let limit = {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("require_dialect", false)?;
+                let file_cfg =
+                    config.call_method("make_child_from_path", (&fname,), Some(&kwargs))?;
+                let val = file_cfg.call_method1("get", ("large_file_skip_byte_limit",))?;
+                val.extract::<i64>().unwrap_or_else(|_| {
+                    val.extract::<String>()
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(0)
+                })
+            };
+            if limit > 0 {
+                let file_size = std::fs::metadata(&path)
+                    .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
+                    .len() as i64;
+                if file_size > limit {
+                    let msg = format!(
+                        "Length of file '{fname}' is {file_size} bytes which is over \
+                         the limit of {limit} bytes. Skipping to avoid parser lock. \
+                         Users can increase this limit in their config by setting the \
+                         'large_file_skip_byte_limit' value, or disable by setting it \
+                         to zero."
+                    );
+                    py.import("logging")?
+                        .call_method1("getLogger", ("sqlfluff.linter",))?
+                        .call_method1("warning", (msg,))?;
+                    continue;
+                }
+            }
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
-            files.push((path.to_string_lossy().to_string(), raw));
+            files.push((fname, raw));
         }
     }
 
