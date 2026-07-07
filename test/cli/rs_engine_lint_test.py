@@ -91,13 +91,24 @@ def test_facade_stdin_lint_falls_back(monkeypatch) -> None:
     assert (
         _try_facade_stdin_lint(_linter("CP01"), "select select select\n", None) is None
     )
-    # Non-façade-safe rule (simulated: every shipped rule is now in the set).
+    # Non-façade-safe rule (simulated: every shipped rule is now in the
+    # set): no longer routes the run to native — it's native-crawled and
+    # merged (and promoted, once it fires and byte-matches the façade).
     import sqlfluff.core.rules.rs_lint as rs_lint
 
     monkeypatch.setattr(
         rs_lint, "FACADE_SAFE_RULES", rs_lint.FACADE_SAFE_RULES - {"CP01"}
     )
-    assert _try_facade_stdin_lint(_linter("CP01"), "SeLeCt 1\n", None) is None
+    monkeypatch.setitem(rs_lint._UNKNOWN_RULE_VERDICTS, ("CP01", "ansi"), False)
+    unknown_result = _try_facade_stdin_lint(_linter("CP01"), "SeLeCt 1\n", None)
+    assert unknown_result is not None
+    assert [
+        (v["code"], v["start_line_no"])
+        for record in unknown_result.as_records()
+        for v in record["violations"]
+    ] == [("CP01", 1)]
+    # monkeypatch.setitem restores the pinned verdict on teardown; pop the
+    # promotion the run would otherwise leak is unnecessary since we pinned.
 
 
 def test_facade_paths_lint_routing(tmp_path) -> None:
@@ -291,3 +302,108 @@ def test_facade_fix_noqa_masks_fixes_like_native(tmp_path) -> None:
     # Line 1's spacing stays broken (masked); line 3 gets fixed.
     assert fixed.startswith("select a ,  b from tbl -- noqa: LT01\n")
     assert "select c, d from tbl" in fixed
+
+
+def test_facade_lint_plugin_rule_split_crawl() -> None:
+    """A plugin rule no longer routes the run to native.
+
+    The example plugin's Example_L001 (not in FACADE_SAFE_RULES) is
+    native-crawled while unproven, merged with façade-crawled core rules —
+    results native-identical — and PROMOTED once it fires and byte-matches,
+    after which it crawls the façade directly.
+    """
+    import sqlfluff.core.rules.rs_lint as rs_lint
+    from sqlfluff.cli.commands import _facade_lint_file
+
+    # `bar` is in the plugin's default forbidden_columns -> Example_L001
+    # fires; the lowercase keywords make CP01 fire (façade side).
+    src = "SELECT a FROM foo ORDER BY bar\n"
+
+    def cfg(rust: bool) -> FluffConfig:
+        return FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "rules": "Example_L001,CP01",
+                "use_rust_engine": rust,
+                "use_rust_parser": rust,
+                "use_rust_rules": rust,
+            }
+        )
+
+    rs_lint._UNKNOWN_RULE_VERDICTS.pop(("Example_L001", "ansi"), None)
+
+    def keys(violations):
+        return sorted(
+            (v.rule_code(), v.line_no, v.line_pos, v.description)
+            for v in violations
+            if isinstance(v, SQLLintError)
+        )
+
+    c = cfg(True)
+    linted = _facade_lint_file(src, "plugin.sql", c, Linter(config=c))
+    assert linted is not None  # plugin rule no longer disqualifies the file
+    fac = keys(linted.violations)
+    nat = keys(Linter(config=cfg(False)).lint_string(src).violations)
+    assert fac == nat
+    assert any(k[0] == "Example_L001" for k in fac)  # the plugin rule fired
+    # Fired and byte-matched -> promoted for the rest of the process.
+    assert rs_lint._UNKNOWN_RULE_VERDICTS.get(("Example_L001", "ansi")) is True
+
+    # Promoted: the native reference parse is dropped (parse_string unused).
+    def _boom(*a, **k):  # pragma: no cover
+        raise AssertionError("promoted rule must not trigger a native parse")
+
+    orig = Linter.parse_string
+    Linter.parse_string = _boom  # type: ignore[method-assign]
+    try:
+        linted2 = _facade_lint_file(src, "plugin.sql", c, Linter(config=c))
+    finally:
+        Linter.parse_string = orig  # type: ignore[method-assign]
+    assert linted2 is not None
+    assert keys(linted2.violations) == nat
+
+
+def test_facade_unknown_rule_divergence_pins_to_native() -> None:
+    """A silently-diverging rule is caught by comparison, not by crashing.
+
+    A rule that only 'works' on native trees (an isinstance-style failure
+    mode: it finds nothing on the façade) must still REPORT the native
+    results, and its verdict pins it to native crawls.
+    """
+    import sqlfluff.core.rules.rs_lint as rs_lint
+    import sqlfluffrs
+    from sqlfluff.core.errors import SQLLintError as LintErr
+    from sqlfluff.core.rules.rs_lint import (
+        RsSegment,
+        facade_unknown_rule_violations,
+    )
+
+    class FakeDivergentRule:
+        code = "XT01"
+        name = "fake.divergent"
+
+        def crawl(self, tree, dialect, fix, templated_file, ignore_mask, fname, config):
+            if isinstance(tree, RsSegment):
+                return [], (), [], None  # silently finds nothing on the façade
+            seg = next(tree.recursive_crawl("keyword"))
+            return (
+                [LintErr(description="fake finding", segment=seg, rule=self)],
+                (),
+                [],
+                None,
+            )
+
+    src = "SELECT a FROM tbl\n"
+    cfg = FluffConfig(overrides={"dialect": "ansi", "rules": "CP01"})
+    rst = sqlfluffrs.engine_parse_to_tree(src, "<t>", cfg, None, True)
+    assert rst is not None
+    rule = FakeDivergentRule()
+    rs_lint._UNKNOWN_RULE_VERDICTS.pop(("XT01", "ansi"), None)
+
+    out = facade_unknown_rule_violations(
+        src, "<t>", cfg, [rule], RsSegment(rst.root), rst.templated_file
+    )
+    # The NATIVE results are reported despite the façade crawl finding nothing.
+    assert out is not None and [v.description for v in out] == ["fake finding"]
+    # And the mismatch pins the rule to native for the process.
+    assert rs_lint._UNKNOWN_RULE_VERDICTS.get(("XT01", "ansi")) is False

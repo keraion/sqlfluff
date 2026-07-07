@@ -1187,6 +1187,7 @@ def _facade_lint_file(
         FACADE_SAFE_RULES_DETECTION_UNSAFE,
         RsSegment,
         facade_ignore_mask,
+        facade_unknown_rule_violations,
         facade_violations,
     )
 
@@ -1201,11 +1202,18 @@ def _facade_lint_file(
         return None
     rule_pack = linter.get_rulepack(config=cfg)
     rules = list(rule_pack.rules)
-    if not rules or any(
-        r.code not in FACADE_SAFE_RULES or r.code in FACADE_SAFE_RULES_DETECTION_UNSAFE
-        for r in rules
-    ):
+    if not rules:
         return None
+    # Vetted rules crawl the façade; anything else (plugin rules) is handled
+    # by ``facade_unknown_rule_violations`` — native-crawled until its façade
+    # crawl earns promotion (see rs_lint for the verification protocol).
+    safe_rules = [
+        r
+        for r in rules
+        if r.code in FACADE_SAFE_RULES
+        and r.code not in FACADE_SAFE_RULES_DETECTION_UNSAFE
+    ]
+    unknown_rules = [r for r in rules if r not in safe_rules]
     t0 = time.monotonic()
     rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
     parse_time = time.monotonic() - t0
@@ -1240,14 +1248,31 @@ def _facade_lint_file(
         raw_file,
         fname,
         cfg,
-        rules,
+        safe_rules,
         rst=rst,
         rule_timing_sink=rule_timings,
         ignore_mask=ignore_mask,
     )
-    lint_time = time.monotonic() - t1
     if violations is None:
         return None
+    if unknown_rules:
+        unknown_violations = facade_unknown_rule_violations(
+            raw_file,
+            fname,
+            cfg,
+            unknown_rules,
+            root,
+            tf,
+            ignore_mask=ignore_mask,
+            rule_timing_sink=rule_timings,
+        )
+        if unknown_violations is None:
+            return None  # native reference parse failed -> native
+        # The same templated-area filter facade_violations applies.
+        if cfg.get("ignore_templated_areas", default=True):
+            unknown_violations = Linter.remove_templated_errors(unknown_violations)
+        violations = violations + unknown_violations
+    lint_time = time.monotonic() - t1
     violations = LintedFile.deduplicate_in_source_space(violations + noqa_violations)
     # Native's violation post-processing (linter.py:840-843).
     for violation in violations:

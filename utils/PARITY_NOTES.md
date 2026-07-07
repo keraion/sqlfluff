@@ -174,6 +174,31 @@ The sqlfluff-testbed generator now sprinkles inline masks, unused
 directives and disable/enable ranges through the models so mask parity
 stays exercised end-to-end in every testbed run.
 
+## Plugin (unknown) rules on the lint fast path (2026-07-07)
+
+Rules outside FACADE_SAFE_RULES no longer route the whole lint run to
+native. The gate splits the crawl: vetted rules crawl the façade;
+unknown rules go through ``rs_lint.facade_unknown_rule_violations`` —
+optimistic but VERIFIED. While a rule is unproven, its REPORTED results
+come from a crawl of a native reference parse (one extra native parse
+per file — correct by construction), and its façade crawl runs alongside
+purely as evidence: one non-trivial byte-match (the rule actually fired)
+promotes it to façade-only for the rest of the process; any mismatch or
+crash pins it to native crawls. The promotion cache is
+``rs_lint._UNKNOWN_RULE_VERDICTS``, keyed ``(rule_code, dialect)``.
+
+Why verification instead of crash-only fallback: the façade's synthetic
+segment classes subclass only RawSegment/BaseSegment, so a plugin rule
+using ``isinstance(seg, KeywordSegment)`` finds NOTHING on the façade
+without crashing — silent divergence that only a native comparison can
+catch. The dangerous case (façade under-reports, first file happens to
+be clean) is handled by requiring the rule to actually FIRE before
+promotion; trivially-empty matches keep it provisional (native-crawled).
+
+The FIX gates still route runs containing unknown rules to native — fix
+verification would need the whole loop run twice, and unknown-rule fixes
+would need spec-ingestion vetting (future milestone).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser
