@@ -3,6 +3,8 @@
 Skipped unless the ``sqlfluffrs`` engine is built.
 """
 
+import logging
+
 import pytest
 
 try:
@@ -29,7 +31,7 @@ def _cfg(limit: int) -> FluffConfig:
     )
 
 
-def test__engine_parse_paths__respects_large_file_skip(tmp_path, caplog):
+def test__engine_parse_paths__respects_large_file_skip(tmp_path):
     """Over-limit files are skipped with native's warning, not parsed.
 
     Regression test: the engine's Rust-side file loading bypassed
@@ -41,15 +43,32 @@ def test__engine_parse_paths__respects_large_file_skip(tmp_path, caplog):
     f.write_text("select col_a, col_b from some_table;\n" * 50)
     size = f.stat().st_size
 
-    with caplog.at_level("WARNING", logger="sqlfluff.linter"):
+    # Attach a handler directly to the logger the engine (and native) warn
+    # through — caplog relies on propagation to the root logger, which other
+    # tests' CLI logging setup can disable, making capture order-dependent.
+    # Snapshot the message STRING at emit time: handlers on this child logger
+    # run before parent ones, and a leftover CLI handler higher up (from
+    # `set_logging_level` in another test) mutates the shared record's msg
+    # in its filter (colorize + trailing space).
+    captured: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    linter_logger = logging.getLogger("sqlfluff.linter")
+    linter_logger.addHandler(handler)
+    old_level = linter_logger.level
+    linter_logger.setLevel(logging.WARNING)
+    try:
         records = sqlfluffrs.engine_parse_paths([str(f)], _cfg(100), None)
+    finally:
+        linter_logger.removeHandler(handler)
+        linter_logger.setLevel(old_level)
     assert records == []  # excluded from output, like native
     warning = next(
-        (
-            r.message
-            for r in caplog.records
-            if "Skipping to avoid parser lock" in r.message
-        ),
+        (m for m in captured if "Skipping to avoid parser lock" in m),
         None,
     )
     assert warning is not None
