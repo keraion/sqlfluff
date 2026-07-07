@@ -1125,18 +1125,21 @@ def _handle_unparsable(
 
 def _try_facade_stdin_fix(
     linter: Linter, source: str, stdin_filename: Optional[str]
-) -> Optional[str]:
+) -> Optional[tuple[str, int]]:
     """EXPERIMENTAL fast path: fix stdin over the Rust arena façade.
 
-    Only taken when ``core.use_rust_engine`` is enabled, *every* selected rule is
-    façade-safe, the source parses via the engine, contains no ``noqa`` directive,
-    and the façade fully fixes it (no violations remain). Otherwise returns
-    ``None`` so the caller falls back to the Python path — keeping behaviour
-    correct for anything the façade doesn't fully cover.
+    Only taken when ``core.use_rust_engine`` is enabled, *every* selected rule
+    is façade-safe, the source parses via the engine, contains no ``noqa``
+    directive, and after fixing either no violations remain or only UNFIXABLE
+    ones do. Returns ``(fixed, num_unfixable)`` — the caller reports the
+    unfixables natively ("Unfixable violations detected." + failure exit).
+    Otherwise returns ``None`` so the caller falls back to the Python path —
+    keeping behaviour correct for anything the façade doesn't fully cover.
     """
     try:
         from sqlfluff.core.rules.rs_lint import (
             FACADE_SAFE_RULES,
+            FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
             facade_violations,
@@ -1199,12 +1202,26 @@ def _try_facade_stdin_fix(
             source, "stdin", config, rules, limit, rst=rst, lint_sink=pre
         )
         if fixed != source:
-            remaining = facade_violations(fixed, "stdin", config, rules)
+            post = facade_violations(fixed, "stdin", config, rules)
         else:
-            remaining = pre
-        if remaining is None or remaining:
-            return None  # unfixable violations remain -> defer to Python
-        return fixed
+            post = pre
+        if post is None:
+            return None
+        # A residual violation still claiming a fix means the loop gave up on
+        # an applicable fix — native's bookkeeping for those is subtle: defer.
+        if any(getattr(v, "fixes", None) for v in post):
+            return None
+        # Unfixable violations are reported from the initial pass, like
+        # native (``num_violations(fixable=False)`` over its kept lint
+        # errors) — unless one comes from a rule with known detection
+        # over-reporting on the façade (possibly phantom -> wrong exit code).
+        pre_unfixable = [v for v in pre if not getattr(v, "fixes", None)]
+        if (pre_unfixable or post) and any(
+            v.rule_code() in FACADE_SAFE_RULES_DETECTION_UNSAFE
+            for v in (*pre_unfixable, *post)
+        ):
+            return None
+        return fixed, len(pre_unfixable)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1215,28 +1232,32 @@ def _try_facade_paths_fix(
     paths,
     fixed_suffix: str,
     ignore_files: bool,
-) -> tuple[Optional[list[str]], int]:
+) -> tuple[Optional[list[str]], int, int]:
     """EXPERIMENTAL fast path: fix discovered files over the Rust arena façade.
 
     Mirrors :func:`_try_facade_stdin_fix` but for the file-based ``fix`` command.
-    Files that are *fully & safely* fixable over the façade (every selected rule
-    is façade-safe, no ``noqa`` directive, the engine parses them, and no
-    violations remain after fixing) are fixed and written in place; every other
-    file is handed back to the native path unchanged.
+    Files the façade can *safely* finish (every selected rule is façade-safe,
+    no ``noqa`` directive, the engine parses them, and after fixing either no
+    violations remain or only UNFIXABLE ones do) are fixed and written in
+    place; every other file is handed back to the native path unchanged.
 
-    Returns ``(remaining_paths, num_facade_fixable)`` where ``num_facade_fixable``
-    is the count of fixable violations the façade fixed (used only to render the
-    summary line). ``remaining_paths`` is either the concrete list of files the
-    native ``lint_paths`` should still process, or ``None`` — the sentinel for
-    "the façade did nothing, run native over the original ``paths`` unchanged"
-    (distinct from an empty list, which means the façade handled *everything*).
+    Returns ``(remaining_paths, num_facade_fixable, num_facade_unfixable)``.
+    ``num_facade_fixable`` is the count of fixable violations the façade fixed
+    and ``num_facade_unfixable`` the count of unfixable violations found in
+    façade-handled files (both feed the native summary lines; the latter also
+    drives the failure exit code). ``remaining_paths`` is either the concrete
+    list of files the native ``lint_paths`` should still process, or ``None``
+    — the sentinel for "the façade did nothing, run native over the original
+    ``paths`` unchanged" (distinct from an empty list, which means the façade
+    handled *everything*).
     """
-    bail: tuple[Optional[list[str]], int] = (None, 0)
+    bail: tuple[Optional[list[str]], int, int] = (None, 0, 0)
     try:
         from sqlfluff.core.linter.discovery import paths_from_path
         from sqlfluff.core.linter.linted_file import LintedFile
         from sqlfluff.core.rules.rs_lint import (
             FACADE_SAFE_RULES,
+            FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
             facade_violations,
@@ -1270,6 +1291,7 @@ def _try_facade_paths_fix(
         remaining: list[str] = []
         handled_any = False
         num_facade_fixable = 0
+        num_facade_unfixable = 0
         limit = int(linter.config.get("runaway_limit"))
 
         for fname in discovered:
@@ -1326,7 +1348,7 @@ def _try_facade_paths_fix(
                 fixed = facade_fix_loop(
                     raw_file, fname, cfg, rules, limit, rst=rst, lint_sink=pre
                 )
-                # Self-guard: no violations may remain. If the fix changed nothing
+                # Self-guard: check what remains. If the fix changed nothing
                 # the residual is identical to ``pre`` (same source, same tree), so
                 # skip the re-parse; only a *changed* result needs a fresh parse to
                 # catch any reparse-vs-mutate divergence.
@@ -1334,9 +1356,38 @@ def _try_facade_paths_fix(
                     post = facade_violations(fixed, fname, cfg, rules)
                 else:
                     post = pre
-                if post is None or post:
-                    remaining.append(fname)  # unfixable violations remain
+                if post is None:
+                    remaining.append(fname)
                     continue
+                # A residual violation still claiming a fix means the loop gave
+                # up on an applicable fix (runaway / grammar-rejected /
+                # loop-detected); native's bookkeeping for those is subtle, so
+                # let native own the file.
+                if any(getattr(v, "fixes", None) for v in post):
+                    remaining.append(fname)
+                    continue
+                # Unfixable violations get REPORTED (summary count + failure
+                # exit code) from the initial pass, like native's
+                # ``num_unfixable_lint_errors`` (which counts its kept lint
+                # errors with ``fixable=False`` — even ones another rule's fix
+                # incidentally resolved).
+                pre_unfixable = [v for v in pre if not getattr(v, "fixes", None)]
+                if pre_unfixable or post:
+                    # An unfixable violation from a rule with known detection
+                    # over-reporting on the façade may be phantom — reporting
+                    # it would leak a wrong exit code, so defer. Likewise
+                    # ``--show-lint-violations`` renders unfixable violations
+                    # from the native result records, so files that would
+                    # populate that section must go through native.
+                    if formatter.show_lint_violations or any(
+                        v.rule_code() in FACADE_SAFE_RULES_DETECTION_UNSAFE
+                        for v in (*pre_unfixable, *post)
+                    ):
+                        remaining.append(fname)
+                        continue
+                # Everything fixable is fixed; anything left is unfixable, which
+                # native would report (and count) without changing the file
+                # further — so the output is FINAL and we can finish here.
                 # Emit the per-file violations exactly as native's runner does
                 # (``dispatch_file_violations`` with ``only_fixable=True``), so the
                 # CLI output matches. Clean files produce an empty (suppressed)
@@ -1347,12 +1398,13 @@ def _try_facade_paths_fix(
                     else:
                         shown = [v for v in pre if getattr(v, "fixes", None)]
                     formatter._dispatch(formatter._format_file_violations(fname, shown))
-                # Fully & safely fixable: write in place (only when changed) using
-                # the native atomic/encoding-preserving writer.
+                # Write in place (only when changed) using the native
+                # atomic/encoding-preserving writer.
                 if fixed != raw_file:
                     LintedFile._safe_create_replace_file(fname, fname, fixed, encoding)
                     formatter.dispatch_persist_filename(filename=fname, result="FIXED")
                 num_facade_fixable += sum(1 for v in pre if getattr(v, "fixes", None))
+                num_facade_unfixable += len(pre_unfixable)
                 handled_any = True
             except Exception:  # noqa: BLE001
                 remaining.append(fname)  # any uncertainty -> native handles it
@@ -1361,7 +1413,7 @@ def _try_facade_paths_fix(
             # The façade contributed nothing; signal "run native over the
             # original paths" so behaviour is exactly as it is today.
             return bail
-        return remaining, num_facade_fixable
+        return remaining, num_facade_fixable, num_facade_unfixable
     except Exception:  # noqa: BLE001
         return bail
 
@@ -1377,11 +1429,19 @@ def _stdin_fix(
     stdin = sys.stdin.read()
 
     # EXPERIMENTAL: Rust-engine façade fast path (falls back to Python if it
-    # can't fully & safely handle the requested rules).
-    _facade_fixed = _try_facade_stdin_fix(linter, stdin, stdin_filename)
-    if _facade_fixed is not None:
+    # can't safely handle the requested rules).
+    _facade_result = _try_facade_stdin_fix(linter, stdin, stdin_filename)
+    if _facade_result is not None:
+        _facade_fixed, _facade_unfixable = _facade_result
+        if _facade_unfixable:
+            # Mirror native's stderr message + failure exit for unfixable
+            # violations (see below).
+            click.echo(
+                formatter.colorize("Unfixable violations detected.", Color.red),
+                err=True,
+            )
         click.echo(_facade_fixed, nl=False)
-        sys.exit(EXIT_SUCCESS)
+        sys.exit(EXIT_FAIL if _facade_unfixable else EXIT_SUCCESS)
 
     result = linter.lint_string_wrapped(
         stdin, fname="stdin", fix=True, stdin_filename=stdin_filename
@@ -1449,15 +1509,18 @@ def _paths_fix(
     # only needs to process those leftovers ([] => the façade handled everything).
     facade_remaining: Optional[list[str]] = None
     num_facade_fixable = 0
+    num_facade_unfixable = 0
     # Skip the fast path for --check (fixes deferred to the end) and for --bench /
     # --persist-timing (which rely on native's per-file timing records).
     if not check and not bench and not persist_timing:
         try:
-            facade_remaining, num_facade_fixable = _try_facade_paths_fix(
-                linter, formatter, paths, fixed_suffix, ignore_files
+            facade_remaining, num_facade_fixable, num_facade_unfixable = (
+                _try_facade_paths_fix(
+                    linter, formatter, paths, fixed_suffix, ignore_files
+                )
             )
         except Exception:  # noqa: BLE001
-            facade_remaining, num_facade_fixable = None, 0
+            facade_remaining, num_facade_fixable, num_facade_unfixable = None, 0, 0
 
     if facade_remaining is None:
         remaining_paths: list[str] = list(paths)
@@ -1469,6 +1532,14 @@ def _paths_fix(
         elif formatter.verbosity >= 0:
             click.echo("==== no fixable linting violations found ====")
             formatter.completion_message()
+        # Mirror native's unfixable summary + failure exit exactly, including
+        # its quirk of only flagging failure alongside the (verbosity-gated)
+        # summary line (see the ``num_unfixable`` handling below).
+        if num_facade_unfixable > 0 and formatter.verbosity >= 0:
+            click.echo(
+                "  [{} unfixable linting violations found]".format(num_facade_unfixable)
+            )
+            sys.exit(EXIT_FAIL)
         sys.exit(EXIT_SUCCESS)
     else:
         remaining_paths = facade_remaining
@@ -1543,6 +1614,9 @@ def _paths_fix(
             formatter.completion_message()
 
     num_unfixable = sum(p.num_unfixable_lint_errors for p in result.paths)
+    # Include unfixable violations found in files the façade fast path handled
+    # (those files are not in ``result``).
+    num_unfixable += num_facade_unfixable
     if num_unfixable > 0 and formatter.verbosity >= 0:
         click.echo("  [{} unfixable linting violations found]".format(num_unfixable))
         exit_code = max(exit_code, EXIT_FAIL)

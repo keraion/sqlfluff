@@ -43,7 +43,20 @@ def _linter(rules: str, engine: str = "true", dialect: str = "ansi") -> Linter:
 )
 def test_facade_stdin_fix_fast_path(src: str, rule: str, expected: str) -> None:
     """Fast path fixes correctly (matching the fixture expectation)."""
-    assert _try_facade_stdin_fix(_linter(rule), src, None) == expected
+    assert _try_facade_stdin_fix(_linter(rule), src, None) == (expected, 0)
+
+
+def test_facade_stdin_fix_reports_unfixable() -> None:
+    """Unfixable violations complete on the fast path, with a count.
+
+    A lint-only finding (AM04: unknown result columns from ``*``) can't be
+    fixed by anyone — deferring to native would just re-produce the same
+    output, so the fast path finishes the file and returns the unfixable
+    count for the caller's "Unfixable violations detected." + failure exit.
+    """
+    src = "select * from tbl\n"
+    result = _try_facade_stdin_fix(_linter("AM04"), src, None)
+    assert result == (src, 1)
 
 
 def test_facade_stdin_fix_falls_back(monkeypatch) -> None:
