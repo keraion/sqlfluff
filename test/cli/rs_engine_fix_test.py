@@ -76,8 +76,13 @@ def test_facade_stdin_fix_falls_back(monkeypatch) -> None:
         _try_facade_stdin_fix(_linter("CP01", engine="false"), "SeLeCt 1\n", None)
         is None
     )
-    # noqa directives are not applied on the façade path.
-    assert _try_facade_stdin_fix(_linter("CP01"), "SeLeCt 1 -- noqa\n", None) is None
+    # noqa directives are handled ON the façade path now: the masked CP01's
+    # fix is NOT applied, exactly like native.
+    noqa_result = _try_facade_stdin_fix(_linter("CP01"), "SeLeCt 1 -- noqa\n", None)
+    assert noqa_result is not None
+    fixed, num_unfixable = noqa_result
+    assert fixed == "SeLeCt 1 -- noqa\n"  # masked -> unchanged
+    assert num_unfixable == 0
     # A templated source (jinja) routes to native: the façade path can't
     # observe templater violations (e.g. undefined variables must abort).
     assert (

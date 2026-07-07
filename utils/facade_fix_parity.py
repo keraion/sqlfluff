@@ -24,6 +24,7 @@ from sqlfluff.core import FluffConfig, Linter
 from sqlfluff.core.rules.rs_lint import (
     RsSegment,
     facade_fix_loop,
+    facade_ignore_mask,
     facade_violations,
 )
 
@@ -64,7 +65,8 @@ def facade_fix(src, fname, dialect):
         return None  # empty files route to native (LT12 under raw templating)
     c = cfg(dialect, True)
     lnt = Linter(config=c)
-    rules = list(lnt.get_rulepack(config=c).rules)
+    rule_pack = lnt.get_rulepack(config=c)
+    rules = list(rule_pack.rules)
     limit = int(c.get("runaway_limit"))
     rst = sqlfluffrs.engine_parse_to_tree(src, fname, c, None, True)
     if rst is None:
@@ -77,10 +79,22 @@ def facade_fix(src, fname, dialect):
         tf, "templated_str", None
     ):
         return None
+    # noqa masks are applied facade-side now (like the CLI gates).
+    ignore_mask, _ivs = facade_ignore_mask(
+        RsSegment(rst.root), c, rule_pack.reference_map
+    )
     pre = []
     loop_state = {}
     fixed = facade_fix_loop(
-        src, fname, c, rules, limit, rst=rst, lint_sink=pre, loop_state=loop_state
+        src,
+        fname,
+        c,
+        rules,
+        limit,
+        rst=rst,
+        lint_sink=pre,
+        loop_state=loop_state,
+        ignore_mask=ignore_mask,
     )
     if loop_state.get("runaway"):
         return None  # the CLI defers runaway reverts to native

@@ -1073,6 +1073,34 @@ def apply_source_fixes(source: str, fixes: list[Any]) -> Optional[str]:
     return "".join(out_parts)
 
 
+def facade_ignore_mask(
+    root: "RsSegment", config: Any, reference_map: dict[str, set[str]]
+) -> tuple[Any, list[Any]]:
+    """Build native's ``IgnoreMask`` from a façade tree.
+
+    Mirrors ``Linter.lint_fix_parsed`` (linter.py:490-499) exactly:
+    ``disable_noqa`` (unless ``disable_noqa_except`` is set) suppresses the
+    mask entirely; otherwise ``IgnoreMask.from_tree`` scans the tree's comment
+    segments — the façade wrappers duck-type everything it reads
+    (``recursive_crawl``/``is_type``/``raw_trimmed``/``source_position``).
+
+    Returns ``(mask_or_None, malformed_noqa_violations)`` — the violations are
+    native ``SQLParseError``s that the caller must report like native's
+    ``initial_linting_errors`` additions. ``reference_map`` is the rule pack's
+    (``rule_pack.reference_map``), so rule aliases/groups resolve identically.
+    """
+    from sqlfluff.core.linter import Linter as _Linter
+    from sqlfluff.core.rules.noqa import IgnoreMask
+
+    disable_noqa_except = config.get("disable_noqa_except")
+    if config.get("disable_noqa") and not disable_noqa_except:
+        return None, []
+    allowed_rules_ref_map = _Linter.allowed_rule_ref_map(
+        reference_map, disable_noqa_except
+    )
+    return IgnoreMask.from_tree(root, allowed_rules_ref_map)  # type: ignore[arg-type]
+
+
 def facade_violations(
     source: str,
     fname: str,
@@ -1080,12 +1108,18 @@ def facade_violations(
     rules: list[Any],
     rst: Any = None,
     rule_timing_sink: Optional[list[tuple[str, str, float]]] = None,
+    ignore_mask: Any = None,
 ) -> Optional[list[Any]]:
     """Crawl ``rules`` over the arena façade and return their ``SQLLintError``s.
 
     Returns ``None`` if the source can't be parsed via the engine (the caller
-    should fall back to the Python path). ``ignore_mask`` is not applied here —
-    callers relying on ``noqa`` must handle it separately.
+    should fall back to the Python path).
+
+    ``ignore_mask``, if given, is passed to each rule crawl exactly like
+    native (``_process_lint_result`` drops masked results and marks the
+    directives used). Build one with :func:`facade_ignore_mask`; the caller
+    owns reporting the malformed-noqa violations it returns and storing the
+    mask on the ``LintedFile`` (unused-noqa warnings).
 
     ``rst`` may be a tree already parsed from ``source`` (the crawl is read-only,
     so a caller can share one parse across the gate checks, the pre-count and the
@@ -1141,7 +1175,7 @@ def facade_violations(
             dialect=dialect_obj,
             fix=False,
             templated_file=templated_file,
-            ignore_mask=None,
+            ignore_mask=ignore_mask,
             fname=fname,
             config=config,
         )
@@ -1383,6 +1417,7 @@ def facade_fix_loop_v3(
     rst: Any = None,
     lint_sink: Optional[list[Any]] = None,
     loop_state: Optional[dict[str, Any]] = None,
+    ignore_mask: Any = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1450,7 +1485,9 @@ def facade_fix_loop_v3(
                     dialect=dialect_obj,
                     fix=True,
                     templated_file=tf,
-                    ignore_mask=None,
+                    # Masked results (and their fixes) are dropped inside the
+                    # crawl (_process_lint_result), exactly like native.
+                    ignore_mask=ignore_mask,
                     fname=fname,
                     config=config,
                 )
@@ -1566,6 +1603,7 @@ def facade_fix_loop(
     rst: Any = None,
     lint_sink: Optional[list[Any]] = None,
     loop_state: Optional[dict[str, Any]] = None,
+    ignore_mask: Any = None,
 ) -> str:
     """Iteratively fix ``source`` over the arena façade.
 
@@ -1577,9 +1615,12 @@ def facade_fix_loop(
     ``lint_sink``, if given, collects the pre-fix violations (native's
     ``initial_linting_errors``) from the first fix pass, and ``loop_state``
     reports ``{"runaway": True}`` on a loop-limit revert — see
-    :func:`facade_fix_loop_v3`. On the legacy v1 path the sink falls back to
-    a separate :func:`facade_violations` sweep and ``loop_state`` is never
-    set (best effort; bisection-only).
+    :func:`facade_fix_loop_v3`. ``ignore_mask`` (see
+    :func:`facade_ignore_mask`) drops masked results and their fixes inside
+    the crawls, exactly like native. On the legacy v1 path the sink falls
+    back to a separate :func:`facade_violations` sweep, ``loop_state`` is
+    never set, and ``ignore_mask`` is NOT applied (best effort;
+    bisection-only).
     """
     import os
 
@@ -1603,6 +1644,7 @@ def facade_fix_loop(
             rules,
             limit,
             rst=rst,
+            ignore_mask=ignore_mask,
             lint_sink=lint_sink,
             loop_state=loop_state,
         )

@@ -75,8 +75,11 @@ def test_facade_stdin_lint_falls_back(monkeypatch) -> None:
         _try_facade_stdin_lint(_linter("CP01", engine="false"), "SeLeCt 1\n", None)
         is None
     )
-    # noqa directives are not applied on the façade path.
-    assert _try_facade_stdin_lint(_linter("CP01"), "SeLeCt 1 -- noqa\n", None) is None
+    # noqa directives are handled ON the façade path now: the masked CP01
+    # is dropped, exactly like native.
+    noqa_result = _try_facade_stdin_lint(_linter("CP01"), "SeLeCt 1 -- noqa\n", None)
+    assert noqa_result is not None
+    assert not [v for v in noqa_result.get_violations() if isinstance(v, SQLLintError)]
     # Templated source routes to native (templater violations).
     assert (
         _try_facade_stdin_lint(
@@ -170,3 +173,121 @@ def test_facade_lint_templated_eligibility(tmp_path) -> None:
 
     undef = "select a from {{ undefined_table_name }}\n"
     assert _facade_lint_file(undef, "undef.sql", c, Linter(config=c)) is None
+
+
+def _noqa_cfg(rust: bool, **extra) -> "FluffConfig":
+    return FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "LT01,LT12",
+            "use_rust_engine": rust,
+            "use_rust_parser": rust,
+            "use_rust_rules": rust,
+            **extra,
+        }
+    )
+
+
+def test_facade_lint_noqa_masks_like_native() -> None:
+    """Sources with noqa lint on the fast path with native-identical masking.
+
+    Covers: a masked violation (dropped), an unmasked one (kept), a
+    malformed directive (SQLParseError reported), and disable_noqa
+    (directives ignored entirely).
+    """
+    from sqlfluff.cli.commands import _facade_lint_file
+
+    # LT01 fires per-site: line 1's double space is masked, line 2's is
+    # not; line 3 is a malformed directive (no colon after noqa).
+    src = (
+        "select a ,  b from tbl -- noqa: LT01\n"
+        "union all\n"
+        "select c ,  d from tbl --noqa missing colon\n"
+    )
+
+    def keys(linted):
+        return sorted((type(v).__name__, v.rule_code(), v.line_no) for v in linted)
+
+    c = _noqa_cfg(True)
+    linted = _facade_lint_file(src, "noqa.sql", c, Linter(config=c))
+    assert linted is not None  # noqa no longer routes to native
+    fac = keys(linted.get_violations(filter_ignore=True))
+    nat = keys(
+        Linter(config=_noqa_cfg(False))
+        .lint_string(src)
+        .get_violations(filter_ignore=True)
+    )
+    assert fac == nat
+    # Line 1's LT01s are masked; line 3's report; the malformed directive
+    # raises an SQLParseError violation.
+    assert not any(k[1] == "LT01" and k[2] == 1 for k in fac)
+    assert any(k[1] == "LT01" and k[2] == 3 for k in fac)
+    assert any(k[0] == "SQLParseError" for k in fac)
+
+    # disable_noqa: directives ignored -> the masked LT01s come back and
+    # the malformed directive is no longer parsed.
+    c2 = _noqa_cfg(True, disable_noqa=True)
+    linted2 = _facade_lint_file(src, "noqa.sql", c2, Linter(config=c2))
+    assert linted2 is not None
+    fac2 = keys(linted2.get_violations(filter_ignore=True))
+    nat2 = keys(
+        Linter(config=_noqa_cfg(False, disable_noqa=True))
+        .lint_string(src)
+        .get_violations(filter_ignore=True)
+    )
+    assert fac2 == nat2
+    assert any(k[1] == "LT01" and k[2] == 1 for k in fac2)
+
+
+def test_facade_lint_unused_noqa_warns_like_native() -> None:
+    """An unused noqa directive produces the same warning as native."""
+    from sqlfluff.cli.commands import _facade_lint_file
+
+    src = "SELECT a FROM tbl\n-- noqa: CP01\n"
+
+    def warning_tuples(linted):
+        return sorted(
+            (v.rule_code(), v.line_no, v.description)
+            for v in linted.get_violations(
+                filter_warning=False, warn_unused_ignores=True
+            )
+            if getattr(v, "warning", False)
+        )
+
+    c = _noqa_cfg(True)
+    linted = _facade_lint_file(src, "unused.sql", c, Linter(config=c))
+    assert linted is not None
+    nat_linted = Linter(config=_noqa_cfg(False)).lint_string(src)
+    assert warning_tuples(linted) == warning_tuples(nat_linted)
+
+
+def test_facade_fix_noqa_masks_fixes_like_native(tmp_path) -> None:
+    """Masked violations' fixes are NOT applied on the fix fast path."""
+    from sqlfluff.cli.commands import _try_facade_paths_fix
+    from sqlfluff.cli.formatters import OutputStreamFormatter
+    from sqlfluff.cli.outputstream import make_output_stream
+
+    src = "select a ,  b from tbl -- noqa: LT01\nunion all\nselect c ,  d from tbl\n"
+    f = tmp_path / "mixed.sql"
+    f.write_text(src)
+
+    c = _noqa_cfg(True)
+    linter = Linter(config=c)
+    stream = make_output_stream(c)
+    formatter = OutputStreamFormatter(stream, False)
+    remaining, _fixable, _unfixable = _try_facade_paths_fix(
+        linter, formatter, (str(tmp_path),), "", True
+    )
+    assert remaining == []  # facade handled the file
+    fixed = f.read_text()
+
+    f.write_text(src)  # restore for the native run
+    nat = (
+        Linter(config=_noqa_cfg(False))
+        .lint_string(src, fname=str(f), fix=True)
+        .fix_string()[0]
+    )
+    assert fixed == nat
+    # Line 1's spacing stays broken (masked); line 3 gets fixed.
+    assert fixed.startswith("select a ,  b from tbl -- noqa: LT01\n")
+    assert "select c, d from tbl" in fixed

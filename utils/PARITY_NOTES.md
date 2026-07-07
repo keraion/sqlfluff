@@ -154,6 +154,26 @@ regions are dropped unless semantically literal or the rule targets
 templated code), and `facade_fix_loop_v3` applies it to the harvested
 `lint_sink` like native's `initial_linting_errors` filter.
 
+## noqa (ignore masks) on the façade fast paths (2026-07-07)
+
+Sources containing ``noqa`` no longer route to native: the gates build
+native's ``IgnoreMask`` from the façade tree
+(``rs_lint.facade_ignore_mask``, mirroring linter.py:490-499 —
+``disable_noqa``/``disable_noqa_except`` handling included) and pass it
+into the rule crawls, where ``_process_lint_result`` drops masked results
+and their fixes exactly like native. Malformed directives surface as
+``SQLParseError`` violations (native's ``initial_linting_errors``
+additions), and the mask rides on the lint path's ``LintedFile`` so
+unused-noqa warnings (``--warn-unused-ignores``) work natively. The
+façade wrappers duck-type everything ``IgnoreMask.from_tree`` reads —
+directive extraction is byte-identical to native.
+
+All four parity sweeps re-vetted with noqa files eligible: literal fix
+2169/0, literal lint 2169/0, templated lint+fix 229 eligible / 0 each.
+The sqlfluff-testbed generator now sprinkles inline masks, unused
+directives and disable/enable ranges through the models so mask parity
+stays exercised end-to-end in every testbed run.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

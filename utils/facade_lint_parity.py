@@ -4,7 +4,7 @@ For each fixture (under its own dialect), compare native ``lint_string``
 violations against ``facade_violations`` — first as (rule, line, pos) tuples
 (detection parity), then descriptions for position-matched pairs (text
 parity). Files that route to native in production (unparsable, templated,
-noqa) are skipped, mirroring the CLI gates.
+noqa masks applied facade-side) are handled, mirroring the CLI gates.
 
 Run from the repo root:
 
@@ -25,7 +25,11 @@ from collections import Counter
 import sqlfluffrs
 from sqlfluff.core import FluffConfig, Linter
 from sqlfluff.core.errors import SQLLintError
-from sqlfluff.core.rules.rs_lint import RsSegment, facade_violations
+from sqlfluff.core.rules.rs_lint import (
+    RsSegment,
+    facade_ignore_mask,
+    facade_violations,
+)
 
 CORPUS = "test/fixtures/dialects"
 RULESET = sys.argv[1] if len(sys.argv) > 1 else None
@@ -55,12 +59,11 @@ for dialect in sorted(os.listdir(CORPUS)):
     )
     lnt_nat = Linter(config=cfg_nat)
     lnt_rs = Linter(config=cfg_rs)
-    rules = list(lnt_rs.get_rulepack(config=cfg_rs).rules)
+    rule_pack = lnt_rs.get_rulepack(config=cfg_rs)
+    rules = list(rule_pack.rules)
     for f in glob.glob(os.path.join(dpath, "**", "*.sql"), recursive=True):
         src = open(f).read()
         n_files += 1
-        if "noqa" in src.lower():
-            continue
         try:
             rst = sqlfluffrs.engine_parse_to_tree(src, f, cfg_rs, None, True)
             if rst is None:
@@ -70,7 +73,13 @@ for dialect in sorted(os.listdir(CORPUS)):
             tf = rst.templated_file
             if tf is None or tf.source_str != tf.templated_str:
                 continue
-            fac = facade_violations(src, f, cfg_rs, rules, rst=rst)
+            # noqa masks are applied facade-side now (like the CLI gates).
+            ignore_mask, _ivs = facade_ignore_mask(
+                RsSegment(rst.root), cfg_rs, rule_pack.reference_map
+            )
+            fac = facade_violations(
+                src, f, cfg_rs, rules, rst=rst, ignore_mask=ignore_mask
+            )
             if fac is None:
                 continue
             res = lnt_nat.lint_string(src)

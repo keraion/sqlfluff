@@ -309,19 +309,31 @@ def test_facade_lint_matches_native(test_case) -> None:
     (rule, line, pos, description) — which the fix fast path relies on for
     its violation counts/exit codes and any future façade ``lint`` wiring.
     """
+    import sqlfluffrs
     from sqlfluff.core.errors import SQLLintError
-    from sqlfluff.core.rules.rs_lint import facade_violations
+    from sqlfluff.core.rules.rs_lint import (
+        RsSegment,
+        facade_ignore_mask,
+        facade_violations,
+    )
 
     src = test_case.fail_str if test_case.fail_str is not None else test_case.pass_str
-    if "noqa" in src.lower():
-        # Ignore masks aren't applied on the façade path; the CLI gates
-        # noqa'd sources to native (commands.py), so they're out of scope.
-        pytest.skip("noqa routes to native in production")
     config = _setup_config(test_case.rule, test_case.configs)
     linter = Linter(config=config)
-    rules = list(linter.get_rulepack(config=config).rules)
+    rule_pack = linter.get_rulepack(config=config)
+    rules = list(rule_pack.rules)
 
-    fac = facade_violations(src, "<test>", config, rules)
+    # Mirror the production gate: noqa directives build an ignore mask from
+    # the facade tree and masked results drop inside the crawl.
+    rst = sqlfluffrs.engine_parse_to_tree(src, "<test>", config, None, True)
+    if rst is None:
+        pytest.skip("engine parse unavailable for this case")
+    ignore_mask, _ivs = facade_ignore_mask(
+        RsSegment(rst.root), config, rule_pack.reference_map
+    )
+    fac = facade_violations(
+        src, "<test>", config, rules, rst=rst, ignore_mask=ignore_mask
+    )
     if fac is None:
         # Engine can't parse this case -> routes to native in production.
         pytest.skip("engine parse unavailable for this case")

@@ -25,6 +25,7 @@ from sqlfluff.core.rules.rs_lint import (
     FACADE_SAFE_RULES,
     RsSegment,
     facade_fix_loop,
+    facade_ignore_mask,
     facade_violations,
 )
 
@@ -59,10 +60,9 @@ def facade_fix(src: str, fname: str, cfg) -> "str | None":
 
     Mirrors ``_try_facade_paths_fix``'s per-file logic (commands.py).
     """
-    if "noqa" in src.lower():
-        return None
     lnt = Linter(config=cfg)
-    rules = list(lnt.get_rulepack(config=cfg).rules)
+    rule_pack = lnt.get_rulepack(config=cfg)
+    rules = list(rule_pack.rules)
     if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
         return None
     rst = sqlfluffrs.engine_parse_to_tree(src, fname, cfg, None, True)
@@ -77,6 +77,10 @@ def facade_fix(src: str, fname: str, cfg) -> "str | None":
         return None
     if getattr(rst, "templater_violations", None):
         return None
+    # noqa masks are applied facade-side now (like the CLI gates).
+    ignore_mask, _ivs = facade_ignore_mask(
+        RsSegment(rst.root), cfg, rule_pack.reference_map
+    )
     pre: list = []
     loop_state: dict = {}
     fixed = facade_fix_loop(
@@ -88,6 +92,7 @@ def facade_fix(src: str, fname: str, cfg) -> "str | None":
         rst=rst,
         lint_sink=pre,
         loop_state=loop_state,
+        ignore_mask=ignore_mask,
     )
     if loop_state.get("runaway"):
         return None

@@ -1186,6 +1186,7 @@ def _facade_lint_file(
         FACADE_SAFE_RULES,
         FACADE_SAFE_RULES_DETECTION_UNSAFE,
         RsSegment,
+        facade_ignore_mask,
         facade_violations,
     )
 
@@ -1198,9 +1199,8 @@ def _facade_lint_file(
         # statistics record differ (no end-of-file meta). Native handles it
         # trivially fast.
         return None
-    if "noqa" in raw_file.lower():
-        return None  # ignore masks not applied on the façade path
-    rules = list(linter.get_rulepack(config=cfg).rules)
+    rule_pack = linter.get_rulepack(config=cfg)
+    rules = list(rule_pack.rules)
     if not rules or any(
         r.code not in FACADE_SAFE_RULES or r.code in FACADE_SAFE_RULES_DETECTION_UNSAFE
         for r in rules
@@ -1226,14 +1226,29 @@ def _facade_lint_file(
         return None
     if getattr(rst, "templater_violations", None):
         return None
+    # ``noqa`` handling, exactly like native (linter.py:490-499): build the
+    # ignore mask from the parsed tree's comments; masked results are dropped
+    # inside the rule crawls and the mask rides on the LintedFile for
+    # unused-noqa warnings. Malformed directives are SQLParseErrors reported
+    # alongside the lint results.
+    ignore_mask, noqa_violations = facade_ignore_mask(
+        root, cfg, rule_pack.reference_map
+    )
     rule_timings: list[tuple[str, str, float]] = []
     t1 = time.monotonic()
     violations = facade_violations(
-        raw_file, fname, cfg, rules, rst=rst, rule_timing_sink=rule_timings
+        raw_file,
+        fname,
+        cfg,
+        rules,
+        rst=rst,
+        rule_timing_sink=rule_timings,
+        ignore_mask=ignore_mask,
     )
     lint_time = time.monotonic() - t1
     if violations is None:
         return None
+    violations = LintedFile.deduplicate_in_source_space(violations + noqa_violations)
     # Native's violation post-processing (linter.py:840-843).
     for violation in violations:
         violation.ignore_if_in(cfg.get("ignore"))
@@ -1257,7 +1272,7 @@ def _facade_lint_file(
         # (char and segment counts); the engine's TemplatedFile and the façade
         # root duck-type the accessors it uses.
         tree=root,  # type: ignore[arg-type]
-        ignore_mask=None,
+        ignore_mask=ignore_mask,
         templated_file=tf,
         encoding=encoding,
     )
@@ -1437,6 +1452,7 @@ def _try_facade_stdin_fix(
             FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
+            facade_ignore_mask,
             facade_violations,
         )
 
@@ -1465,13 +1481,12 @@ def _try_facade_stdin_fix(
             # placeholder that LT12 fixes to a single newline — the arena's
             # bare ``file`` node can't reproduce that.
             return None
-        if "noqa" in source.lower():
-            return None  # ignore masks not applied on the façade path
         if config.get("warnings"):
             # ``sqlfluff:warnings:`` demotes matching violations to warnings;
             # the façade crawl can't apply that -> native.
             return None
-        rules = list(linter.get_rulepack(config=config).rules)
+        rule_pack = linter.get_rulepack(config=config)
+        rules = list(rule_pack.rules)
         if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
             return None
         import sqlfluffrs
@@ -1497,11 +1512,17 @@ def _try_facade_stdin_fix(
         if getattr(rst, "templater_violations", None):
             return None
         limit = int(config.get("runaway_limit"))
+        # ``noqa`` handling, exactly like native (linter.py:490-499): masked
+        # results and their fixes are dropped inside the loop's crawls;
+        # malformed directives report like initial_linting_errors.
+        ignore_mask, noqa_violations = facade_ignore_mask(
+            RsSegment(rst.root), config, rule_pack.reference_map
+        )
         # Reuse the tree just parsed for the gate check (the fix loop mutates it)
         # instead of re-parsing the same source. Harvest the pre-fix violations
         # from the loop's first pass: when the fix changed nothing they ARE the
         # residual, so the self-guard needs no second sweep.
-        pre: list = []
+        pre: list = list(noqa_violations)
         loop_state: dict = {}
         fixed = facade_fix_loop(
             source,
@@ -1512,6 +1533,7 @@ def _try_facade_stdin_fix(
             rst=rst,
             lint_sink=pre,
             loop_state=loop_state,
+            ignore_mask=ignore_mask,
         )
         # A runaway revert is the one gave-up case whose bookkeeping we don't
         # reproduce (native strips the fixes from every reported violation,
@@ -1587,6 +1609,7 @@ def _try_facade_paths_fix(
             FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
+            facade_ignore_mask,
             facade_violations,
         )
 
@@ -1637,15 +1660,13 @@ def _try_facade_paths_fix(
                     # LT12 lints raw-templated zero-byte renders).
                     remaining.append(fname)
                     continue
-                if "noqa" in raw_file.lower():
-                    remaining.append(fname)  # ignore masks not applied here
-                    continue
                 if cfg.get("warnings"):
                     # ``sqlfluff:warnings:`` demotes matching violations to
                     # warnings; the façade crawl can't apply that -> native.
                     remaining.append(fname)
                     continue
-                rules = list(linter.get_rulepack(config=cfg).rules)
+                rule_pack = linter.get_rulepack(config=cfg)
+                rules = list(rule_pack.rules)
                 if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
                     remaining.append(fname)
                     continue
@@ -1680,7 +1701,13 @@ def _try_facade_paths_fix(
                 # ``initial_linting_errors``) are harvested from the loop's own
                 # first pass via ``lint_sink`` rather than paying a separate
                 # whole-ruleset crawl.
-                pre: list = []
+                # ``noqa``: masked results/fixes drop inside the loop's
+                # crawls; malformed directives report like native's
+                # initial_linting_errors.
+                ignore_mask, noqa_violations = facade_ignore_mask(
+                    root, cfg, rule_pack.reference_map
+                )
+                pre: list = list(noqa_violations)
                 loop_state: dict = {}
                 fixed = facade_fix_loop(
                     raw_file,
@@ -1691,6 +1718,7 @@ def _try_facade_paths_fix(
                     rst=rst,
                     lint_sink=pre,
                     loop_state=loop_state,
+                    ignore_mask=ignore_mask,
                 )
                 # A runaway revert is the one gave-up case whose bookkeeping
                 # we don't reproduce (native strips the fixes from every
