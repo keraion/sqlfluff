@@ -8,7 +8,7 @@ import sys
 import time
 from itertools import chain
 from logging import LogRecord
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
 
 # Third-party imports
 import click
@@ -41,6 +41,10 @@ from sqlfluff.core.linter.linted_file import TMP_PRS_ERROR_TYPES
 from sqlfluff.core.plugin.host import get_plugin_manager
 from sqlfluff.core.rules.noqa import IgnoreMask
 from sqlfluff.core.types import Color, FormatType
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sqlfluff.core.linter.linted_dir import LintedDir
+    from sqlfluff.core.linter.linted_file import LintedFile
 
 
 # --- Recursion Limit Helper ---
@@ -787,23 +791,59 @@ def lint(
     with PathAndUserErrorHandler(formatter):
         # add stdin if specified via lone '-'
         if ("-",) == paths:
-            if stdin_filename:
-                lnt.config = lnt.config.make_child_from_path(
-                    stdin_filename, require_dialect=False
+            stdin_source = sys.stdin.read()
+            # EXPERIMENTAL: Rust-engine façade fast path (falls back to the
+            # Python path for anything it can't safely cover).
+            _facade_result = _try_facade_stdin_lint(lnt, stdin_source, stdin_filename)
+            if _facade_result is not None:
+                result = _facade_result
+            else:
+                if stdin_filename:
+                    lnt.config = lnt.config.make_child_from_path(
+                        stdin_filename, require_dialect=False
+                    )
+                result = lnt.lint_string_wrapped(
+                    stdin_source, fname="stdin", stdin_filename=stdin_filename
                 )
-            result = lnt.lint_string_wrapped(
-                sys.stdin.read(), fname="stdin", stdin_filename=stdin_filename
-            )
         else:
-            result = lnt.lint_paths(
-                paths,
-                ignore_non_existent_files=False,
-                ignore_files=not disregard_sqlfluffignores,
-                processes=processes,
-                # If we're just linting in the CLI, we don't need to retain the
-                # raw file content. This allows us to reduce memory overhead.
-                retain_files=False,
-            )
+            # EXPERIMENTAL: Rust-engine façade fast path. Lint (and stream
+            # output for) every file it can safely handle, and hand the rest
+            # back to the native path below. Skipped for --bench /
+            # --persist-timing, which rely on native's per-file timing records.
+            _facade_lint = None
+            if not bench and not persist_timing:
+                try:
+                    _facade_lint = _try_facade_paths_lint(
+                        lnt, formatter, paths, not disregard_sqlfluffignores
+                    )
+                except Exception:  # noqa: BLE001
+                    _facade_lint = None
+            if _facade_lint is None:
+                remaining_paths: tuple[str, ...] = paths
+                facade_dirs: list[Any] = []
+            else:
+                facade_dirs, _remaining = _facade_lint
+                remaining_paths = tuple(_remaining)
+            if remaining_paths or not facade_dirs:
+                result = lnt.lint_paths(
+                    remaining_paths,
+                    ignore_non_existent_files=False,
+                    ignore_files=not disregard_sqlfluffignores,
+                    processes=processes,
+                    # If we're just linting in the CLI, we don't need to retain
+                    # the raw file content. This allows us to reduce memory
+                    # overhead.
+                    retain_files=False,
+                )
+            else:
+                result = LintingResult()
+                result.stop_timer()
+            # Merge façade-handled files into the result. ``as_records`` sorts
+            # by filepath and the stats aggregate across dirs, so downstream
+            # output (json/yaml/github/sarif, stats, exit codes) is unaffected
+            # by which engine handled which file.
+            for _dir in facade_dirs:
+                result.add(_dir)
 
     # Output the final stats
     if verbose >= 1 and not non_human_output:
@@ -1121,6 +1161,252 @@ def _handle_unparsable(
         total_errors, num_filtered_errors, tmp_prs_errors_by_file, force_stderr=True
     )
     return EXIT_FAIL if num_filtered_errors else EXIT_SUCCESS
+
+
+def _facade_lint_file(
+    raw_file: str,
+    fname: str,
+    cfg: "FluffConfig",
+    linter: Linter,
+    encoding: str = "utf-8",
+) -> Optional["LintedFile"]:
+    """Lint one literal source over the Rust arena façade, or ``None`` to defer.
+
+    Applies the same routing gates as the fix fast paths (engine enabled,
+    every rule façade-safe and detection-verified, no ``noqa``, parses via the
+    engine with no unparsable section, source == templated) and native's
+    violation post-processing (``ignore_if_in``/``warning_if_in`` config
+    handling, source-space dedupe — the latter inside ``facade_violations``).
+    Returns a real ``LintedFile`` so every downstream consumer (formatters,
+    ``as_records`` serialisation, stats, exit codes) behaves natively.
+    """
+    import sqlfluffrs
+    from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
+    from sqlfluff.core.rules.rs_lint import (
+        FACADE_SAFE_RULES,
+        FACADE_SAFE_RULES_DETECTION_UNSAFE,
+        RsSegment,
+        facade_violations,
+    )
+
+    if not _use_rust_engine(cfg, None):
+        return None
+    if not raw_file:
+        # An empty file lints clean either way, but the arena's bare ``file``
+        # node makes the statistics record differ (no end-of-file meta);
+        # native handles it trivially fast.
+        return None
+    if "noqa" in raw_file.lower():
+        return None  # ignore masks not applied on the façade path
+    rules = list(linter.get_rulepack(config=cfg).rules)
+    if not rules or any(
+        r.code not in FACADE_SAFE_RULES or r.code in FACADE_SAFE_RULES_DETECTION_UNSAFE
+        for r in rules
+    ):
+        return None
+    t0 = time.monotonic()
+    rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
+    parse_time = time.monotonic() - t0
+    if rst is None:
+        return None  # unrenderable / lexer error -> native (TMP reporting)
+    root = RsSegment(rst.root)
+    if next(root.recursive_crawl("unparsable"), None) is not None:
+        return None  # parse error -> native (PRS violations + exit code)
+    tf = rst.templated_file
+    if tf is None or getattr(tf, "source_str", None) != getattr(
+        tf, "templated_str", None
+    ):
+        return None  # templated -> native (templater violations)
+    rule_timings: list[tuple[str, str, float]] = []
+    t1 = time.monotonic()
+    violations = facade_violations(
+        raw_file, fname, cfg, rules, rst=rst, rule_timing_sink=rule_timings
+    )
+    lint_time = time.monotonic() - t1
+    if violations is None:
+        return None
+    # Native's violation post-processing (linter.py:840-843).
+    for violation in violations:
+        violation.ignore_if_in(cfg.get("ignore"))
+        violation.warning_if_in(cfg.get("warnings"))
+    return LintedFile(
+        fname,
+        violations,
+        # The engine templates/lexes/parses in one call, so the whole
+        # front-of-pipeline time lands under "parsing" (the record keys still
+        # match native's; --bench and --persist-timing route to native).
+        timings=FileTimings(
+            {
+                "templating": 0.0,
+                "lexing": 0.0,
+                "parsing": parse_time,
+                "linting": lint_time,
+            },
+            rule_timings,
+        ),
+        # ``LintedDir.add`` reads these for the per-file ``statistics`` record
+        # (char and segment counts); the engine's TemplatedFile and the façade
+        # root duck-type the accessors it uses.
+        tree=root,  # type: ignore[arg-type]
+        ignore_mask=None,
+        templated_file=tf,
+        encoding=encoding,
+    )
+
+
+def _dispatch_facade_lint_output(
+    formatter: Any,
+    linted_file: "LintedFile",
+    cfg: "FluffConfig",
+    rules: list[Any],
+) -> None:
+    """Emit the per-file lint output exactly as the native pipeline does.
+
+    Mirrors ``dispatch_lint_header`` (linter.py:485-488, verbosity-gated) and
+    the per-file ``dispatch_file_violations`` (runner.py:212 / linter.py:859).
+    """
+    formatter.dispatch_lint_header(linted_file.path, sorted(r.code for r in rules))
+    formatter.dispatch_file_violations(
+        linted_file.path,
+        linted_file,
+        only_fixable=False,
+        warn_unused_ignores=cfg.get("warn_unused_ignores"),
+    )
+
+
+def _try_facade_paths_lint(
+    linter: Linter,
+    formatter: OutputStreamFormatter,
+    paths,
+    ignore_files: bool,
+) -> Optional[tuple[list["LintedDir"], list[str]]]:
+    """EXPERIMENTAL fast path: lint discovered files over the Rust arena façade.
+
+    Mirrors :func:`_try_facade_paths_fix` for the ``lint`` command. Files the
+    façade can safely lint become real ``LintedFile``s (grouped into one
+    ``LintedDir`` per input path, exactly like ``Linter.lint_paths``); every
+    other file is handed back to the native path.
+
+    Returns ``(linted_dirs, remaining_paths)``, or ``None`` — the sentinel for
+    "the façade did nothing, run native over the original ``paths`` unchanged".
+    Per-file human output is dispatched as files are linted, matching native's
+    streaming behaviour (ordering deviates only when files are split between
+    the two engines, as with the fix fast path).
+    """
+    try:
+        from sqlfluff.core.linter.discovery import paths_from_path
+        from sqlfluff.core.linter.linted_dir import LintedDir
+
+        if "-" in paths:
+            return None  # stdin mixed in -> leave everything to native
+        if not _use_rust_engine(linter.config, None):
+            return None
+
+        sql_exts = linter.config.get("sql_file_exts", default=".sql").lower().split(",")
+        linted_dirs: list[LintedDir] = []
+        discovered: list[tuple[LintedDir, str]] = []
+        seen_files: set[str] = set()
+        for path in paths:
+            linted_dir = LintedDir(path, retain_files=False)
+            linted_dirs.append(linted_dir)
+            for fname in paths_from_path(
+                path,
+                ignore_non_existent_files=False,
+                ignore_files=ignore_files,
+                target_file_exts=sql_exts,
+            ):
+                if fname not in seen_files:
+                    seen_files.add(fname)
+                    discovered.append((linted_dir, fname))
+
+        remaining: list[str] = []
+        handled_any = False
+        # The same files-level progress bar native shows (linter.py:1200-1238):
+        # only rendered when there's more than one file, advanced per file.
+        # Read the configuration through the linter module at call time — the
+        # reference native's bars use (and the one tests patch).
+        import sqlfluff.core.linter.linter as _linter_module
+
+        progress_bar_files = tqdm(
+            total=len(discovered),
+            desc=f"file {discovered[0][1] if discovered else ''}",
+            leave=False,
+            disable=len(discovered) <= 1
+            or _linter_module.progress_bar_configuration.disable_progress_bar,  # type: ignore[attr-defined]  # noqa: E501
+        )
+        try:
+            for i, (linted_dir, fname) in enumerate(discovered, start=1):
+                try:
+                    raw_file, cfg, encoding = Linter.load_raw_file_and_config(
+                        fname, linter.config
+                    )
+                    linted_file = _facade_lint_file(
+                        raw_file, fname, cfg, linter, encoding=encoding
+                    )
+                except Exception:  # noqa: BLE001
+                    linted_file = None  # any uncertainty -> native handles it
+                if linted_file is None:
+                    remaining.append(fname)
+                else:
+                    rules = list(linter.get_rulepack(config=cfg).rules)
+                    _dispatch_facade_lint_output(formatter, linted_file, cfg, rules)
+                    linted_dir.add(linted_file)
+                    handled_any = True
+                progress_bar_files.update(n=1)
+                if i < len(discovered):
+                    progress_bar_files.set_description(f"file {discovered[i][1]}")
+        finally:
+            progress_bar_files.close()
+        if not handled_any:
+            return None
+        return linted_dirs, remaining
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _try_facade_stdin_lint(
+    linter: Linter, source: str, stdin_filename: Optional[str]
+) -> Optional["LintingResult"]:
+    """EXPERIMENTAL fast path: lint stdin over the Rust arena façade.
+
+    Mirrors ``Linter.lint_string_wrapped`` — returns a complete
+    ``LintingResult`` (so stats/records/exit codes behave natively) or
+    ``None`` to defer to the Python path.
+    """
+    try:
+        from sqlfluff.core.linter.linted_dir import LintedDir
+
+        config = linter.config
+        if stdin_filename:
+            config = config.make_child_from_path(stdin_filename, require_dialect=False)
+            # Respect ignore files exactly as native ``lint_string_wrapped``
+            # does (linter.py:1112-1121): if the named file is excluded by a
+            # ``.sqlfluffignore``, defer — native then emits the advisory
+            # warning and returns an empty result.
+            from sqlfluff.core.linter.discovery import paths_from_path
+
+            if not list(
+                paths_from_path(
+                    stdin_filename,
+                    target_file_exts=("",),
+                    check_non_existent_file=True,
+                )
+            ):
+                return None
+        linted_file = _facade_lint_file(source, "stdin", config, linter)
+        if linted_file is None:
+            return None
+        rules = list(linter.get_rulepack(config=config).rules)
+        if linter.formatter:
+            _dispatch_facade_lint_output(linter.formatter, linted_file, config, rules)
+        result = LintingResult()
+        linted_dir = LintedDir("stdin")
+        linted_dir.add(linted_file)
+        result.add(linted_dir)
+        result.stop_timer()
+        return result
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _try_facade_stdin_fix(

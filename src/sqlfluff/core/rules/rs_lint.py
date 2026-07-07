@@ -540,6 +540,16 @@ class RsSegment:
     def get_raw_segments(self) -> list[RsSegment]:
         return self.raw_segments
 
+    def count_segments(self, raw_only: bool = False) -> int:
+        # Mirrors ``BaseSegment.count_segments`` (used by ``LintedDir.add``
+        # for the per-file ``statistics`` record).
+        if self.segments:
+            self_count = 0 if raw_only else 1
+            return self_count + sum(
+                seg.count_segments(raw_only=raw_only) for seg in self.segments
+            )
+        return 1
+
     def select_children(
         self,
         start_seg: Optional["RsSegment"] = None,
@@ -998,6 +1008,7 @@ def facade_violations(
     config: Any,
     rules: list[Any],
     rst: Any = None,
+    rule_timing_sink: Optional[list[tuple[str, str, float]]] = None,
 ) -> Optional[list[Any]]:
     """Crawl ``rules`` over the arena façade and return their ``SQLLintError``s.
 
@@ -1008,7 +1019,13 @@ def facade_violations(
     ``rst`` may be a tree already parsed from ``source`` (the crawl is read-only,
     so a caller can share one parse across the gate checks, the pre-count and the
     fix loop instead of re-parsing the same source each time).
+
+    ``rule_timing_sink``, if given, collects ``(code, name, seconds)`` per rule
+    crawl — the shape of native ``rule_timings`` (linter.py:659-662), used by
+    the lint fast path to populate the per-file ``timings`` record.
     """
+    import time
+
     import sqlfluffrs
     from sqlfluff.core.linter.linted_file import LintedFile
 
@@ -1028,7 +1045,23 @@ def facade_violations(
     # source_str (e.g. CV10) and for correct source-position mapping.
     templated_file = rst.templated_file
     out: list[Any] = []
-    for rule in rules:
+    # The same per-rule progress bar native shows while crawling
+    # (linter.py:536-541/556). Read the configuration through the linter
+    # module at call time — that's the reference native's bars use (and the
+    # one tests patch), so enable/disable behaviour stays uniform.
+    from tqdm import tqdm
+
+    import sqlfluff.core.linter.linter as _linter_module
+
+    progress_bar_crawler = tqdm(
+        rules,
+        desc="lint by rules",
+        leave=False,
+        disable=_linter_module.progress_bar_configuration.disable_progress_bar,  # type: ignore[attr-defined]  # noqa: E501
+    )
+    for rule in progress_bar_crawler:
+        progress_bar_crawler.set_description(f"rule {rule.code}")
+        t0 = time.monotonic()
         lints, _, _, _ = rule.crawl(
             tree=root,
             dialect=dialect_obj,
@@ -1038,6 +1071,8 @@ def facade_violations(
             fname=fname,
             config=config,
         )
+        if rule_timing_sink is not None:
+            rule_timing_sink.append((rule.code, rule.name, time.monotonic() - t0))
         out.extend(lints)
     # Native passes every file's violations through
     # ``deduplicate_in_source_space`` (linter.py:848): dedupe on
