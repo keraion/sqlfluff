@@ -138,3 +138,43 @@ def test_facade_stdin_fix_defers_on_runaway() -> None:
         )
     )
     assert _try_facade_stdin_fix(linter, "select a FROM tbl\n", None) is None
+
+
+def test_format_command_uses_facade_fast_path(tmp_path, monkeypatch) -> None:
+    """`sqlfluff format` engages the façade fix fast path.
+
+    format shares _stdin_fix/_paths_fix with fix and its forced ruleset is
+    entirely façade-safe, so it fast-paths BY CONSTRUCTION — this test pins
+    that: with the engine on, the native fixing path must never run.
+    Verified separately: whole-testbed format output is byte-identical
+    engine-on vs native.
+    """
+    from click.testing import CliRunner
+
+    from sqlfluff.cli.commands import cli_format
+
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nuse_rust_engine = True\nuse_rust_parser = True\n"
+    )
+    src = "select a ,  b from tbl\n"
+    f = tmp_path / "dirty.sql"
+    f.write_text(src)
+
+    # If the façade hands ANY file back to native, these raise and the
+    # command exits non-zero.
+    def _boom(*a, **k):  # pragma: no cover
+        raise AssertionError("format must not reach the native fixing path")
+
+    monkeypatch.setattr(Linter, "lint_paths", _boom)
+    monkeypatch.setattr(Linter, "lint_string_wrapped", _boom)
+
+    formatted = "select\n    a,\n    b\nfrom tbl\n"
+    result = CliRunner().invoke(cli_format, [str(f)])
+    assert result.exit_code == 0, result.output
+    assert f.read_text() == formatted
+
+    # stdin flavour: output on stdout, same guarantee. (Explicit dialect:
+    # stdin doesn't see tmp_path's .sqlfluff, and no-dialect bails the gate.)
+    result = CliRunner().invoke(cli_format, ["--dialect", "ansi", "-"], input=src)
+    assert result.exit_code == 0, result.output
+    assert result.output == formatted
