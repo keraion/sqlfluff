@@ -1192,9 +1192,11 @@ def _facade_lint_file(
     if not _use_rust_engine(cfg, None):
         return None
     if not raw_file:
-        # An empty file lints clean either way, but the arena's bare ``file``
-        # node makes the statistics record differ (no end-of-file meta);
-        # native handles it trivially fast.
+        # Not façade-eligible: under a templater whose zero-byte render keeps
+        # a raw slice (e.g. ``raw``), native lexes a zero-width placeholder
+        # that LT12 lints — and the arena's bare ``file`` node also makes the
+        # statistics record differ (no end-of-file meta). Native handles it
+        # trivially fast.
         return None
     if "noqa" in raw_file.lower():
         return None  # ignore masks not applied on the façade path
@@ -1450,6 +1452,12 @@ def _try_facade_stdin_fix(
                 return None
         if not _use_rust_engine(config, None):
             return None
+        if not source:
+            # Not façade-eligible: under a templater whose zero-byte render
+            # keeps a raw slice (e.g. ``raw``), native lexes a zero-width
+            # placeholder that LT12 fixes to a single newline — the arena's
+            # bare ``file`` node can't reproduce that.
+            return None
         if "noqa" in source.lower():
             return None  # ignore masks not applied on the façade path
         if config.get("warnings"):
@@ -1612,6 +1620,11 @@ def _try_facade_paths_fix(
                     fname, linter.config
                 )
                 if not _use_rust_engine(cfg, None):
+                    remaining.append(fname)
+                    continue
+                if not raw_file:
+                    # Empty file -> native (see ``_try_facade_stdin_fix``:
+                    # LT12 lints raw-templated zero-byte renders).
                     remaining.append(fname)
                     continue
                 if "noqa" in raw_file.lower():

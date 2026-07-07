@@ -1081,12 +1081,15 @@ def facade_violations(
     import sqlfluffrs
     from sqlfluff.core.linter.linted_file import LintedFile
 
-    # An empty file has nothing to lint — native returns no violations. The
-    # arena's empty ``file`` node carries no pos_marker (native's gets a
-    # zero-width one), which some rule crawls assert on (e.g. JJ01), so don't
-    # crawl it at all. Mirrors the guard in ``facade_fix_loop``.
+    # An empty file is not façade-eligible: the arena's empty ``file`` node
+    # carries no pos_marker (native's gets a zero-width one), which some rule
+    # crawls assert on (e.g. JJ01) — and native is NOT always violation-free
+    # here: under a templater whose zero-byte render keeps a raw slice (e.g.
+    # ``raw``), native's lexer emits a zero-width placeholder that LT12 lints
+    # and fixes to a single newline. Fall back to native rather than report
+    # a clean result the native path may not produce.
     if not source:
-        return []
+        return None
     if rst is None:
         rst = sqlfluffrs.engine_parse_to_tree(source, fname, config, None, True)
     if rst is None:
@@ -1533,11 +1536,13 @@ def facade_fix_loop(
 
     import sqlfluffrs
 
-    # An empty file has nothing to fix. Short-circuit before the arena path: the
-    # Rust engine's empty ``file`` node carries no pos_marker (native's
-    # FileSegment gets a zero-width one), so the reconstruction pass
-    # (``generate_source_patches``) would assert on it. Native returns the empty
-    # source unchanged here too — with no violations (the sink stays empty).
+    # Crash guard for direct callers: the Rust engine's empty ``file`` node
+    # carries no pos_marker (native's FileSegment gets a zero-width one), so
+    # the reconstruction pass (``generate_source_patches``) would assert on
+    # it. NOTE: this does NOT always match native — under a templater whose
+    # zero-byte render keeps a raw slice (e.g. ``raw``), native lexes a
+    # zero-width placeholder that LT12 fixes to a single newline. The CLI
+    # gates therefore route empty sources to native before reaching here.
     if not source:
         return source
 
