@@ -1183,12 +1183,12 @@ def _facade_lint_file(
     import sqlfluffrs
     from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
     from sqlfluff.core.rules.rs_lint import (
-        FACADE_SAFE_RULES,
         FACADE_SAFE_RULES_DETECTION_UNSAFE,
         RsSegment,
         facade_ignore_mask,
         facade_unknown_rule_violations,
         facade_violations,
+        rule_is_facade_safe,
     )
 
     if not _use_rust_engine(cfg, None):
@@ -1204,14 +1204,13 @@ def _facade_lint_file(
     rules = list(rule_pack.rules)
     if not rules:
         return None
-    # Vetted rules crawl the façade; anything else (plugin rules) is handled
-    # by ``facade_unknown_rule_violations`` — native-crawled until its façade
-    # crawl earns promotion (see rs_lint for the verification protocol).
+    # Façade-safe rules (core allowlist or an explicit plugin
+    # ``rust_compatible`` opt-in) crawl the façade; anything else runs on
+    # the classic Python pipeline via ``facade_unknown_rule_violations``.
     safe_rules = [
         r
         for r in rules
-        if r.code in FACADE_SAFE_RULES
-        and r.code not in FACADE_SAFE_RULES_DETECTION_UNSAFE
+        if rule_is_facade_safe(r) and r.code not in FACADE_SAFE_RULES_DETECTION_UNSAFE
     ]
     unknown_rules = [r for r in rules if r not in safe_rules]
     t0 = time.monotonic()
@@ -1261,8 +1260,6 @@ def _facade_lint_file(
             fname,
             cfg,
             unknown_rules,
-            root,
-            tf,
             ignore_mask=ignore_mask,
             rule_timing_sink=rule_timings,
         )
@@ -1473,12 +1470,12 @@ def _try_facade_stdin_fix(
     """
     try:
         from sqlfluff.core.rules.rs_lint import (
-            FACADE_SAFE_RULES,
             FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
             facade_ignore_mask,
             facade_violations,
+            rule_is_facade_safe,
         )
 
         config = linter.config
@@ -1512,7 +1509,8 @@ def _try_facade_stdin_fix(
             return None
         rule_pack = linter.get_rulepack(config=config)
         rules = list(rule_pack.rules)
-        if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
+        # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
+        if not rules or any(not rule_is_facade_safe(r) for r in rules):
             return None
         import sqlfluffrs
 
@@ -1630,12 +1628,12 @@ def _try_facade_paths_fix(
         from sqlfluff.core.linter.discovery import paths_from_path
         from sqlfluff.core.linter.linted_file import LintedFile
         from sqlfluff.core.rules.rs_lint import (
-            FACADE_SAFE_RULES,
             FACADE_SAFE_RULES_DETECTION_UNSAFE,
             RsSegment,
             facade_fix_loop,
             facade_ignore_mask,
             facade_violations,
+            rule_is_facade_safe,
         )
 
         # GATE: only engage for the write-in-place, engine-enabled case.
@@ -1692,7 +1690,8 @@ def _try_facade_paths_fix(
                     continue
                 rule_pack = linter.get_rulepack(config=cfg)
                 rules = list(rule_pack.rules)
-                if not rules or any(r.code not in FACADE_SAFE_RULES for r in rules):
+                # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
+                if not rules or any(not rule_is_facade_safe(r) for r in rules):
                     remaining.append(fname)
                     continue
                 rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)

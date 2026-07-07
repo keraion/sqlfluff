@@ -174,30 +174,29 @@ The sqlfluff-testbed generator now sprinkles inline masks, unused
 directives and disable/enable ranges through the models so mask parity
 stays exercised end-to-end in every testbed run.
 
-## Plugin (unknown) rules on the lint fast path (2026-07-07)
+## Plugin rules: explicit ``rust_compatible`` opt-in (2026-07-07)
 
-Rules outside FACADE_SAFE_RULES no longer route the whole lint run to
-native. The gate splits the crawl: vetted rules crawl the façade;
-unknown rules go through ``rs_lint.facade_unknown_rule_violations`` —
-optimistic but VERIFIED. While a rule is unproven, its REPORTED results
-come from a crawl of a native reference parse (one extra native parse
-per file — correct by construction), and its façade crawl runs alongside
-purely as evidence: one non-trivial byte-match (the rule actually fired)
-promotes it to façade-only for the rest of the process; any mismatch or
-crash pins it to native crawls. The promotion cache is
-``rs_lint._UNKNOWN_RULE_VERDICTS``, keyed ``(rule_code, dialect)``.
+Plugin rules run on the classic Python pipeline unless their author
+declares ``rust_compatible = True`` on the rule class (see
+``BaseRule.rust_compatible`` and the custom-rules guide). Effective
+façade eligibility is ``rs_lint.rule_is_facade_safe``: the
+centrally-vetted core allowlist (FACADE_SAFE_RULES) OR the flag — and it
+applies to BOTH the lint and fix fast paths (an opted-in rule's fixes
+flow through the arena like core rules'). Undeclared rules no longer
+disqualify a lint run: the gate splits the crawl — safe rules on the
+façade, undeclared rules crawled on a native reference parse
+(``facade_unknown_rule_violations``, correct by construction, one extra
+python parse per file, INFO-logged) — and merges. Undeclared rules DO
+still route fix runs to native.
 
-Why verification instead of crash-only fallback: the façade's synthetic
-segment classes subclass only RawSegment/BaseSegment, so a plugin rule
-using ``isinstance(seg, KeywordSegment)`` finds NOTHING on the façade
-without crashing — silent divergence that only a native comparison can
-catch. The dangerous case (façade under-reports, first file happens to
-be clean) is handled by requiring the rule to actually FIRE before
-promotion; trivially-empty matches keep it provisional (native-crawled).
-
-The FIX gates still route runs containing unknown rules to native — fix
-verification would need the whole loop run twice, and unknown-rule fixes
-would need spec-ingestion vetting (future milestone).
+Why an explicit flag rather than attempt-and-fall-back: the façade's
+synthetic segment classes subclass only RawSegment/BaseSegment, so a
+plugin rule using ``isinstance(seg, KeywordSegment)`` finds NOTHING on
+the façade *without crashing* — silent divergence, nothing catchable to
+fall back on. (An earlier same-day design auto-promoted rules whose
+shadow façade crawl byte-matched native; replaced by the flag — explicit
+author contract over runtime guessing, and no double-crawl overhead.)
+The example plugin declares the flag as a reference.
 
 ## Pitfall: pinning the native side of ANY parity probe
 

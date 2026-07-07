@@ -1008,31 +1008,18 @@ def facade_ignore_mask(
     return IgnoreMask.from_tree(root, allowed_rules_ref_map)  # type: ignore[arg-type]
 
 
-# Runtime verdicts for rules OUTSIDE the vetted façade allowlist (plugin
-# rules), keyed ``(rule_code, dialect)``. ``True`` = promoted: the rule's
-# façade crawl byte-matched a native crawl on a file where it actually fired
-# (non-trivial evidence), so it runs façade-only from then on. ``False`` =
-# pinned to native: the façade crawl diverged or crashed — its results are
-# never trusted again this process. Absent = provisional: native results are
-# used while the comparison keeps looking for promotion evidence.
-# Process-lifetime by design (one CLI invocation); config variance between
-# files of one run is not re-keyed — acceptable because unpromoted rules
-# always use native results anyway, and promotion requires an exact match
-# under the config where it fired.
-_UNKNOWN_RULE_VERDICTS: dict[tuple[str, str], bool] = {}
+def rule_is_facade_safe(rule: Any) -> bool:
+    """Whether ``rule`` may run over the arena façade.
 
-
-def _lint_compare_keys(lints: list[Any]) -> list[tuple]:
-    """Comparison keys for promotion checks: position, text and fixability."""
-    return sorted(
-        (
-            v.rule_code(),
-            v.line_no,
-            v.line_pos,
-            v.description,
-            len(getattr(v, "fixes", []) or []),
-        )
-        for v in lints
+    Two ways in: membership of the centrally-vetted core allowlist
+    (:data:`FACADE_SAFE_RULES` — byte-parity proven over the corpora), or an
+    EXPLICIT opt-in by the rule author via ``BaseRule.rust_compatible`` (the
+    plugin contract: the rule asserts it behaves identically over the façade
+    wrappers — ``is_type`` navigation, no ``isinstance`` against concrete
+    segment classes). Anything else runs on the classic Python pipeline.
+    """
+    return rule.code in FACADE_SAFE_RULES or bool(
+        getattr(rule, "rust_compatible", False)
     )
 
 
@@ -1041,23 +1028,17 @@ def facade_unknown_rule_violations(
     fname: str,
     config: Any,
     unknown_rules: list[Any],
-    root: "RsSegment",
-    templated_file: Any,
     ignore_mask: Any = None,
     rule_timing_sink: Optional[list[tuple[str, str, float]]] = None,
 ) -> Optional[list[Any]]:
-    """Violations for rules outside the façade allowlist (plugin rules).
+    """Violations for rules NOT façade-safe (see :func:`rule_is_facade_safe`).
 
-    Optimistic but VERIFIED: an unvetted rule might crawl the façade
-    perfectly (the wrappers duck-type ``BaseSegment``) — or silently
-    diverge (e.g. ``isinstance(seg, KeywordSegment)`` is False on the
-    synthetic façade classes, so such a rule finds nothing without
-    crashing). A crash-only fallback can't see that, so while a rule is
-    unproven its REPORTED results always come from a crawl of a native
-    reference parse (correct by construction), and its façade crawl runs
-    alongside purely as evidence: one non-trivial byte-match promotes the
-    rule (façade-only afterwards — the native parse is dropped); any
-    mismatch or crash pins it to native crawls for the process.
+    These run on the classic Python pipeline BY DESIGN: a native reference
+    parse of the source, crawled natively — correct by construction. (Rules
+    can opt out of this cost by declaring ``rust_compatible = True``; without
+    the declaration the façade is never crawled — an incompatible rule, e.g.
+    one using ``isinstance`` against concrete segment classes, would diverge
+    silently rather than crash, so there is nothing safe to "attempt".)
 
     Returns ``None`` when the native reference parse fails — the caller
     routes the file to native.
@@ -1066,68 +1047,39 @@ def facade_unknown_rule_violations(
 
     from sqlfluff.core.linter import Linter as _Linter
 
-    dialect = str(config.get("dialect") or "")
     dialect_obj = config.get("dialect_obj")
-    out: list[Any] = []
 
-    def crawl(rule: Any, tree: Any, tf: Any) -> list[Any]:
+    # Native reference parse — a python tree, by design. INFO: expected, but
+    # visible so per-file python parses are attributable when profiling.
+    linter_logger.info(
+        "Façade lint: native reference parse of %s for non-rust_compatible rules %s",
+        fname,
+        [r.code for r in unknown_rules],
+    )
+    # A bare Linter: the caller's may carry a formatter, and ``parse_string``
+    # dispatches output through it.
+    parsed = _Linter(config=config).parse_string(source, fname=fname)
+    nat_tree = parsed.tree
+    if nat_tree is None:
+        return None
+    nat_variant = parsed.parsed_variants[0] if parsed.parsed_variants else None
+    nat_tf = getattr(nat_variant, "templated_file", None)
+
+    out: list[Any] = []
+    for rule in unknown_rules:
         t0 = time.monotonic()
         lints, _, _, _ = rule.crawl(
-            tree=tree,
+            tree=nat_tree,
             dialect=dialect_obj,
             fix=False,
-            templated_file=tf,
+            templated_file=nat_tf,
             ignore_mask=ignore_mask,
             fname=fname,
             config=config,
         )
         if rule_timing_sink is not None:
             rule_timing_sink.append((rule.code, rule.name, time.monotonic() - t0))
-        return lints
-
-    pending = [
-        r
-        for r in unknown_rules
-        if _UNKNOWN_RULE_VERDICTS.get((r.code, dialect)) is not True
-    ]
-    for rule in unknown_rules:
-        if rule not in pending:  # promoted -> façade-only
-            out.extend(crawl(rule, root, templated_file))
-
-    if pending:
-        # Native reference parse — a python tree, by design, while these
-        # rules are unproven. INFO (not warning): expected, but visible so
-        # per-file python parses are attributable when profiling.
-        linter_logger.info(
-            "Façade lint: native reference parse of %s for unproven rules %s",
-            fname,
-            [r.code for r in pending],
-        )
-        # A bare Linter: the caller's may carry a formatter, and
-        # ``parse_string`` dispatches output through it.
-        parsed = _Linter(config=config).parse_string(source, fname=fname)
-        nat_tree = parsed.tree
-        if nat_tree is None:
-            return None
-        nat_variant = parsed.parsed_variants[0] if parsed.parsed_variants else None
-        nat_tf = getattr(nat_variant, "templated_file", None)
-        for rule in pending:
-            nat_lints = crawl(rule, nat_tree, nat_tf)
-            out.extend(nat_lints)  # ALWAYS the native results while unproven
-            key = (rule.code, dialect)
-            if _UNKNOWN_RULE_VERDICTS.get(key) is False:
-                continue  # pinned: don't waste the comparison crawl
-            try:
-                fac_lints = crawl(rule, root, templated_file)
-            except Exception:  # noqa: BLE001 — a crash IS the verdict
-                _UNKNOWN_RULE_VERDICTS[key] = False
-                continue
-            if _lint_compare_keys(fac_lints) == _lint_compare_keys(nat_lints):
-                if nat_lints:
-                    # Fired and matched byte-for-byte: promote.
-                    _UNKNOWN_RULE_VERDICTS[key] = True
-            else:
-                _UNKNOWN_RULE_VERDICTS[key] = False
+        out.extend(lints)
     return out
 
 

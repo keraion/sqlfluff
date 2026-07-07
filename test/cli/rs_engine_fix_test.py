@@ -178,3 +178,22 @@ def test_format_command_uses_facade_fast_path(tmp_path, monkeypatch) -> None:
     result = CliRunner().invoke(cli_format, ["--dialect", "ansi", "-"], input=src)
     assert result.exit_code == 0, result.output
     assert result.output == formatted
+
+
+def test_facade_fix_plugin_rule_opt_in() -> None:
+    """A ``rust_compatible`` plugin rule is eligible for the FIX fast path.
+
+    Example_L001 (lint-only here — its finding is unfixable) plus CP01: the
+    run engages the fast path, CP01's fixes apply, and the plugin finding
+    counts as unfixable — byte- and count-identical to native.
+    """
+    src = "select a from foo order by bar\n"
+    linter = _linter("Example_L001,CP01")
+    result = _try_facade_stdin_fix(linter, src, None)
+    assert result is not None  # flagged plugin rule doesn't disqualify
+    fixed, num_unfixable = result
+
+    nat_cfg = FluffConfig(overrides={"dialect": "ansi", "rules": "Example_L001,CP01"})
+    nat_res = Linter(config=nat_cfg).lint_string(src, fix=True)
+    assert fixed == nat_res.fix_string()[0]
+    assert num_unfixable == 1  # the Example_L001 finding has no fixes

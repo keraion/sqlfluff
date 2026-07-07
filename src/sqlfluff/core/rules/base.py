@@ -424,6 +424,19 @@ class BaseRule(metaclass=RuleMetaclass):
     # a line to the docstring.
     is_fix_compatible = False
 
+    # OPT-IN for the Rust-engine façade fast paths (plugin rules only; core
+    # rules are centrally vetted via ``rs_lint.FACADE_SAFE_RULES``). Declaring
+    # ``rust_compatible = True`` asserts this rule behaves identically when
+    # crawling the arena façade's segment wrappers instead of native
+    # ``BaseSegment`` trees. In practice that means: use ``is_type``/type
+    # strings and the functional API rather than ``isinstance`` against
+    # concrete segment classes (the façade's synthetic classes only subclass
+    # ``RawSegment``/``BaseSegment``), and anchor fixes on segments from the
+    # crawled tree. Rules that don't declare this run on the classic Python
+    # pipeline (a native reference parse), even when the Rust engine handles
+    # the rest of the run.
+    rust_compatible = False
+
     # Add comma separated string to Base Rule to ensure that it uses the same
     # Configuration that is defined in the Config.py file
     split_comma_separated_string = staticmethod(split_comma_separated_string)

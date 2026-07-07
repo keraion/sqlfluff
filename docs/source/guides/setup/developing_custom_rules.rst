@@ -64,6 +64,15 @@ help you decide what to develop:
      implement a level of complexity and edge case handling which may not
      be necessary for your organisation.
 
+   * If the Rust engine is in use (``use_rust_engine``), custom rules run
+     on the classic Python pipeline by default. A rule can OPT IN to the
+     Rust fast paths by declaring ``rust_compatible = True``, asserting it
+     behaves identically over the engine's segment wrappers: in practice,
+     navigate with ``is_type``/type strings and the functional API rather
+     than ``isinstance`` against concrete segment classes, and anchor
+     fixes on segments from the crawled tree. The `SQLFluff example
+     plugin`_ declares it as a reference.
+
 3. How am I going to roll out my rule to the team? Thinking through this
    aspect of rule development is just as important as the technical aspect.
    Spending a lot of time on rule development for it to be rejected by

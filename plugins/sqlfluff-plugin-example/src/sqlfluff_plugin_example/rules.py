@@ -43,6 +43,10 @@ class Rule_Example_L001(BaseRule):
     config_keywords = ["forbidden_columns"]
     crawl_behaviour = SegmentSeekerCrawler({"orderby_clause"})
     is_fix_compatible = True
+    # Opt in to the Rust-engine façade fast paths: this rule only uses
+    # type-string navigation and ``seg.raw`` (no isinstance against concrete
+    # segment classes), so it behaves identically over the façade wrappers.
+    rust_compatible = True
 
     def __init__(self, *args, **kwargs):
         """Overwrite __init__ to set config."""
