@@ -1299,8 +1299,23 @@ class TableBuilder:
         )
 
     def _handle_token(self, grammar, parse_context) -> GrammarInstData:
-        """Convert Token (BaseSegment without match_grammar) to GrammarInst."""
+        """Convert Token (BaseSegment without match_grammar) to GrammarInst.
+
+        Aux block layout: ``[type_id, class_name_id, ct_count, ct_ids...]``.
+        Native re-mints the matched token as a fresh instance of the class
+        (e.g. ``Ref("LiteralSegment")`` over a lexed ``numeric_literal`` token
+        yields a ``LiteralSegment`` typed ``literal``), so the runtime needs
+        the class name and ``_class_types`` to reproduce that — not just the
+        type string this variant used to store directly in the offsets slot.
+        """
         type_id = self._add_string(grammar.type)
+        class_id = self._add_string(grammar.__name__)
+        class_types = sorted(getattr(grammar, "_class_types", frozenset()))
+        aux_offset = len(self.aux_data)
+        self.aux_data.append(type_id)
+        self.aux_data.append(class_id)
+        self.aux_data.append(len(class_types))
+        self.aux_data.extend(self._add_string(t) for t in class_types)
         return GrammarInstData(
             variant="Token",
             flags=0,
@@ -1310,7 +1325,7 @@ class TableBuilder:
             min_times=0,
             first_terminator_idx=len(self.terminators),
             terminator_count=0,
-            aux_data_offset=type_id,
+            aux_data_offset=aux_offset,
             simple_hint_idx=0,
             comment=f'Token("{grammar.type}")',
         )

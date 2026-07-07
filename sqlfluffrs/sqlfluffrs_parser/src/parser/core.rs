@@ -66,17 +66,15 @@ fn aux_block_bounds(
 ) -> (usize, usize) {
     let idx = grammar_id.get() as usize;
     let aux_start = tables.aux_data_offsets[idx] as usize;
-    let next_aux_off = tables
-        .aux_data_offsets
-        .get(idx + 1)
-        .map(|&off| off as usize)
-        .unwrap_or_else(|| tables.aux_data.len());
-    let aux_end = if next_aux_off > aux_start {
-        next_aux_off
-    } else {
-        tables.aux_data.len()
-    };
-    (aux_start, aux_end)
+    // The end bound is only a safety clamp: every parser aux block is
+    // self-describing (fixed header + count-prefixed id lists), so readers
+    // never cross into the next block. Deriving the end from the NEXT
+    // instruction's offsets slot is WRONG — that slot is not an aux offset
+    // for every variant (e.g. ``Token`` stores a string id there), and a
+    // small value there used to TRUNCATE this block's class_types tail
+    // (seen as doris ``end_bracket`` tokens losing the ``symbol`` class
+    // type, diverging from native in reflow's violation descriptions).
+    (aux_start, tables.aux_data.len())
 }
 
 /// Diagnostic counters accumulated during a parse.
@@ -1398,10 +1396,19 @@ impl<'a> Parser<'a> {
         // Extract token_type from tables
         let tables = self.grammar_ctx.tables();
 
-        // Token stores token_type string id in aux_data at the instruction's
-        // aux_data_offsets index (the generator emits the type id there).
-        let token_type_id = tables.aux_data_offsets[grammar_id.get() as usize];
+        // Token aux block: [type_id, class_name_id, ct_count, ct_ids...].
+        // (Older tables stored the type id directly in the offsets slot; the
+        // generator now emits a real aux block so the match can re-mint the
+        // token as the class, like native does for a bare raw-class grammar.)
+        let (aux_start, aux_end) = aux_block_bounds(tables, grammar_id);
+        let token_type_id = tables.aux_data[aux_start];
         let token_type = tables.get_string(token_type_id).to_string();
+        let class_name = if aux_start + 1 < aux_end {
+            Some(tables.get_string(tables.aux_data[aux_start + 1]).to_string())
+        } else {
+            None
+        };
+        let class_type_ids = read_string_ids_from_aux(tables, aux_start + 2, aux_end);
 
         vdebug!(
             "Token[table]: pos={}, token_type='{}'",
@@ -1423,10 +1430,33 @@ impl<'a> Parser<'a> {
                     token_pos
                 );
 
-                // Return MatchResult spanning this single token
-                // The apply() method will retrieve token data from the tokens array
+                // Re-mint the token as the grammar's class, like native: a
+                // bare raw-class grammar (e.g. ``Ref("LiteralSegment")`` over
+                // a lexed ``numeric_literal``) yields a fresh instance of the
+                // CLASS — type and class_types from the class, no lexer
+                // instance types carried over.
+                let matched_class = class_name.map(|name| MatchedClass {
+                    class_name: Cow::Owned(name),
+                    segment_type: Some(Cow::Owned(token_type.clone())),
+                    class_type: Some(Cow::Owned(token_type.clone())),
+                    segment_kwargs: SegmentKwargs {
+                        instance_types: Some(Vec::new()),
+                        class_types: if class_type_ids.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                class_type_ids
+                                    .iter()
+                                    .map(|id| tables.get_string(*id).to_string())
+                                    .collect(),
+                            )
+                        },
+                        ..Default::default()
+                    },
+                });
                 Ok(MatchResult {
                     matched_slice: token_pos..token_pos + 1,
+                    matched_class,
                     ..Default::default()
                 })
             }
@@ -1685,6 +1715,16 @@ impl<'a> Parser<'a> {
                 class_type: Some(Cow::Borrowed("symbol")),
                 segment_kwargs: SegmentKwargs {
                     instance_types: Some(vec![start_bracket_type.to_string()]),
+                    // SymbolSegment._class_types — like handle_string_parser
+                    // applies from its aux table. Without it the node keeps
+                    // the LEXED token's class_types ({base, raw}) and
+                    // `is_type("symbol")` diverges from native (visible in
+                    // reflow's pretty_segment_name descriptions).
+                    class_types: Some(vec![
+                        "base".to_string(),
+                        "raw".to_string(),
+                        "symbol".to_string(),
+                    ]),
                     ..Default::default()
                 },
             }),
@@ -1739,6 +1779,12 @@ impl<'a> Parser<'a> {
                 class_type: Some(Cow::Borrowed("symbol")),
                 segment_kwargs: SegmentKwargs {
                     instance_types: Some(vec![end_bracket_type.to_string()]),
+                    // SymbolSegment._class_types — see the opening bracket note.
+                    class_types: Some(vec![
+                        "base".to_string(),
+                        "raw".to_string(),
+                        "symbol".to_string(),
+                    ]),
                     ..Default::default()
                 },
             }),
