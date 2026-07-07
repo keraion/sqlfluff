@@ -31,7 +31,9 @@ use sqlfluffrs_dialects::Dialect;
 use sqlfluffrs_types::token::CaseFold;
 use sqlfluffrs_types::{PositionMarker, Slice};
 
-use super::revalidate::{revalidate_leaf_descriptors, LeafDescriptor, ParseLimits, RevalidateOutcome};
+use super::revalidate::{
+    revalidate_leaf_descriptors, LeafDescriptor, ParseLimits, RevalidateOutcome,
+};
 use super::types::{MetaType, Node, RawSegmentKwargs};
 
 /// A source-level edit attached to a segment, mirroring Python's ``SourceFix``
@@ -543,8 +545,14 @@ impl Arena {
             if let Some(root_pm) = self.nodes[self.root.idx()].pos_marker.as_ref() {
                 let tf = Arc::clone(&root_pm.templated_file);
                 self.nodes[id.idx()].pos_marker = Some(PositionMarker::new(
-                    Slice { start: s0, stop: s1 },
-                    Slice { start: t0, stop: t1 },
+                    Slice {
+                        start: s0,
+                        stop: s1,
+                    },
+                    Slice {
+                        start: t0,
+                        stop: t1,
+                    },
                     &tf,
                     Some(wln),
                     Some(wlp),
@@ -1448,15 +1456,18 @@ impl Arena {
 
     // -- position pass (port of BaseSegment._position_segments) --------------
 
-    /// Marker equality for the recurse-on-change check.  Mirrors the native
-    /// dataclass `__eq__` (slices + working position; the templated file
-    /// compares by identity in practice — one `Arc` per tree).
+    /// Marker equality, mirroring native `PositionMarker.__eq__`
+    /// (markers.py:67-70): the WORKING LOCATION only — not the slices.
+    /// This quirk is semantic in `_position_segments`: at a jinja loop
+    /// boundary the source positions of templated-space neighbours are
+    /// non-monotonic, so an inserted point segment's start/end candidates
+    /// share a working location but carry different source slices. Native's
+    /// working-loc equality keeps the POINT marker (start wins); comparing
+    /// slices here instead widened via `from_points` and produced an
+    /// INVERTED source slice (start > stop), which silently suppressed the
+    /// segment's source patch at reconstruction.
     fn marker_eq(a: &PositionMarker, b: &PositionMarker) -> bool {
-        a.source_slice == b.source_slice
-            && a.templated_slice == b.templated_slice
-            && a.working_line_no == b.working_line_no
-            && a.working_line_pos == b.working_line_pos
-            && Arc::ptr_eq(&a.templated_file, &b.templated_file)
+        a.working_line_no == b.working_line_no && a.working_line_pos == b.working_line_pos
     }
 
     /// The issue-#6261 skip: a zero-length *templated* placeholder (a jinja
@@ -3237,5 +3248,4 @@ mod tests {
         let arena = Arena::from_node(&file_tree());
         assert!(arena.validate_staged(&Dialect::Ansi, ParseLimits::default()));
     }
-
 }
