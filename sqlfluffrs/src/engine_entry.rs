@@ -249,12 +249,17 @@ pub fn engine_parse_paths<'py>(
     let _ = parse_statistics; // reserved (timing/stats not surfaced yet)
     let is_stdin = paths.iter().any(|p| p == "-");
 
-    // (fname, raw) work-list — Rust drives discovery / file reading.
-    let mut files: Vec<(String, String)> = Vec::new();
+    // (fname, raw, per-file config) work-list — Rust drives discovery / file
+    // reading. The per-file config is built ONCE during the size gate below
+    // and reused for templating (a second `make_child_from_path` round-trip
+    // per file measurably slowed corpus parses); `None` for stdin, whose
+    // child config is the root config itself.
+    let mut files: Vec<(String, String, Option<Bound<'py, PyAny>>)> = Vec::new();
     if is_stdin {
         files.push((
             stdin_filename.unwrap_or_else(|| "stdin".to_string()),
             stdin_content.unwrap_or_default(),
+            None,
         ));
     } else {
         let exts: Vec<String> = read_str_list(&config, "sql_file_exts")
@@ -278,11 +283,10 @@ pub fn engine_parse_paths<'py>(
             // BEFORE reading; over-limit files are skipped with the same
             // warning (via the same `sqlfluff.linter` logger) and excluded
             // from the output, exactly like the native parse path.
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("require_dialect", false)?;
+            let file_cfg = config.call_method("make_child_from_path", (&fname,), Some(&kwargs))?;
             let limit = {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("require_dialect", false)?;
-                let file_cfg =
-                    config.call_method("make_child_from_path", (&fname,), Some(&kwargs))?;
                 let val = file_cfg.call_method1("get", ("large_file_skip_byte_limit",))?;
                 val.extract::<i64>().unwrap_or_else(|_| {
                     val.extract::<String>()
@@ -311,14 +315,22 @@ pub fn engine_parse_paths<'py>(
             }
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
-            files.push((fname, raw));
+            files.push((fname, raw, Some(file_cfg)));
         }
     }
 
     let formatter_ref = formatter.as_ref();
     let mut out = Vec::with_capacity(files.len());
-    for (fname, raw) in files {
-        let child = child_config(&config, &fname, is_stdin, &raw)?;
+    for (fname, raw, file_cfg) in files {
+        // Reuse the per-file config from the size gate (mirrors
+        // ``child_config``: apply inline directives before templating).
+        let child = match file_cfg {
+            Some(cfg) => {
+                cfg.call_method1("process_raw_file_for_config", (&raw, &fname))?;
+                cfg
+            }
+            None => child_config(&config, &fname, is_stdin, &raw)?,
+        };
         let (variants, templater_violations) =
             render_via_python(py, &child, &raw, &fname, formatter_ref)?;
 
