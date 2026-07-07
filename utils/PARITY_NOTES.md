@@ -112,6 +112,48 @@ Any parity probe comparing templaters in one process is affected. Not
 fixed here (rust-side, upstream-shared); the key needs the slicing (or a
 content hash), or the cache needs to go.
 
+## Templated (jinja) sources on the façade fast paths (2026-07-07)
+
+Templated sources are now façade-eligible for lint AND fix when the render
+is single-variant and violation-free (`RsTree.num_variants` /
+`.templater_violations`, populated by `engine_parse_to_tree`); multi-variant
+or violation-bearing renders route to native (native lints EVERY variant and
+reports TMP violations). Vetting harnesses:
+`utils/facade_templated_lint_parity.py` and
+`utils/facade_templated_fix_parity.py` — both sweep
+`test/fixtures/templater/**` (per-fixture configs honoured) plus the
+sqlfluff-testbed models through the PRODUCTION gate functions. Baseline:
+0 divergences / 0 errors on both (218 eligible of 277).
+
+Getting there fixed four real bugs, all found via fix-output byte diffs:
+
+1. **Arena position pass `marker_eq`** compared full markers where native
+   `PositionMarker.__eq__` (markers.py:67) compares ONLY the working
+   location. At a jinja-loop boundary (source positions non-monotonic in
+   templated order) the widen-vs-point decision then widened via
+   `from_points` into an INVERTED source slice, silently suppressing that
+   segment's source patch.
+2. **FFI slices carried `step=1`** (`PySlice` → `slice(a, b, 1)`), and
+   `slice(a, b, 1) != slice(a, b, None)` in Python — breaking equality
+   against native-built slices (live victim: FixPatch dedupe over repeated
+   loop regions applied a patch twice).
+3. **`facade_fix_loop_v3` skipped `merge_source_patches`** — native routes
+   even single-variant patches through it (dedupe + drop same-position
+   conflicting insertions, e.g. two different indents at a block-tag
+   boundary).
+4. **`RsSegment.edit(source_fixes=...)` on a placeholder** (JJ01's fix
+   shape) fell into the raw-edit branch: the staged replacement lost
+   `block_type` ('skipped_source') and its summary `source_str`, misleading
+   LT02's jinja-block alignment on the next crawl. Now mirrors
+   `TemplateSegment.edit` (keep source_str/block_type/block_uuid, merge
+   source fixes).
+
+Detection-side: `facade_violations` now applies native's
+`Linter.remove_templated_errors` (violations anchored in non-literal
+regions are dropped unless semantically literal or the rule targets
+templated code), and `facade_fix_loop_v3` applies it to the harvested
+`lint_sink` like native's `initial_linting_errors` filter.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

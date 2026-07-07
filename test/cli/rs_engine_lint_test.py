@@ -128,3 +128,45 @@ def test_facade_paths_lint_routing(tmp_path) -> None:
         if record["filepath"].endswith("dirty.sql")
     ]
     assert [v["code"] for v in records[0]["violations"]] == ["CP01", "CP01"]
+
+
+def test_facade_lint_templated_eligibility(tmp_path) -> None:
+    """Templated sources are façade-eligible; violation-bearing renders route.
+
+    A clean jinja render lints on the fast path (native-identical result);
+    a render with templater violations (undefined variable) must return
+    ``None`` so native reports the TMP violation.
+    """
+    from sqlfluff.cli.commands import _facade_lint_file
+    from sqlfluff.core import FluffConfig
+
+    def cfg(rust: bool) -> FluffConfig:
+        return FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "templater": "jinja",
+                "rules": "CP01",
+                "use_rust_engine": rust,
+                "use_rust_parser": rust,
+                "use_rust_rules": rust,
+            }
+        )
+
+    clean = "{% set t = 'tbl' %}select a from {{ t }}\n"
+    c = cfg(True)
+    linted = _facade_lint_file(clean, "clean.sql", c, Linter(config=c))
+    assert linted is not None  # templated but eligible
+    fac = sorted(
+        (v.rule_code(), v.line_no, v.line_pos)
+        for v in linted.violations
+        if isinstance(v, SQLLintError)
+    )
+    nat = sorted(
+        (v.rule_code(), v.line_no, v.line_pos)
+        for v in Linter(config=cfg(False)).lint_string(clean).violations
+        if isinstance(v, SQLLintError)
+    )
+    assert fac == nat
+
+    undef = "select a from {{ undefined_table_name }}\n"
+    assert _facade_lint_file(undef, "undef.sql", c, Linter(config=c)) is None

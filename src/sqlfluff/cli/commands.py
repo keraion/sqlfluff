@@ -1215,10 +1215,17 @@ def _facade_lint_file(
     if next(root.recursive_crawl("unparsable"), None) is not None:
         return None  # parse error -> native (PRS violations + exit code)
     tf = rst.templated_file
-    if tf is None or getattr(tf, "source_str", None) != getattr(
-        tf, "templated_str", None
-    ):
-        return None  # templated -> native (templater violations)
+    if tf is None:
+        return None
+    # Templated sources are eligible (arena markers carry the full source
+    # mapping) EXCEPT when the render itself needs native handling: native
+    # lints EVERY variant and merges (the arena tree is only the first),
+    # and reports templater violations alongside lint results (which the
+    # façade LintedFile below would drop).
+    if getattr(rst, "num_variants", 1) > 1:
+        return None
+    if getattr(rst, "templater_violations", None):
+        return None
     rule_timings: list[tuple[str, str, float]] = []
     t1 = time.monotonic()
     violations = facade_violations(
@@ -1477,14 +1484,17 @@ def _try_facade_stdin_fix(
         # "Unfixable violations detected") and we must not swallow them.
         if next(RsSegment(rst.root).recursive_crawl("unparsable"), None) is not None:
             return None
-        # Likewise route any *templated* source to native: the façade path
-        # can't observe templater (TMP) violations — e.g. an undefined jinja
-        # variable renders differently and must abort the fix — so we only
-        # handle sources that are literal (source == templated).
+        # Templated sources are eligible (fix reconstruction runs native
+        # ``generate_source_patches`` against the real TemplatedFile, which
+        # only patches literal regions) EXCEPT when the render itself needs
+        # native handling: multi-variant renders (native lints/fixes over
+        # every variant) and violation-bearing renders (TMP reporting).
         tf = rst.templated_file
-        if tf is None or getattr(tf, "source_str", None) != getattr(
-            tf, "templated_str", None
-        ):
+        if tf is None:
+            return None
+        if getattr(rst, "num_variants", 1) > 1:
+            return None
+        if getattr(rst, "templater_violations", None):
             return None
         limit = int(config.get("runaway_limit"))
         # Reuse the tree just parsed for the gate check (the fix loop mutates it)
@@ -1651,13 +1661,17 @@ def _try_facade_paths_fix(
                 if next(root.recursive_crawl("unparsable"), None) is not None:
                     remaining.append(fname)
                     continue
-                # Likewise route any *templated* file to native: the façade path
-                # can't observe templater (TMP) violations here, so we only handle
-                # files whose source is literal (source == templated).
+                # Templated sources are eligible except when the render needs
+                # native handling (see ``_try_facade_stdin_fix``): multi-variant
+                # or violation-bearing renders route to native.
                 tf = rst.templated_file
-                if tf is None or getattr(tf, "source_str", None) != getattr(
-                    tf, "templated_str", None
-                ):
+                if tf is None:
+                    remaining.append(fname)
+                    continue
+                if getattr(rst, "num_variants", 1) > 1:
+                    remaining.append(fname)
+                    continue
+                if getattr(rst, "templater_violations", None):
                     remaining.append(fname)
                     continue
                 # The fix loop mutates ``rst`` in place; hand it the same tree

@@ -368,3 +368,123 @@ def test_facade_lint_dedupes_like_native() -> None:
     assert [(v.rule_code(), v.line_no, v.line_pos) for v in fac] == [
         (v.rule_code(), v.line_no, v.line_pos) for v in nat
     ]
+
+
+# ============================================================================
+# Templated-source (jinja) façade support
+# ============================================================================
+
+_JINJA_LOOP_SRC = (
+    "{% set cols = ['a', 'b'] %}\n"
+    "select\n"
+    "    id,\n"
+    "{% for c in cols %}\n"
+    "    sum({{ c }}) as total_{{ c }}{{ ',' if not loop.last }}\n"
+    "{% endfor %}\n"
+    "from tbl\n"
+    "group by id;\n"
+)
+
+
+def _jinja_cfg(rust: bool, rules: str) -> FluffConfig:
+    return FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "templater": "jinja",
+            "rules": rules,
+            "use_rust_parser": rust,
+            "use_rust_engine": rust,
+            "use_rust_rules": rust,
+        }
+    )
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_lint_templated_source_matches_native() -> None:
+    """facade_violations on a jinja source matches native.
+
+    Including the templated-area filter: violations anchored in non-literal
+    regions are dropped unless the rule targets templated code.
+    """
+    from sqlfluff.core.errors import SQLLintError
+    from sqlfluff.core.rules.rs_lint import facade_violations
+
+    rules_str = "CP01,LT01,LT02,LT09,JJ01"
+    cfg = _jinja_cfg(True, rules_str)
+    lnt = Linter(config=cfg)
+    rules = list(lnt.get_rulepack(config=cfg).rules)
+    fac = facade_violations(_JINJA_LOOP_SRC, "<test>", cfg, rules)
+    assert fac is not None
+    fac_keys = sorted((v.rule_code(), v.line_no, v.line_pos) for v in fac)
+
+    nat_cfg = _jinja_cfg(False, rules_str)
+    nat = [
+        v
+        for v in Linter(config=nat_cfg).lint_string(_JINJA_LOOP_SRC).violations
+        if isinstance(v, SQLLintError)
+    ]
+    nat_keys = sorted((v.rule_code(), v.line_no, v.line_pos) for v in nat)
+    assert fac_keys == nat_keys
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_fix_templated_source_matches_native() -> None:
+    """facade_fix_loop on a jinja source is byte-identical to native.
+
+    Patches only land in literal regions, and same-position conflicting
+    insertions at block-tag boundaries dedupe like native
+    (merge_source_patches).
+    """
+    rules_str = "CP01,LT01,LT02,LT09,JJ01"
+    cfg = _jinja_cfg(True, rules_str)
+    lnt = Linter(config=cfg)
+    rules = list(lnt.get_rulepack(config=cfg).rules)
+    fixed = facade_fix_loop(
+        _JINJA_LOOP_SRC, "<test>", cfg, rules, int(cfg.get("runaway_limit"))
+    )
+
+    nat_cfg = _jinja_cfg(False, rules_str)
+    nat_res = Linter(config=nat_cfg).lint_string(_JINJA_LOOP_SRC, fix=True)
+    assert fixed == nat_res.fix_string()[0]
+
+
+@pytest.mark.skipif(
+    not _HAS_ENGINE, reason="sqlfluffrs.engine_parse_to_tree unavailable"
+)
+def test_facade_placeholder_edit_preserves_template_metadata() -> None:
+    """Placeholder edit(source_fixes=...) mirrors TemplateSegment.edit.
+
+    It keeps source_str/block_type/block_uuid and merges source fixes —
+    JJ01's fix path. Previously it fell through to the raw-edit branch and
+    the staged replacement lost 'skipped_source' block_type, misleading
+    LT02's jinja-block alignment.
+    """
+    import sqlfluffrs
+    from sqlfluff.core.parser import SourceFix
+    from sqlfluff.core.parser.segments.meta import TemplateSegment
+    from sqlfluff.core.rules.rs_lint import RsSegment
+
+    src = "select\n    {% for c in ['a'] %}\n    {{c}}\n    {% endfor %}\nfrom t;\n"
+    cfg = _jinja_cfg(True, "JJ01")
+    rst = sqlfluffrs.engine_parse_to_tree(src, "<test>", cfg, None, True)
+    assert rst is not None
+    placeholder = next(
+        s
+        for s in RsSegment(rst.root).recursive_crawl("placeholder")
+        if s.block_type == "block_start"
+    )
+    fix = SourceFix("{{ c }}", slice(0, 5), slice(0, 0))
+    edited = placeholder.edit(source_fixes=[fix])
+    assert isinstance(edited, TemplateSegment)
+    assert edited.block_type == "block_start"
+    assert edited.source_str == placeholder.source_str
+    # The façade exposes block_uuid as an int (hashable + truthy for reflow
+    # grouping); the edited native TemplateSegment carries the real UUID.
+    import uuid as _uuid
+
+    assert edited.block_uuid == _uuid.UUID(int=placeholder.block_uuid)
+    assert edited.source_fixes == [fix]

@@ -917,14 +917,33 @@ class RsSegment:
         ``TemplateSegment.edit``: when ``source_str`` is given we're editing a
         template placeholder, so return a ``TemplateSegment``.
         """
-        if source_str is not None:
+        if source_str is not None or self.is_type("placeholder"):
+            # Mirror ``TemplateSegment.edit`` (meta.py:267-300) exactly: keep
+            # the existing source_str/block_type/block_uuid when not replaced
+            # and MERGE new source fixes with any existing ones. JJ01 edits a
+            # placeholder passing ONLY source_fixes — branching on the passed
+            # source_str alone sent that through the raw-edit path below,
+            # which rebuilt the placeholder as a raw-typed segment: the
+            # staged replacement lost block_type ('skipped_source') and its
+            # summary source_str, and LT02's next crawl misindented the
+            # surrounding jinja block.
+            import uuid as _uuid
+
             from sqlfluff.core.parser.segments.meta import TemplateSegment
 
+            if source_fixes or self.source_fixes:
+                sf = list(source_fixes or []) + list(self.source_fixes)
+            else:  # pragma: no cover
+                sf = None
+            block_uuid = self._h.block_uuid()
             return TemplateSegment(
                 pos_marker=self.pos_marker,
-                source_str=source_str,
+                source_str=source_str if source_str is not None else self.source_str,
                 block_type=self.block_type or "",
-                source_fixes=source_fixes,
+                source_fixes=sf,
+                block_uuid=(
+                    _uuid.UUID(int=block_uuid) if block_uuid is not None else None
+                ),
             )
         # Mirror RawSegment.edit: `raw` defaults to the current raw (fixes that
         # only set source_fixes, e.g. JJ01, pass raw=None but must keep the raw)
@@ -1129,6 +1148,17 @@ def facade_violations(
         if rule_timing_sink is not None:
             rule_timing_sink.append((rule.code, rule.name, time.monotonic() - t0))
         out.extend(lints)
+    # Native filters out lint errors anchored in templated (non-literal)
+    # sections unless the anchor is semantically literal or the rule targets
+    # templated code (``Linter.remove_templated_errors``, applied in
+    # ``lint_fix_parsed`` gated on ``ignore_templated_areas``). The façade
+    # markers carry ``is_literal`` and the Rust raw-slice objects duck-type
+    # the accessors it uses, so reuse it verbatim. No-op for literal sources
+    # (every marker is literal).
+    if config.get("ignore_templated_areas", default=True):
+        from sqlfluff.core.linter import Linter as _Linter
+
+        out = _Linter.remove_templated_errors(out)
     # Native passes every file's violations through
     # ``deduplicate_in_source_space`` (linter.py:848): dedupe on
     # ``source_signature()`` + sort by position. Without it a rule that
@@ -1499,8 +1529,27 @@ def facade_fix_loop_v3(
                 loop_state["runaway"] = True
             return source
 
+    # Native's post-loop filter on ``initial_linting_errors`` (linter.py:701):
+    # drop templated-anchored violations from reporting. Native does NOT apply
+    # this on the runaway path (its early return precedes the filter), and
+    # neither do we — runaway defers to native anyway.
+    if lint_sink is not None and config.get("ignore_templated_areas", default=True):
+        from sqlfluff.core.linter import Linter as _Linter
+
+        lint_sink[:] = _Linter.remove_templated_errors(lint_sink)
+
     # Reconstruction: native patch generation over the mutated façade.
-    patches = generate_source_patches(root, tf)  # type: ignore[arg-type]
+    # Native routes patches through ``merge_source_patches`` even for a
+    # single variant (linter.py:770-778 -> LintedFile.source_patches):
+    # it sorts in source space, dedupes, and drops same-position
+    # CONFLICTING patches — e.g. two different zero-width insertions at a
+    # jinja block-tag boundary, which the raw patch list would apply
+    # doubled. Mirror it exactly.
+    from sqlfluff.core.linter.patch import merge_source_patches
+
+    patches = merge_source_patches(
+        [generate_source_patches(root, tf)]  # type: ignore[arg-type]
+    )
     source_only = tf.source_only_slices()
     slices = LintedFile._slice_source_file_using_patches(
         patches, source_only, tf.source_str
