@@ -27,6 +27,7 @@ from sqlfluff.core.parser.parsers import (
 )
 from sqlfluff.core.parser.segments.base import BaseSegment, SegmentMetaclass
 from sqlfluff.core.parser.segments.meta import MetaSegment
+from sqlfluff.core.parser.segments.raw import RawSegment
 
 
 @dataclass
@@ -1301,19 +1302,41 @@ class TableBuilder:
     def _handle_token(self, grammar, parse_context) -> GrammarInstData:
         """Convert Token (BaseSegment without match_grammar) to GrammarInst.
 
-        Aux block layout: ``[type_id, class_name_id, ct_count, ct_ids...]``.
-        Native re-mints the matched token as a fresh instance of the class
-        (e.g. ``Ref("LiteralSegment")`` over a lexed ``numeric_literal`` token
-        yields a ``LiteralSegment`` typed ``literal``), so the runtime needs
-        the class name and ``_class_types`` to reproduce that — not just the
-        type string this variant used to store directly in the offsets slot.
+        Aux block layout: ``[type_id, class_name_id, flags, ct_count,
+        ct_ids...]``.
+
+        Native semantics (``BaseSegment.match``, base.py): a bare class
+        grammar matches iff the segment at idx is already an ``isinstance``
+        of the class — and then it's consumed UNCHANGED (no re-mint; the
+        tsql sqlcmd ``Ref("CodeSegment")`` value stays a ``word``, the
+        snowflake catalog-integration ``10`` stays a ``numeric_literal``).
+        A non-instance can't match at all (these classes have no
+        match_grammar, so native would assert).
+
+        The runtime reproduces ``isinstance`` from table data as: the
+        class's ``_class_types`` ⊆ the token's class-chain types, plus —
+        for RawSegment subclasses — equality of the ``_is_code`` /
+        ``_is_comment`` / ``_is_whitespace`` class flags (``CodeSegment``
+        contributes no type of its own, so without the flags a whitespace
+        or comment token would pass the subset test). Flags word: bit3 =
+        flags-valid (raw target), bit0/1/2 = is_code/is_comment/
+        is_whitespace.
         """
         type_id = self._add_string(grammar.type)
         class_id = self._add_string(grammar.__name__)
         class_types = sorted(getattr(grammar, "_class_types", frozenset()))
+        flags = 0
+        if issubclass(grammar, RawSegment):
+            flags = (
+                0b1000
+                | (0b0001 if grammar._is_code else 0)
+                | (0b0010 if grammar._is_comment else 0)
+                | (0b0100 if grammar._is_whitespace else 0)
+            )
         aux_offset = len(self.aux_data)
         self.aux_data.append(type_id)
         self.aux_data.append(class_id)
+        self.aux_data.append(flags)
         self.aux_data.append(len(class_types))
         self.aux_data.extend(self._add_string(t) for t in class_types)
         return GrammarInstData(

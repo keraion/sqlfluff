@@ -1396,19 +1396,30 @@ impl<'a> Parser<'a> {
         // Extract token_type from tables
         let tables = self.grammar_ctx.tables();
 
-        // Token aux block: [type_id, class_name_id, ct_count, ct_ids...].
-        // (Older tables stored the type id directly in the offsets slot; the
-        // generator now emits a real aux block so the match can re-mint the
-        // token as the class, like native does for a bare raw-class grammar.)
+        // Token aux block: [type_id, class_name_id, flags, ct_count, ct_ids...].
+        // Native semantics (BaseSegment.match, base.py ~688): a bare class
+        // grammar matches iff the segment is already an isinstance of the
+        // class, and it's consumed UNCHANGED — no re-mint (tsql sqlcmd
+        // Ref("CodeSegment") keeps the lexed `word`/`double_quote`; the
+        // snowflake catalog-integration `10` stays `numeric_literal`). A
+        // non-instance can't match at all (no match_grammar → native
+        // asserts; we return Empty). isinstance is reproduced as: class's
+        // _class_types ⊆ token's class-chain types, plus (for raw targets,
+        // flags bit3) equality of the is_code/is_comment/is_whitespace
+        // class flags — CodeSegment adds no type of its own, so without
+        // the flags a whitespace or comment token would pass the subset
+        // test.
         let (aux_start, aux_end) = aux_block_bounds(tables, grammar_id);
-        let token_type_id = tables.aux_data[aux_start];
-        let token_type = tables.get_string(token_type_id).to_string();
-        let class_name = if aux_start + 1 < aux_end {
-            Some(tables.get_string(tables.aux_data[aux_start + 1]).to_string())
+        #[cfg(feature = "verbose-debug")]
+        let token_type = tables
+            .get_string(tables.aux_data[aux_start])
+            .to_string();
+        let class_flags = if aux_start + 2 < aux_end {
+            tables.aux_data[aux_start + 2]
         } else {
-            None
+            0
         };
-        let class_type_ids = read_string_ids_from_aux(tables, aux_start + 2, aux_end);
+        let class_type_ids = read_string_ids_from_aux(tables, aux_start + 3, aux_end);
 
         vdebug!(
             "Token[table]: pos={}, token_type='{}'",
@@ -1416,47 +1427,40 @@ impl<'a> Parser<'a> {
             token_type
         );
 
+        let is_instance = |tok: &sqlfluffrs_types::Token| -> bool {
+            let chain = &tok.class_types;
+            if !class_type_ids
+                .iter()
+                .all(|id| chain.contains(tables.get_string(*id)))
+            {
+                return false;
+            }
+            if class_flags & 0b1000 != 0 {
+                tok.is_code() == (class_flags & 0b0001 != 0)
+                    && tok.is_comment() == (class_flags & 0b0010 != 0)
+                    && tok.is_whitespace() == (class_flags & 0b0100 != 0)
+            } else {
+                true
+            }
+        };
+
         match self.peek() {
-            Some(tok) if tok.is_type(&[&token_type]) => {
+            Some(tok) if is_instance(tok) => {
                 let token_pos = self.pos;
                 #[cfg(feature = "verbose-debug")]
                 let raw = tok.raw().to_owned();
                 self.bump();
 
                 vdebug!(
-                    "Token[table] MATCHED: type='{}', raw='{}' at pos={}",
+                    "Token[table] MATCHED (instance, kept unchanged): type='{}', raw='{}' at pos={}",
                     token_type,
                     raw,
                     token_pos
                 );
 
-                // Re-mint the token as the grammar's class, like native: a
-                // bare raw-class grammar (e.g. ``Ref("LiteralSegment")`` over
-                // a lexed ``numeric_literal``) yields a fresh instance of the
-                // CLASS — type and class_types from the class, no lexer
-                // instance types carried over.
-                let matched_class = class_name.map(|name| MatchedClass {
-                    class_name: Cow::Owned(name),
-                    segment_type: Some(Cow::Owned(token_type.clone())),
-                    class_type: Some(Cow::Owned(token_type.clone())),
-                    segment_kwargs: SegmentKwargs {
-                        instance_types: Some(Vec::new()),
-                        class_types: if class_type_ids.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                class_type_ids
-                                    .iter()
-                                    .map(|id| tables.get_string(*id).to_string())
-                                    .collect(),
-                            )
-                        },
-                        ..Default::default()
-                    },
-                });
                 Ok(MatchResult {
                     matched_slice: token_pos..token_pos + 1,
-                    matched_class,
+                    matched_class: None,
                     ..Default::default()
                 })
             }
