@@ -438,8 +438,20 @@ Two changes from the benchmark findings:
    ``FluffConfig.copy()`` measured 5x MORE expensive than a fresh
    ``make_child_from_path`` (deepcopy of ``_configs`` deep-copies the
    dialect object!) — copy-on-use was scrapped for the no-directive
-   share. Rulepack sharing across same-dir files is validated
-   empirically by the 2170-file single-dir literal sweep.
+   share.
+
+   Rulepack sharing means RULE INSTANCES are reused across same-config
+   files (native rebuilds per file). ``context.memory`` is crawl-scoped
+   (fresh ``RuleContext`` per crawl, base.py:626-631) so it can't leak;
+   a full audit of core-rule ``self`` writes found only config/dialect-
+   derived attrs (CP01 family, CV09, RF02-05 — idempotent under
+   same-config sharing), per-evaluation helper classes (ST05's
+   ``_CTEBuilder``/clone map), and eval-start resets (ST06). NOTE the
+   parity harnesses do NOT exercise sharing (they call the façade
+   functions directly with per-file packs) — the CLI-path tests and the
+   testbed gate (real CLI, 191 files byte-identical) are what cover it.
+   The ``rust_compatible`` contract documents the reuse constraint for
+   plugin rules.
 
 2. Lint files the façade declines now run the NATIVE pipeline inside
    the unit ("native" status; parse_string + lint_parsed with

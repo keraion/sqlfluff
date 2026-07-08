@@ -70,8 +70,12 @@ help you decide what to develop:
      behaves identically over the engine's segment wrappers: in practice,
      navigate with ``is_type``/type strings and the functional API rather
      than ``isinstance`` against concrete segment classes, and anchor
-     fixes on segments from the crawled tree. The `SQLFluff example
-     plugin`_ declares it as a reference.
+     fixes on segments from the crawled tree. The fast path may also reuse
+     one rule instance across multiple files that share a config, so keep
+     working state in ``context.memory`` (crawl-scoped) rather than on
+     ``self`` — any instance attribute written during evaluation must be
+     derived purely from config or reset at the start of ``_eval``. The
+     `SQLFluff example plugin`_ declares it as a reference.
 
 3. How am I going to roll out my rule to the team? Thinking through this
    aspect of rule development is just as important as the technical aspect.

@@ -432,9 +432,13 @@ class BaseRule(metaclass=RuleMetaclass):
     # strings and the functional API rather than ``isinstance`` against
     # concrete segment classes (the façade's synthetic classes only subclass
     # ``RawSegment``/``BaseSegment``), and anchor fixes on segments from the
-    # crawled tree. Rules that don't declare this run on the classic Python
-    # pipeline (a native reference parse), even when the Rust engine handles
-    # the rest of the run.
+    # crawled tree. Additionally, the fast path may REUSE one rule instance
+    # across multiple files sharing a config (native rebuilds per file), so
+    # any ``self`` attribute written during evaluation must be derived purely
+    # from config/dialect or reset at the start of ``_eval`` — use
+    # ``context.memory`` (crawl-scoped) for working state. Rules that don't
+    # declare this run on the classic Python pipeline (a native reference
+    # parse), even when the Rust engine handles the rest of the run.
     rust_compatible = False
 
     # Add comma separated string to Base Rule to ensure that it uses the same
