@@ -198,6 +198,27 @@ shadow façade crawl byte-matched native; replaced by the flag — explicit
 author contract over runtime guessing, and no double-crawl overhead.)
 The example plugin declares the flag as a reference.
 
+## dbt templater vetted on the façade fast paths (2026-07-07)
+
+The gates have been templater-agnostic since the jinja milestone; this
+confirms it for dbt with real compilation: ``utils/facade_dbt_parity.py``
+sweeps the dbt plugin's fixture project (dbt 1.10.20, postgres adapter)
+through mirrored gate logic — lint (positions + descriptions) AND fix
+(byte compare) vs native. Baseline: **31 models, 28 façade-eligible, 0
+divergences, 0 errors**; 3 route to native consistently (a disabled
+model and a missing-CLI-var model dbt refuses — ``SQLFluffSkipFile``
+propagates out of ``engine_parse_to_tree``, the gates' exception guard
+routes, and native absorbs the skip gracefully; plus ``vars_from_env``).
+
+Run requirements (see the harness docstring): a dbt-capable interpreter
+(``.tox/dbt1100/bin/python`` with the working-tree sqlfluff + fresh
+sqlfluffrs wheel installed), postgres reachable per the fixture
+profiles, ``dbt deps`` run in the fixture project, and
+``passed_through_env``/``DBT_USE_EXPERIMENTAL_PARSER`` env vars (the
+harness sets them). NOTE: the dbt env's click version can't import
+``sqlfluff.cli.commands``, so the harness mirrors the gate logic inline
+instead of calling the production functions.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser
