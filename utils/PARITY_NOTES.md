@@ -426,6 +426,45 @@ but inline `-- sqlfluff:` directives mutate the child, so a cache needs
 copy-on-use); running routed files natively INSIDE the façade pool
 workers (needs SQLFluffSkipFile accounting to ride the transport).
 
+## Perf follow-ups: config cache + native-inline lint (2026-07-08)
+
+Two changes from the benchmark findings:
+
+1. ``load_raw_file_and_config_cached``: same-directory files share the
+   child config AND rulepack — but ONLY directive-free files
+   (``-- sqlfluff`` lines mutate the child; directive-free processing is
+   a no-op, so the shared child never mutates; directive-carrying files
+   take the private native loader and never seed the cache).
+   ``FluffConfig.copy()`` measured 5x MORE expensive than a fresh
+   ``make_child_from_path`` (deepcopy of ``_configs`` deep-copies the
+   dialect object!) — copy-on-use was scrapped for the no-directive
+   share. Rulepack sharing across same-dir files is validated
+   empirically by the 2170-file single-dir literal sweep.
+
+2. Lint files the façade declines now run the NATIVE pipeline inside
+   the unit ("native" status; parse_string + lint_parsed with
+   formatter=None; native LintedFiles pickle — that's how native's own
+   runners transport them). No second native pool for leftovers, and
+   per-file output stays in discovery order. SPAWN TRAP: config
+   pickling deliberately nulls ``templater_obj`` and ``Linter.__init__``
+   reads it — the pool initializer must rehydrate
+   (``config.get_templater()``, sanctioned by ``__getstate__``'s
+   comment) or every native-inline render dies with
+   ``'NoneType' has no attribute 'name'``. Skips transport as a
+   ("skipped", msg) status; the caller adds to
+   ``result.files_skipped``. The fix command instead clamps the native
+   remainder's worker count to the file count.
+
+Parity findings en route: the OLD façade lint gate MISSED native's
+unset-dialect warning for files whose only parse errors were malformed
+noqa directives (linter.py:866-874) — now dispatched uniformly (paths +
+stdin). And ``large_file_skip_fail`` reads from the ROOT
+(cwd-discovered) config, not the target directory's — verified
+engine-off before asserting; tests must chdir into the project.
+
+Testbed lint after: -p1 1.44x (was 1.19x at yesterday's numbers), -p8
+at parity with native (2.50s vs 2.43s; was 0.84x).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

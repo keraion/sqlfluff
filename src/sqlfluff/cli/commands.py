@@ -826,9 +826,14 @@ def lint(
             if _facade_lint is None:
                 remaining_paths: tuple[str, ...] = paths
                 facade_dirs: list[Any] = []
+                facade_skipped = 0
             else:
-                facade_dirs, _remaining = _facade_lint
+                facade_dirs, _remaining, facade_skipped = _facade_lint
                 remaining_paths = tuple(_remaining)
+                # Never spawn more native workers than leftover files (the
+                # remainder is the unexpected-failure escape hatch only).
+                if remaining_paths and processes is not None:
+                    processes = max(min(processes, len(remaining_paths)), 1)
             if remaining_paths or not facade_dirs:
                 result = lnt.lint_paths(
                     remaining_paths,
@@ -849,6 +854,9 @@ def lint(
             # by which engine handled which file.
             for _dir in facade_dirs:
                 result.add(_dir)
+            # Large-file skips detected in the façade units (native's runner
+            # would have counted these; drives large_file_skip_fail).
+            result.files_skipped += facade_skipped
 
     # Output the final stats
     if verbose >= 1 and not non_human_output:
@@ -1201,6 +1209,8 @@ def _dispatch_facade_lint_output(
     Mirrors ``dispatch_lint_header`` (linter.py:485-488, verbosity-gated) and
     the per-file ``dispatch_file_violations`` (runner.py:212 / linter.py:859).
     """
+    from sqlfluff.core.errors import SQLParseError as _PRS
+
     formatter.dispatch_lint_header(linted_file.path, sorted(r.code for r in rules))
     formatter.dispatch_file_violations(
         linted_file.path,
@@ -1208,6 +1218,9 @@ def _dispatch_facade_lint_output(
         only_fixable=False,
         warn_unused_ignores=cfg.get("warn_unused_ignores"),
     )
+    # Native's unset-dialect safety flag (linter.py:866-874).
+    if linted_file.get_violations(types=_PRS):
+        formatter.dispatch_dialect_warning(cfg.get("dialect"))
 
 
 def _try_facade_paths_lint(
@@ -1216,7 +1229,7 @@ def _try_facade_paths_lint(
     paths,
     ignore_files: bool,
     processes: Optional[int] = None,
-) -> Optional[tuple[list["LintedDir"], list[str]]]:
+) -> Optional[tuple[list["LintedDir"], list[str], int]]:
     """EXPERIMENTAL fast path: lint discovered files over the Rust arena façade.
 
     Mirrors :func:`_try_facade_paths_fix` for the ``lint`` command. Files the
@@ -1224,11 +1237,15 @@ def _try_facade_paths_lint(
     ``LintedDir`` per input path, exactly like ``Linter.lint_paths``); every
     other file is handed back to the native path.
 
-    Returns ``(linted_dirs, remaining_paths)``, or ``None`` — the sentinel for
-    "the façade did nothing, run native over the original ``paths`` unchanged".
-    Per-file human output is dispatched as files are linted, matching native's
-    streaming behaviour (ordering deviates only when files are split between
-    the two engines, as with the fix fast path).
+    Returns ``(linted_dirs, remaining_paths, files_skipped)``, or ``None`` —
+    the sentinel for "the façade did nothing, run native over the original
+    ``paths`` unchanged". Per-file human output is dispatched as files are
+    linted IN DISCOVERY ORDER: files the façade declines run through the
+    native pipeline inside the same unit ("native" status), so nothing waits
+    for a second native pass (or pool). ``files_skipped`` counts
+    ``SQLFluffSkipFile`` (large-file) skips, which the caller adds to the
+    result's accounting; ``remaining_paths`` only carries unexpected-failure
+    escapes.
     """
     try:
         from sqlfluff.core.linter.discovery import paths_from_path
@@ -1284,12 +1301,16 @@ def _try_facade_paths_lint(
         # ``imap`` preserves input order, matching the serial dispatch order.
         fnames = [f for _, f in discovered]
 
+        _loader_cache: dict = {}
+
         def _serial_units():
             for _f in fnames:
                 try:
-                    yield facade_lint_file_unit(_f, linter.config, linter)
+                    yield facade_lint_file_unit(
+                        _f, linter.config, linter, loader_cache=_loader_cache
+                    )
                 except Exception:  # noqa: BLE001
-                    yield ("routed", _f, None, None, False)
+                    yield ("routed", _f, None, None, False, None)
 
         pool = None
         procs = resolve_facade_processes(linter.config, processes)
@@ -1302,27 +1323,50 @@ def _try_facade_paths_lint(
         if pool is None:
             results = _serial_units()
 
+        files_skipped = 0
         try:
             results_it = iter(results)
             for i, (linted_dir, fname) in enumerate(discovered, start=1):
                 try:
-                    status, _fname, linted_file, codes, warn_unused = next(results_it)
+                    (
+                        status,
+                        _fname,
+                        payload,
+                        codes,
+                        warn_unused,
+                        dialect,
+                    ) = next(results_it)
                 except Exception:  # noqa: BLE001
                     # Pool breakage routes this and every later file to
                     # native — nothing was emitted for them yet.
-                    status, linted_file = "routed", None
-                if status != "handled" or linted_file is None:
-                    remaining.append(fname)
-                else:
-                    formatter.dispatch_lint_header(linted_file.path, codes)
+                    status, payload = "routed", None
+                if status == "skipped":
+                    # Native's runner logs the SQLFluffSkipFile message and
+                    # counts the skip (runner.py:54-57) — same logger channel.
+                    logging.getLogger("sqlfluff.linter").warning(payload)
+                    files_skipped += 1
+                    handled_any = True
+                elif status in ("handled", "native") and payload is not None:
+                    # "native": the unit ran the native pipeline for a file
+                    # the façade declined — same LintedFile handling.
+                    formatter.dispatch_lint_header(payload.path, codes)
                     formatter.dispatch_file_violations(
-                        linted_file.path,
-                        linted_file,
+                        payload.path,
+                        payload,
                         only_fixable=False,
                         warn_unused_ignores=warn_unused,
                     )
-                    linted_dir.add(linted_file)
+                    # Native's unset-dialect safety flag (linter.py:866-874).
+                    # (The pre-unit façade gate MISSED this for files whose
+                    # only parse errors were malformed noqa directives.)
+                    from sqlfluff.core.errors import SQLParseError as _PRS
+
+                    if payload.get_violations(types=_PRS):
+                        formatter.dispatch_dialect_warning(dialect)
+                    linted_dir.add(payload)
                     handled_any = True
+                else:
+                    remaining.append(fname)
                 progress_bar_files.update(n=1)
                 if i < len(discovered):
                     progress_bar_files.set_description(f"file {discovered[i][1]}")
@@ -1333,7 +1377,7 @@ def _try_facade_paths_lint(
                 pool.join()
         if not handled_any:
             return None
-        return linted_dirs, remaining
+        return linted_dirs, remaining, files_skipped
     except Exception:  # noqa: BLE001
         return None
 
@@ -1634,10 +1678,14 @@ def _try_facade_paths_fix(
         # loop below (display, records, counts, writes), so serial and
         # parallel outputs match by construction. ``imap`` preserves input
         # order, so per-file output ordering matches the serial path.
+        _loader_cache: dict = {}
+
         def _serial_units():
             for _f in discovered:
                 try:
-                    yield facade_fix_file_unit(_f, linter.config, linter)
+                    yield facade_fix_file_unit(
+                        _f, linter.config, linter, loader_cache=_loader_cache
+                    )
                 except Exception:  # noqa: BLE001
                     yield ("routed", _f, None)
 
@@ -1858,6 +1906,10 @@ def _paths_fix(
 
     if facade_remaining is None:
         remaining_paths: list[str] = list(paths)
+    elif facade_remaining and processes is not None:
+        # Never spawn more native workers than leftover files.
+        processes = max(min(processes, len(facade_remaining)), 1)
+        remaining_paths = facade_remaining
     elif (
         not facade_remaining
         and not check

@@ -2156,35 +2156,107 @@ def transport_linted_file(lf: Any) -> Any:
     )
 
 
-def facade_lint_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
-    """The full per-file LINT fast-path unit (read → gate → crawl → transport).
+_INLINE_CONFIG_MARKERS = ("-- sqlfluff", "--sqlfluff")
 
-    Returns ``("handled", fname, transported_linted_file, rule_codes,
-    warn_unused_ignores)`` or ``("routed", fname, None, None, False)``.
-    Runs identically inline (serial) or in a pool worker.
+
+def _has_inline_config(raw: str) -> bool:
+    """Whether ``process_raw_file_for_config`` would find any directive."""
+    return any(ln.startswith(_INLINE_CONFIG_MARKERS) for ln in raw.splitlines())
+
+
+def load_raw_file_and_config_cached(
+    fname: str, root_config: Any, linter: Any, cache: Optional[dict]
+) -> tuple:
+    """``load_raw_file_and_config`` + rulepack, with per-directory sharing.
+
+    ``make_child_from_path`` is directory-derived, so same-directory files
+    share the child config AND its rulepack — UNLESS the file carries inline
+    ``-- sqlfluff`` directives, which mutate the child; directive-carrying
+    files always take the private native loader and a fresh pack (and never
+    seed the cache). Directive-free processing is a no-op, so the shared
+    child never mutates. Over-limit files fall through to the native loader
+    purely so its canonical ``SQLFluffSkipFile`` message raises.
+
+    Returns ``(raw, cfg, encoding, rule_pack)``.
     """
+    import os
+
+    from sqlfluff.core.helpers.file import get_encoding
     from sqlfluff.core.linter import Linter as _Linter
 
+    entry = None
+    dirkey = None
+    if cache is not None:
+        dirkey = os.path.dirname(os.path.abspath(fname))
+        entry = cache.get(dirkey)
+    if entry is not None:
+        cfg, pack = entry
+        limit = cfg.get("large_file_skip_byte_limit")
+        if not limit or os.path.getsize(fname) <= int(limit):
+            config_encoding = cfg.get("encoding", default="autodetect")
+            encoding = get_encoding(fname=fname, config_encoding=config_encoding)
+            with open(fname, encoding=encoding, errors="backslashreplace") as f:
+                raw = f.read()
+            if not _has_inline_config(raw):
+                return raw, cfg, encoding, pack
+        # Over-limit (native loader raises the canonical SQLFluffSkipFile)
+        # or directive-carrying: private load below.
     raw, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
-    # ONE rulepack per file (building it is ~3.5ms — doubling it up showed in
-    # profiles as ~10% of the whole small-file unit).
-    rule_pack = linter.get_rulepack(config=cfg)
+    pack = linter.get_rulepack(config=cfg)
+    if cache is not None and not _has_inline_config(raw):
+        cache[dirkey] = (cfg, pack)
+    return raw, cfg, encoding, pack
+
+
+def facade_lint_file_unit(
+    fname: str, root_config: Any, linter: Any, loader_cache: Optional[dict] = None
+) -> tuple:
+    """The full per-file LINT fast-path unit (read → gate → crawl → transport).
+
+    Returns one of (the last element is the per-file dialect string, for
+    native's unset-dialect safety warning — linter.py:866-874)::
+
+        ("handled", fname, transported_linted_file, rule_codes, warn_unused, dialect)
+        ("native",  fname, native_linted_file,      rule_codes, warn_unused, dialect)
+        ("skipped", fname, skip_message,            None,       False,       None)
+        ("routed",  fname, None,                    None,       False,       None)
+
+    "native": the façade declined the file, so the NATIVE pipeline ran right
+    here (parse_string + lint_parsed — native LintedFiles pickle, which is
+    how native's own runners transport them). That keeps every file in ONE
+    pool/loop: no second native pool spawn for a handful of leftovers, and
+    per-file output stays in discovery order. "skipped" carries the
+    ``SQLFluffSkipFile`` message; the consumer owns the warning + the
+    ``files_skipped`` accounting. "routed" only remains as the escape hatch
+    for unexpected failures (the consumer hands those to native
+    ``lint_paths``).
+    """
+    from sqlfluff.core.errors import SQLFluffSkipFile
+
+    try:
+        raw, cfg, encoding, rule_pack = load_raw_file_and_config_cached(
+            fname, root_config, linter, loader_cache
+        )
+    except SQLFluffSkipFile as e:
+        return ("skipped", fname, str(e), None, False, None)
+    codes = sorted(r.code for r in rule_pack.rules)
+    warn_unused = bool(cfg.get("warn_unused_ignores"))
+    dialect = cfg.get("dialect")
     lf = facade_linted_file(
         raw, fname, cfg, linter, encoding=encoding, rule_pack=rule_pack
     )
     if lf is None:
-        return ("routed", fname, None, None, False)
-    codes = sorted(r.code for r in rule_pack.rules)
-    return (
-        "handled",
-        fname,
-        transport_linted_file(lf),
-        codes,
-        bool(cfg.get("warn_unused_ignores")),
-    )
+        parsed = linter.parse_string(raw, fname=fname, config=cfg, encoding=encoding)
+        native_lf = linter.lint_parsed(
+            parsed, rule_pack, fix=False, formatter=None, encoding=encoding
+        )
+        return ("native", fname, native_lf, codes, warn_unused, dialect)
+    return ("handled", fname, transport_linted_file(lf), codes, warn_unused, dialect)
 
 
-def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
+def facade_fix_file_unit(
+    fname: str, root_config: Any, linter: Any, loader_cache: Optional[dict] = None
+) -> tuple:
     """The full per-file FIX fast-path unit — shared by serial and pool paths.
 
     Mirrors the gating previously inline in ``_try_facade_paths_fix``
@@ -2204,17 +2276,17 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
 
     import sqlfluffrs
     from sqlfluff.core.errors import SQLLintError as _SQLLintError
-    from sqlfluff.core.linter import Linter as _Linter
     from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
 
     routed = ("routed", fname, None)
-    raw_file, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
+    raw_file, cfg, encoding, rule_pack = load_raw_file_and_config_cached(
+        fname, root_config, linter, loader_cache
+    )
     if not engine_enabled(cfg):
         return routed
     if not raw_file:
         # Empty file -> native (LT12 lints raw-templated zero-byte renders).
         return routed
-    rule_pack = linter.get_rulepack(config=cfg)
     rules = list(rule_pack.rules)
     # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
     if not rules or any(not rule_is_facade_safe(r) for r in rules):
@@ -2358,6 +2430,10 @@ def _facade_pool_init(config: Any) -> None:
 
     is_main_process.set(False)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Pickling deliberately nulls ``templater_obj`` (FluffConfig.__getstate__
+    # sanctions rehydrating it in the child) — the native-inline path in the
+    # lint unit renders through ``linter.templater``, so rebuild it here.
+    config._configs["core"]["templater_obj"] = config.get_templater()
     _POOL_STATE["config"] = config
     _POOL_STATE["linter"] = _Linter(config=config)
 
@@ -2366,17 +2442,25 @@ def _facade_lint_pool_worker(fname: str) -> tuple:
     """Run one file's lint unit in a pool worker; failures route to native."""
     try:
         return facade_lint_file_unit(
-            fname, _POOL_STATE["config"], _POOL_STATE["linter"]
+            fname,
+            _POOL_STATE["config"],
+            _POOL_STATE["linter"],
+            loader_cache=_POOL_STATE.setdefault("loader_cache", {}),
         )
     except Exception as e:  # noqa: BLE001 — worker failure -> native owns it
         linter_logger.info("Façade pool worker failed on %s: %s", fname, e)
-        return ("routed", fname, None, None, False)
+        return ("routed", fname, None, None, False, None)
 
 
 def _facade_fix_pool_worker(fname: str) -> tuple:
     """Run one file's fix unit in a pool worker; failures route to native."""
     try:
-        return facade_fix_file_unit(fname, _POOL_STATE["config"], _POOL_STATE["linter"])
+        return facade_fix_file_unit(
+            fname,
+            _POOL_STATE["config"],
+            _POOL_STATE["linter"],
+            loader_cache=_POOL_STATE.setdefault("loader_cache", {}),
+        )
     except Exception as e:  # noqa: BLE001 — worker failure -> native owns it
         linter_logger.info("Façade pool worker failed on %s: %s", fname, e)
         return ("routed", fname, None)

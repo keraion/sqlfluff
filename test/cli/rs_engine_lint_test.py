@@ -127,25 +127,38 @@ def test_facade_paths_lint_routing(tmp_path) -> None:
     formatter = OutputStreamFormatter(make_output_stream(config), False, verbosity=0)
     result = _try_facade_paths_lint(linter, formatter, (str(tmp_path),), True)
     assert result is not None
-    dirs, remaining = result
+    dirs, remaining, skipped = result
     handled = sorted(
         record["filepath"].rsplit("/", 1)[-1]
         for linted_dir in dirs
         for record in linted_dir.as_records()
     )
-    assert handled == ["clean.sql", "dirty.sql"]
-    assert sorted(p.rsplit("/", 1)[-1] for p in remaining) == [
+    # Files the façade declines (templater violations, parse errors) run the
+    # NATIVE pipeline inside the same unit — nothing is left for a second
+    # native pass.
+    assert handled == [
+        "clean.sql",
+        "dirty.sql",
         "templated.sql",
         "unparsable.sql",
     ]
-    # The dirty file's violations match native.
-    records = [
-        record
-        for linted_dir in dirs
-        for record in linted_dir.as_records()
-        if record["filepath"].endswith("dirty.sql")
-    ]
-    assert [v["code"] for v in records[0]["violations"]] == ["CP01", "CP01"]
+    assert remaining == []
+    assert skipped == 0
+
+    def codes(name):
+        return [
+            v["code"]
+            for linted_dir in dirs
+            for record in linted_dir.as_records()
+            if record["filepath"].endswith(name)
+            for v in record["violations"]
+        ]
+
+    # The dirty file's violations match native; the natively-run files carry
+    # native's TMP/PRS reporting.
+    assert codes("dirty.sql") == ["CP01", "CP01"]
+    assert codes("unparsable.sql") == ["PRS"]
+    assert codes("templated.sql") == ["PRS", "TMP"]
 
 
 def test_facade_lint_templated_eligibility(tmp_path) -> None:

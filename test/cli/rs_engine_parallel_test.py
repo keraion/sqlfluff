@@ -131,3 +131,61 @@ def test_parallel_lint_json_records_match(tmp_path) -> None:
         return sorted(recs, key=lambda r: r["filepath"])
 
     assert norm(got.output, proj) == norm(ref.output, nat_proj)
+
+
+def test_inline_directive_isolation_under_config_cache(tmp_path) -> None:
+    """The per-directory config cache must not leak inline directives.
+
+    Two same-directory files: one carries ``-- sqlfluff:rules:LT01`` (private
+    child config), its sibling must still lint with the directory rules —
+    at -p 1 and -p 2, matching native.
+    """
+    for engine in (True, False):
+        d = tmp_path / ("rs" if engine else "nat")
+        d.mkdir()
+        # Directive file sorts FIRST so a leaked child would poison the cache.
+        (d / "a_directive.sql").write_text(
+            "-- sqlfluff:rules:LT01\nSeLeCt a ,  b from tbl\n"
+        )
+        (d / "b_plain.sql").write_text("SeLeCt a ,  b from tbl\n")
+        (d / ".sqlfluff").write_text(
+            f"[sqlfluff]\ndialect = ansi\nrules = CP01,LT01\n"
+            f"use_rust_engine = {engine}\n"
+        )
+    outs = {}
+    for p in ("1", "2"):
+        got = _run(lint, ["--disable-progress-bar", "-p", p, str(tmp_path / "rs")])
+        ref = _run(lint, ["--disable-progress-bar", "-p", p, str(tmp_path / "nat")])
+        assert got.exit_code == ref.exit_code == 1
+        assert _blocks(got.output, str(tmp_path / "rs")) == _blocks(
+            ref.output, str(tmp_path / "nat")
+        )
+        outs[p] = _blocks(got.output, str(tmp_path / "rs"))
+    assert outs["1"] == outs["2"]
+    # The directive file got ONLY LT01; the sibling got CP01 too.
+    directive_block = next(b for b in outs["1"] if "a_directive" in b)
+    plain_block = next(b for b in outs["1"] if "b_plain" in b)
+    assert "CP01" not in directive_block and "LT01" in directive_block
+    assert "CP01" in plain_block
+
+
+@pytest.mark.parametrize("processes", ["1", "2"])
+def test_large_file_skip_accounting_on_fast_path(
+    tmp_path, monkeypatch, processes
+) -> None:
+    """SQLFluffSkipFile skips count toward large_file_skip_fail's exit code.
+
+    NOTE: ``large_file_skip_fail`` is read from the ROOT (cwd-discovered)
+    config — native semantics, verified engine-off — so the test runs from
+    inside the project directory.
+    """
+    (tmp_path / "small.sql").write_text("SELECT 1 FROM tbl\n")
+    (tmp_path / "big.sql").write_text("SELECT 1 FROM tbl\n" * 200)
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nrules = CP01\nuse_rust_engine = True\n"
+        "large_file_skip_byte_limit = 500\nlarge_file_skip_fail = True\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = _run(lint, ["--disable-progress-bar", "-p", processes, "."])
+    # small.sql is clean; the exit failure comes from the skipped big file.
+    assert result.exit_code == 1
