@@ -96,6 +96,16 @@ mod bridge {
             // error), which Python surfaces as a violation (exit FAIL) — not an
             // internal error. So we catch it and report it as a templater error
             // rather than propagating a hard failure.
+            // `render_string` stops collecting at `render_variant_limit`
+            // (linter.py:950-966) — the variant generator is lazy and native
+            // never renders past the cap, so neither may we (parity AND
+            // cost; the extension's render_via_python mirrors this too).
+            let variant_limit: usize = fluff_config
+                .call_method1("get", ("render_variant_limit",))
+                .ok()
+                .and_then(|v| v.extract::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(usize::MAX);
             let mut variants = Vec::new();
             let mut errors = Vec::new();
             let mut run = || -> PyResult<()> {
@@ -114,6 +124,9 @@ mod bridge {
                         for e in errs_obj.try_iter()? {
                             errors.push(e?.str()?.to_string());
                         }
+                    }
+                    if variants.len() >= variant_limit {
+                        break; // Stop if we hit the limit (like native).
                     }
                 }
                 Ok(())
