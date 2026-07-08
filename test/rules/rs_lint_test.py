@@ -508,3 +508,47 @@ def test_facade_placeholder_edit_preserves_template_metadata() -> None:
 
     assert edited.block_uuid == _uuid.UUID(int=placeholder.block_uuid)
     assert edited.source_fixes == [fix]
+
+
+def test_facade_rule_classification_is_total_and_current() -> None:
+    """Drift guard: every bundled rule has an explicit façade decision.
+
+    The behavioral suites enumerate their work FROM ``FACADE_SAFE_RULES``,
+    so a rule missing from the classification is invisible to them: it
+    silently routes to native and coverage never starts. This test makes the
+    classification total (new rules fail here with instructions) and current
+    (renamed/removed codes can't linger, silently shedding coverage).
+    """
+    from sqlfluff.core.rules.rs_lint import (
+        FACADE_EXCLUDED,
+        FACADE_SAFE_RULES,
+        FACADE_SAFE_RULES_DETECTION_UNSAFE,
+    )
+
+    config = FluffConfig(overrides={"dialect": "ansi", "rules": "all"})
+    pack = Linter(config=config).get_rulepack(config=config)
+    # Bundled rules only: plugins are the ``rust_compatible`` flag's domain.
+    bundled = {
+        rule.code
+        for rule in pack.rules
+        if type(rule).__module__.startswith("sqlfluff.rules")
+    }
+    classified = FACADE_SAFE_RULES | set(FACADE_EXCLUDED)
+
+    missing = bundled - classified
+    assert not missing, (
+        f"New core rule(s) {sorted(missing)} need a façade decision: verify "
+        "byte-parity with the sweeps in utils/facade_*_parity.py and add to "
+        "FACADE_SAFE_RULES, or add to FACADE_EXCLUDED with a reason."
+    )
+    stale = classified - bundled
+    assert not stale, (
+        f"Stale code(s) {sorted(stale)} in the façade classification "
+        "(renamed or removed rule?) — coverage for them has silently ended."
+    )
+    overlap = FACADE_SAFE_RULES & set(FACADE_EXCLUDED)
+    assert not overlap, f"Codes in BOTH safe and excluded: {sorted(overlap)}"
+    assert FACADE_SAFE_RULES_DETECTION_UNSAFE <= FACADE_SAFE_RULES, (
+        "DETECTION_UNSAFE quarantines a subset of the SAFE list; a code "
+        "outside it has no effect."
+    )

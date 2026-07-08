@@ -477,6 +477,23 @@ engine-off before asserting; tests must chdir into the project.
 Testbed lint after: -p1 1.44x (was 1.19x at yesterday's numbers), -p8
 at parity with native (2.50s vs 2.43s; was 0.84x).
 
+## Drift guard on the façade rule classification (2026-07-08)
+
+Every behavioral suite enumerates its work FROM ``FACADE_SAFE_RULES``
+(std_rule_cases collects fixtures for safe rules; the parity harnesses
+build their rule list from it) — so a rule ABSENT from the
+classification was invisible: silently routed to native, no coverage,
+nobody prompted. ``test_facade_rule_classification_is_total_and_current``
+closes that: every bundled rule code must be in ``FACADE_SAFE_RULES``
+or the new ``FACADE_EXCLUDED`` dict (code -> reason; currently empty —
+all 76 are vetted), no stale codes may linger (renames silently shed
+coverage otherwise), the two sets must not overlap, and
+DETECTION_UNSAFE must remain a subset of SAFE. Adding a core rule now
+fails the suite with instructions (sweep + allowlist, or record the
+exclusion) instead of silently defaulting. Guard verified to fire by
+mutation (removed code -> missing; fake code -> stale). Plugins remain
+the ``rust_compatible`` flag's domain, out of the guard's scope.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

@@ -88,6 +88,13 @@ _INTERN: "weakref.WeakValueDictionary[int, RsSegment]" = weakref.WeakValueDictio
 # and its fast-path gating remain for future rules (e.g. plugins) that may
 # need quarantining before their detection is verified.
 FACADE_SAFE_RULES_DETECTION_UNSAFE: frozenset[str] = frozenset()
+
+# Core rules DELIBERATELY kept off the façade fast paths, with the reason.
+# Every bundled rule code must appear in ``FACADE_SAFE_RULES`` or here — the
+# drift guard (test/rules/rs_lint_test.py) enforces totality, so adding a
+# core rule forces an explicit decision (run the parity sweeps and allowlist
+# it, or record the exclusion) instead of silently routing to native.
+FACADE_EXCLUDED: dict[str, str] = {}
 # Batch added (verified 0 NEW whole-corpus divergences over the prior set):
 # AL05, AM04, AM07, CV06, PG02, RF01, RF03, RF05, ST02, ST10, ST11. Triage
 # surfaced (and fixed) the sole combined-run divergence, which was PRE-EXISTING
