@@ -814,7 +814,11 @@ def lint(
             if not bench and not persist_timing:
                 try:
                     _facade_lint = _try_facade_paths_lint(
-                        lnt, formatter, paths, not disregard_sqlfluffignores
+                        lnt,
+                        formatter,
+                        paths,
+                        not disregard_sqlfluffignores,
+                        processes=processes,
                     )
                 except Exception:  # noqa: BLE001
                     _facade_lint = None
@@ -1208,6 +1212,7 @@ def _try_facade_paths_lint(
     formatter: OutputStreamFormatter,
     paths,
     ignore_files: bool,
+    processes: Optional[int] = None,
 ) -> Optional[tuple[list["LintedDir"], list[str]]]:
     """EXPERIMENTAL fast path: lint discovered files over the Rust arena façade.
 
@@ -1263,22 +1268,56 @@ def _try_facade_paths_lint(
             disable=len(discovered) <= 1
             or _linter_module.progress_bar_configuration.disable_progress_bar,  # type: ignore[attr-defined]  # noqa: E501
         )
+        from sqlfluff.core.rules.rs_lint import (
+            _facade_lint_pool_worker,
+            facade_lint_file_unit,
+            facade_pool,
+            resolve_facade_processes,
+        )
+
+        # Per-file work runs through ONE unit (``facade_lint_file_unit``) —
+        # inline for -p 1, in a spawn pool for -p N — with one consumption
+        # loop, so serial and parallel outputs match by construction.
+        # ``imap`` preserves input order, matching the serial dispatch order.
+        fnames = [f for _, f in discovered]
+
+        def _serial_units():
+            for _f in fnames:
+                try:
+                    yield facade_lint_file_unit(_f, linter.config, linter)
+                except Exception:  # noqa: BLE001
+                    yield ("routed", _f, None, None, False)
+
+        pool = None
+        procs = resolve_facade_processes(linter.config, processes)
+        if procs > 1 and len(fnames) > 1:
+            try:
+                pool = facade_pool(procs, linter.config)
+                results = pool.imap(_facade_lint_pool_worker, fnames)
+            except Exception:  # noqa: BLE001
+                pool = None
+        if pool is None:
+            results = _serial_units()
+
         try:
+            results_it = iter(results)
             for i, (linted_dir, fname) in enumerate(discovered, start=1):
                 try:
-                    raw_file, cfg, encoding = Linter.load_raw_file_and_config(
-                        fname, linter.config
-                    )
-                    linted_file = _facade_lint_file(
-                        raw_file, fname, cfg, linter, encoding=encoding
-                    )
+                    status, _fname, linted_file, codes, warn_unused = next(results_it)
                 except Exception:  # noqa: BLE001
-                    linted_file = None  # any uncertainty -> native handles it
-                if linted_file is None:
+                    # Pool breakage routes this and every later file to
+                    # native — nothing was emitted for them yet.
+                    status, linted_file = "routed", None
+                if status != "handled" or linted_file is None:
                     remaining.append(fname)
                 else:
-                    rules = list(linter.get_rulepack(config=cfg).rules)
-                    _dispatch_facade_lint_output(formatter, linted_file, cfg, rules)
+                    formatter.dispatch_lint_header(linted_file.path, codes)
+                    formatter.dispatch_file_violations(
+                        linted_file.path,
+                        linted_file,
+                        only_fixable=False,
+                        warn_unused_ignores=warn_unused,
+                    )
                     linted_dir.add(linted_file)
                     handled_any = True
                 progress_bar_files.update(n=1)
@@ -1286,6 +1325,9 @@ def _try_facade_paths_lint(
                     progress_bar_files.set_description(f"file {discovered[i][1]}")
         finally:
             progress_bar_files.close()
+            if pool is not None:
+                pool.terminate()
+                pool.join()
         if not handled_any:
             return None
         return linted_dirs, remaining
@@ -1502,6 +1544,7 @@ def _try_facade_paths_fix(
     fixed_suffix: str,
     ignore_files: bool,
     check: bool = False,
+    processes: Optional[int] = None,
 ) -> tuple[Optional[list[str]], int, int, list, list]:
     """EXPERIMENTAL fast path: fix discovered files over the Rust arena façade.
 
@@ -1533,14 +1576,6 @@ def _try_facade_paths_fix(
     try:
         from sqlfluff.core.linter.discovery import paths_from_path
         from sqlfluff.core.linter.linted_file import LintedFile
-        from sqlfluff.core.rules.rs_lint import (
-            FACADE_SAFE_RULES_DETECTION_UNSAFE,
-            RsSegment,
-            facade_fix_loop,
-            facade_ignore_mask,
-            facade_violations,
-            rule_is_facade_safe,
-        )
 
         # GATE: only engage for the write-in-place, engine-enabled case.
         if fixed_suffix:
@@ -1549,8 +1584,6 @@ def _try_facade_paths_fix(
             return bail  # stdin mixed in -> leave everything to native
         if not _use_rust_engine(linter.config, None):
             return bail
-
-        import sqlfluffrs
 
         # Discover the concrete SQL files exactly as ``Linter.lint_paths`` does.
         sql_exts = linter.config.get("sql_file_exts", default=".sql").lower().split(",")
@@ -1573,156 +1606,73 @@ def _try_facade_paths_fix(
         num_facade_unfixable = 0
         unfixable_records: list[tuple[str, list]] = []
         pending_writes: list[tuple[str, str, str]] = []
-        limit = int(linter.config.get("runaway_limit"))
 
-        for fname in discovered:
+        from sqlfluff.core.rules.rs_lint import (
+            _facade_fix_pool_worker,
+            facade_fix_file_unit,
+            facade_pool,
+            resolve_facade_processes,
+        )
+
+        # Per-file work runs through ONE unit (``facade_fix_file_unit``) —
+        # inline for -p 1, in a spawn pool for -p N — and one consumption
+        # loop below (display, records, counts, writes), so serial and
+        # parallel outputs match by construction. ``imap`` preserves input
+        # order, so per-file output ordering matches the serial path.
+        def _serial_units():
+            for _f in discovered:
+                try:
+                    yield facade_fix_file_unit(_f, linter.config, linter)
+                except Exception:  # noqa: BLE001
+                    yield ("routed", _f, None)
+
+        pool = None
+        procs = resolve_facade_processes(linter.config, processes)
+        if procs > 1 and len(discovered) > 1:
             try:
-                # Read the source + resolve the per-file config/encoding exactly
-                # as the native linter does (identical newline/encoding/large-file
-                # handling), so any written output matches native byte-for-byte.
-                raw_file, cfg, encoding = Linter.load_raw_file_and_config(
-                    fname, linter.config
-                )
-                if not _use_rust_engine(cfg, None):
-                    remaining.append(fname)
-                    continue
-                if not raw_file:
-                    # Empty file -> native (see ``_try_facade_stdin_fix``:
-                    # LT12 lints raw-templated zero-byte renders).
-                    remaining.append(fname)
-                    continue
-                rule_pack = linter.get_rulepack(config=cfg)
-                rules = list(rule_pack.rules)
-                # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
-                if not rules or any(not rule_is_facade_safe(r) for r in rules):
-                    remaining.append(fname)
-                    continue
-                rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
-                if rst is None:
-                    remaining.append(fname)  # unparsable / templater error
-                    continue
-                # Route anything with a parse error (an ``unparsable`` section) to
-                # native: the arena still yields a tree for these, but native
-                # treats them as PRS errors (non-zero exit, no fix) and we must
-                # not silently swallow them.
-                root = RsSegment(rst.root)
-                if next(root.recursive_crawl("unparsable"), None) is not None:
-                    remaining.append(fname)
-                    continue
-                # Templated sources are eligible except violation-bearing
-                # renders (see ``_try_facade_stdin_fix``); multi-variant
-                # renders fix every variant tree and merge patches.
-                tf = rst.templated_file
-                if tf is None:
-                    remaining.append(fname)
-                    continue
-                if getattr(rst, "templater_violations", None):
-                    remaining.append(fname)
-                    continue
-                # The fix loop mutates ``rst`` in place; hand it the same tree
-                # so it needn't re-parse ``raw_file``. The pre-fix violations
-                # (what the native summary reports — its
-                # ``initial_linting_errors``) are harvested from the loop's own
-                # first pass via ``lint_sink`` rather than paying a separate
-                # whole-ruleset crawl.
-                # ``noqa``: masked results/fixes drop inside the loop's
-                # crawls; malformed directives report like native's
-                # initial_linting_errors.
-                ignore_mask, noqa_violations = facade_ignore_mask(
-                    root, cfg, rule_pack.reference_map
-                )
-                pre: list = list(noqa_violations)
-                loop_state: dict = {}
-                fixed = facade_fix_loop(
-                    raw_file,
-                    fname,
-                    cfg,
-                    rules,
-                    limit,
-                    rst=rst,
-                    lint_sink=pre,
-                    loop_state=loop_state,
-                    ignore_mask=ignore_mask,
-                    reference_map=rule_pack.reference_map,
-                )
-                # A runaway revert is the one gave-up case whose bookkeeping
-                # we don't reproduce (native strips the fixes from every
-                # reported violation, making them all unfixable —
-                # linter.py:683-693): let native own the file (it reverts
-                # identically and reports accordingly).
-                if loop_state.get("runaway"):
-                    remaining.append(fname)
-                    continue
-                # Native passes reported violations through
-                # ``deduplicate_in_source_space`` (linter.py:848); mirror it so
-                # counts/display match when a rule legitimately reports the
-                # same result twice (AL04).
-                pre = LintedFile.deduplicate_in_source_space(pre)
-                # Native's violation post-processing (linter.py:840-843):
-                # the ``ignore`` config and ``sqlfluff:warnings`` demotion.
-                # Warned/ignored violations drop out of every count.
-                for v in pre:
-                    v.ignore_if_in(cfg.get("ignore"))
-                    v.warning_if_in(cfg.get("warnings"))
-                # Anything that isn't a lint error (e.g. a malformed-noqa
-                # SQLParseError) reports through native's parse-error
-                # machinery -> defer the file to native.
-                from sqlfluff.core.errors import SQLLintError as _SQLLintError
+                pool = facade_pool(procs, linter.config)
+                results = pool.imap(_facade_fix_pool_worker, discovered)
+            except Exception:  # noqa: BLE001
+                pool = None
+        if pool is None:
+            results = _serial_units()
 
-                if any(not isinstance(v, _SQLLintError) for v in pre):
+        try:
+            results_it = iter(results)
+            for fname in discovered:
+                try:
+                    status, _fname, payload = next(results_it)
+                except Exception:  # noqa: BLE001
+                    # Pool breakage (including a dead worker) routes this and
+                    # every later file to native — nothing was emitted for
+                    # them yet.
                     remaining.append(fname)
                     continue
+                if status != "handled":
+                    remaining.append(fname)
+                    continue
+                fixed = payload["fixed"]
+                encoding = payload["encoding"]
+                pre = payload["pre"]
+                ignore_mask = payload["mask"]
+                # Transported violations answer ``fixable`` from primitives
+                # (their ``fixes`` list is deliberately empty).
                 kept = [
                     v
                     for v in pre
                     if not getattr(v, "warning", False)
                     and getattr(v, "ignore", False) is not True
                 ]
-                # Self-guard: the fixed output must still reparse cleanly over
-                # a FRESH engine parse (catches any mutate-vs-reparse
-                # divergence). Residual violations are expected — unapplied
-                # fixes (grammar-rejected or loop-detected) keep their
-                # violations, exactly like native, which counts them as
-                # fixable in the summary and does not fail the exit code for
-                # them. If the fix changed nothing the residual is identical
-                # to ``pre`` (same source, same tree), so skip the re-parse.
-                if fixed != raw_file:
-                    post = facade_violations(fixed, fname, cfg, rules)
-                    if post is None:
-                        remaining.append(fname)
-                        continue
-                else:
-                    post = pre
-                # Unfixable violations get REPORTED (summary count + failure
-                # exit code) from the initial pass, like native's
-                # ``num_unfixable_lint_errors`` (which counts its kept lint
-                # errors with ``fixable=False`` — even ones another rule's fix
-                # incidentally resolved).
-                pre_unfixable = [v for v in kept if not getattr(v, "fixes", None)]
-                if pre_unfixable or post:
-                    # An unfixable violation from a rule with known detection
-                    # over-reporting on the façade may be phantom — reporting
-                    # it would leak a wrong exit code, so defer.
-                    if any(
-                        v.rule_code() in FACADE_SAFE_RULES_DETECTION_UNSAFE
-                        for v in (*pre_unfixable, *post)
-                    ):
-                        remaining.append(fname)
-                        continue
-                # Everything fixable was either applied or gave up exactly as
-                # native would; anything unfixable is reported. The output is
-                # FINAL and we can finish here.
+                pre_unfixable = [v for v in kept if not v.fixable]
                 # Emit the per-file violations exactly as native's runner does
-                # (``dispatch_file_violations`` with ``only_fixable=True``), so
-                # the CLI output matches: ignored violations drop, warned ones
-                # show (``filter_warning=False``), unused-noqa warnings append
-                # when configured. Clean files produce an empty (suppressed)
-                # block.
+                # (``dispatch_file_violations`` with ``only_fixable=True``):
+                # ignored violations drop, warned ones show, unused-noqa
+                # warnings append when configured.
                 if formatter.verbosity >= 0:
                     shown = [v for v in pre if getattr(v, "ignore", False) is not True]
                     if not formatter.show_lint_violations:
-                        shown = [v for v in shown if getattr(v, "fixes", None)]
-                    if cfg.get("warn_unused_ignores") and ignore_mask:
+                        shown = [v for v in shown if v.fixable]
+                    if payload["warn_unused"] and ignore_mask:
                         shown = shown + ignore_mask.generate_warnings_for_unused()
                     formatter._dispatch(formatter._format_file_violations(fname, shown))
                 # The façade's contribution to ``--show-lint-violations``
@@ -1734,7 +1684,7 @@ def _try_facade_paths_fix(
                 # atomic/encoding-preserving writer — unless we're in
                 # ``--check`` mode, where writes wait for the user's
                 # confirmation in ``_paths_fix``.
-                if fixed != raw_file:
+                if payload["changed"]:
                     if check:
                         pending_writes.append((fname, fixed, encoding))
                     else:
@@ -1744,11 +1694,13 @@ def _try_facade_paths_fix(
                         formatter.dispatch_persist_filename(
                             filename=fname, result="FIXED"
                         )
-                num_facade_fixable += sum(1 for v in kept if getattr(v, "fixes", None))
+                num_facade_fixable += sum(1 for v in kept if v.fixable)
                 num_facade_unfixable += len(pre_unfixable)
                 handled_any = True
-            except Exception:  # noqa: BLE001
-                remaining.append(fname)  # any uncertainty -> native handles it
+        finally:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
 
         if not handled_any:
             # The façade contributed nothing; signal "run native over the
@@ -1871,7 +1823,13 @@ def _paths_fix(
                 facade_unfixable_records,
                 facade_pending_writes,
             ) = _try_facade_paths_fix(
-                linter, formatter, paths, fixed_suffix, ignore_files, check=check
+                linter,
+                formatter,
+                paths,
+                fixed_suffix,
+                ignore_files,
+                check=check,
+                processes=processes,
             )
         except Exception:  # noqa: BLE001
             facade_remaining, num_facade_fixable, num_facade_unfixable = None, 0, 0

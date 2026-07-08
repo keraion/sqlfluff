@@ -336,6 +336,38 @@ gc.collect() BEFORE baselining, or prior tests' pending garbage drags
 the count below base under xdist; the original jinja-then-raw
 empty-file symptom).
 
+## -p N on the façade fast paths (2026-07-08)
+
+The lint and fix gates now parallelize: per-file work runs through ONE
+shared unit (``facade_lint_file_unit`` / ``facade_fix_file_unit`` in
+rs_lint) consumed identically by an inline generator (``-p 1``) or a
+spawn-context pool with ordered ``imap`` (``-p N``, worker-count math
+matching native ``get_runner``: <=0 means cpu_count+n). Serial and
+parallel therefore cannot drift.
+
+Transport: façade objects don't pickle (pyo3 handles/markers/synthetic
+segment classes), so workers precompute every consumer-visible answer
+WITH THE REAL OBJECTS' METHODS and return ``TransportedLintError`` /
+``TransportedParseError`` (SQLLintError/SQLParseError SUBCLASSES —
+isinstance-faithful — answering to_dict/rule_code/fixable/check_tuple
+from stored primitives; ``fixes`` deliberately empty, ``fixable`` is a
+stored bool) plus ``_TransportedTreeStats``/``_TransportedTemplatedFileStats``
+shims (the only things LintedDir.add reads). IgnoreMask is plain data
+and crosses as-is (parent generates unused-noqa warnings from it). The
+serial path uses the SAME transports, so -p 1 exercises them too. A
+worker failure or pool breakage routes the file(s) to native.
+
+Scaling: testbed (198 files) lint 10.05s -> 3.69s with -p 4 (2.7x,
+spawn overhead included).
+
+Findings for future probes: NATIVE's own -p N per-file output order is
+completion-order — nondeterministic run to run — while the façade's
+ordered imap is deterministic and byte-matches -p 1. Byte-comparing
+against native multiprocess stdout is therefore never stable; compare
+per-file blocks as sets (and the trailing dialect-WARNING /
+"All Finished!" lines attach to whichever block prints last). JSON
+record comparisons must drop ``timings`` (wall-clock floats).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

@@ -29,6 +29,8 @@ from typing import Any, Iterator, Optional, cast
 
 import regex
 
+from sqlfluff.core.errors import SQLBaseError, SQLLintError, SQLParseError
+
 # Same logger native ``apply_fixes`` uses, so the "unparsable file" warning is
 # emitted on the identical channel (``src/sqlfluff/core/linter/fix.py``).
 linter_logger = logging.getLogger("sqlfluff.linter")
@@ -1935,3 +1937,412 @@ def try_facade_lint_string(
         return facade_linted_file(in_str, fname, config, linter, encoding)
     except Exception:  # noqa: BLE001 — any uncertainty -> native handles it
         return None
+
+
+# --------------------------------------------------------------------------
+# Multiprocess transport & per-file work units (the -p N fast path).
+#
+# Façade objects (RsSegment anchors, RsTemplatedFile-bearing markers,
+# synthetic segment classes) don't pickle, so per-file results computed in a
+# worker process cross back as "transported" equivalents: every consumer-
+# visible answer (to_dict records, rule codes, positions, fixability,
+# warning/ignore flags) is PRECOMPUTED with the real objects' own methods in
+# the worker, then served from stored primitives in the parent. The serial
+# path uses the same units and transports, so ``-p 1`` and ``-p N`` share one
+# code path by construction.
+# --------------------------------------------------------------------------
+
+
+class TransportedLintError(SQLLintError):
+    """A picklable stand-in for a façade ``SQLLintError``.
+
+    Subclasses ``SQLLintError`` so ``isinstance`` filters (e.g.
+    ``get_violations(types=...)``) behave identically, but never touches
+    ``segment``/``rule``/``fixes`` — every answer comes from primitives
+    computed by the REAL error in the producing process.
+    """
+
+    def __init__(
+        self,
+        description: str,
+        line_no: int,
+        line_pos: int,
+        rule_code: str,
+        rule_name: str,
+        record: dict,
+        fixable: bool,
+        ignore: bool = False,
+        warning: bool = False,
+        fatal: bool = False,
+    ) -> None:
+        SQLBaseError.__init__(
+            self,
+            description=description,
+            line_no=line_no,
+            line_pos=line_pos,
+            ignore=ignore,
+            fatal=fatal,
+            warning=warning,
+        )
+        self.segment = None  # type: ignore[assignment]
+        self.rule = None  # type: ignore[assignment]
+        self.fixes = []
+        self._rule_code = rule_code
+        self._rule_name = rule_name
+        self._record = record
+        self._fixable = fixable
+
+    def rule_code(self) -> str:
+        return self._rule_code
+
+    def rule_name(self) -> str:
+        return self._rule_name
+
+    def to_dict(self) -> dict:
+        return self._record
+
+    @property
+    def fixable(self) -> bool:
+        return self._fixable
+
+    def __reduce__(self):
+        return type(self), (
+            self.description,
+            self.line_no,
+            self.line_pos,
+            self._rule_code,
+            self._rule_name,
+            self._record,
+            self._fixable,
+            self.ignore,
+            self.warning,
+            self.fatal,
+        )
+
+
+class TransportedParseError(SQLParseError):
+    """A picklable stand-in for a façade-anchored ``SQLParseError``.
+
+    (Malformed-noqa directives anchor on façade comment segments.)
+    """
+
+    def __init__(
+        self,
+        description: str,
+        line_no: int,
+        line_pos: int,
+        record: dict,
+        ignore: bool = False,
+        warning: bool = False,
+        fatal: bool = False,
+    ) -> None:
+        SQLBaseError.__init__(
+            self,
+            description=description,
+            line_no=line_no,
+            line_pos=line_pos,
+            ignore=ignore,
+            fatal=fatal,
+            warning=warning,
+        )
+        self.segment = None
+        self._record = record
+
+    def to_dict(self) -> dict:
+        return self._record
+
+    def __reduce__(self):
+        return type(self), (
+            self.description,
+            self.line_no,
+            self.line_pos,
+            self._record,
+            self.ignore,
+            self.warning,
+            self.fatal,
+        )
+
+
+def transport_violation(v: Any) -> Any:
+    """A picklable equivalent of one façade violation (see module note)."""
+    if isinstance(v, SQLLintError):
+        return TransportedLintError(
+            description=v.description or "",
+            line_no=v.line_no,
+            line_pos=v.line_pos,
+            rule_code=v.rule_code(),
+            rule_name=v.rule_name(),
+            record=v.to_dict(),
+            fixable=v.fixable,
+            ignore=v.ignore,
+            warning=v.warning,
+            fatal=v.fatal,
+        )
+    if isinstance(v, SQLParseError):
+        return TransportedParseError(
+            description=v.description or "",
+            line_no=v.line_no,
+            line_pos=v.line_pos,
+            record=v.to_dict(),
+            ignore=v.ignore,
+            warning=v.warning,
+            fatal=v.fatal,
+        )
+    return v  # segment-less SQLBaseErrors pickle natively
+
+
+class _TransportedTreeStats:
+    """The two answers ``LintedDir.add`` reads from ``LintedFile.tree``."""
+
+    def __init__(self, segments: int, raw_segments: int) -> None:
+        self._segments = segments
+        self._raw_segments = raw_segments
+
+    def count_segments(self, raw_only: bool = False) -> int:
+        return self._raw_segments if raw_only else self._segments
+
+
+class _TransportedTemplatedFileStats:
+    """The two answers ``LintedDir.add`` reads from ``.templated_file``."""
+
+    def __init__(self, source_str: str, templated_str: str) -> None:
+        self.source_str = source_str
+        self.templated_str = templated_str
+
+
+def transport_linted_file(lf: Any) -> Any:
+    """A picklable equivalent of a façade ``LintedFile``.
+
+    ``IgnoreMask`` is plain data and crosses as-is (the formatter generates
+    unused-noqa warnings from it in the parent); ``FileTimings`` likewise.
+    """
+    from sqlfluff.core.linter.linted_file import LintedFile
+
+    return LintedFile(
+        path=lf.path,
+        violations=[transport_violation(v) for v in lf.violations],
+        timings=lf.timings,
+        tree=(
+            _TransportedTreeStats(  # type: ignore[arg-type]
+                lf.tree.count_segments(raw_only=False),
+                lf.tree.count_segments(raw_only=True),
+            )
+            if lf.tree is not None
+            else None
+        ),
+        ignore_mask=lf.ignore_mask,
+        templated_file=(
+            _TransportedTemplatedFileStats(  # type: ignore[arg-type]
+                lf.templated_file.source_str, lf.templated_file.templated_str
+            )
+            if lf.templated_file is not None
+            else None
+        ),
+        encoding=lf.encoding,
+    )
+
+
+def facade_lint_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
+    """The full per-file LINT fast-path unit (read → gate → crawl → transport).
+
+    Returns ``("handled", fname, transported_linted_file, rule_codes,
+    warn_unused_ignores)`` or ``("routed", fname, None, None, False)``.
+    Runs identically inline (serial) or in a pool worker.
+    """
+    from sqlfluff.core.linter import Linter as _Linter
+
+    raw, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
+    lf = facade_linted_file(raw, fname, cfg, linter, encoding=encoding)
+    if lf is None:
+        return ("routed", fname, None, None, False)
+    codes = sorted(r.code for r in linter.get_rulepack(config=cfg).rules)
+    return (
+        "handled",
+        fname,
+        transport_linted_file(lf),
+        codes,
+        bool(cfg.get("warn_unused_ignores")),
+    )
+
+
+def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
+    """The full per-file FIX fast-path unit — shared by serial and pool paths.
+
+    Mirrors the gating previously inline in ``_try_facade_paths_fix``
+    (every rule façade-safe, engine parse with no unparsable section,
+    violation-free render, no runaway, no phantom-prone unfixables) and
+    returns ``("routed", fname, None)`` or ``("handled", fname, payload)``
+    with a PICKLABLE payload::
+
+        {"fixed": str, "changed": bool, "encoding": str,
+         "pre": [transported violations post-dedupe/demotion, in order],
+         "mask": IgnoreMask or None, "warn_unused": bool}
+
+    Display filtering, counts, records and writes all happen in the parent
+    from this payload (once — the same consumption for -p 1 and -p N).
+    """
+    import sqlfluffrs
+    from sqlfluff.core.errors import SQLLintError as _SQLLintError
+    from sqlfluff.core.linter import Linter as _Linter
+    from sqlfluff.core.linter.linted_file import LintedFile
+
+    routed = ("routed", fname, None)
+    raw_file, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
+    if not engine_enabled(cfg):
+        return routed
+    if not raw_file:
+        # Empty file -> native (LT12 lints raw-templated zero-byte renders).
+        return routed
+    rule_pack = linter.get_rulepack(config=cfg)
+    rules = list(rule_pack.rules)
+    # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
+    if not rules or any(not rule_is_facade_safe(r) for r in rules):
+        return routed
+    rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
+    if rst is None:
+        return routed  # unparsable / templater error
+    # Parse errors (an ``unparsable`` section) are native's: PRS violations,
+    # non-zero exit, no fix.
+    root = RsSegment(rst.root)
+    if next(root.recursive_crawl("unparsable"), None) is not None:
+        return routed
+    tf = rst.templated_file
+    if tf is None:
+        return routed
+    if getattr(rst, "templater_violations", None):
+        return routed  # TMP reporting stays native
+    # ``noqa``: masked results/fixes drop inside the loop's crawls; malformed
+    # directives report like native's initial_linting_errors.
+    ignore_mask, noqa_violations = facade_ignore_mask(
+        root, cfg, rule_pack.reference_map
+    )
+    pre: list = list(noqa_violations)
+    loop_state: dict = {}
+    fixed = facade_fix_loop(
+        raw_file,
+        fname,
+        cfg,
+        rules,
+        int(cfg.get("runaway_limit")),
+        rst=rst,
+        lint_sink=pre,
+        loop_state=loop_state,
+        ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
+    )
+    # A runaway revert is the one gave-up case whose bookkeeping we don't
+    # reproduce (native strips fixes from every reported violation —
+    # linter.py:683-693): let native own the file.
+    if loop_state.get("runaway"):
+        return routed
+    # Native's reporting pipeline: source-space dedupe (linter.py:848), then
+    # the ``ignore`` config and ``sqlfluff:warnings`` demotion (840-843).
+    pre = LintedFile.deduplicate_in_source_space(pre)
+    for v in pre:
+        v.ignore_if_in(cfg.get("ignore"))
+        v.warning_if_in(cfg.get("warnings"))
+    # Anything that isn't a lint error (e.g. a malformed-noqa SQLParseError)
+    # reports through native's parse-error machinery -> defer.
+    if any(not isinstance(v, _SQLLintError) for v in pre):
+        return routed
+    kept = [
+        v
+        for v in pre
+        if not getattr(v, "warning", False) and getattr(v, "ignore", False) is not True
+    ]
+    # Self-guard: the fixed output must still reparse cleanly over a FRESH
+    # engine parse (catches any mutate-vs-reparse divergence). If the fix
+    # changed nothing the residual is identical to ``pre``, so skip it.
+    if fixed != raw_file:
+        post = facade_violations(fixed, fname, cfg, rules)
+        if post is None:
+            return routed
+    else:
+        post = pre
+    pre_unfixable = [v for v in kept if not getattr(v, "fixes", None)]
+    if pre_unfixable or post:
+        # An unfixable violation from a rule with known detection
+        # over-reporting on the façade may be phantom — reporting it would
+        # leak a wrong exit code, so defer.
+        if any(
+            v.rule_code() in FACADE_SAFE_RULES_DETECTION_UNSAFE
+            for v in (*pre_unfixable, *post)
+        ):
+            return routed
+    return (
+        "handled",
+        fname,
+        {
+            "fixed": fixed,
+            "changed": fixed != raw_file,
+            "encoding": encoding,
+            "pre": [transport_violation(v) for v in pre],
+            "mask": ignore_mask,
+            "warn_unused": bool(cfg.get("warn_unused_ignores")),
+        },
+    )
+
+
+# Per-worker state for the multiprocess fast path (set by the pool
+# initializer; keyed lookups keep the worker functions picklable-by-name).
+_POOL_STATE: dict[str, Any] = {}
+
+
+def _facade_pool_init(config: Any) -> None:
+    """Pool worker initializer: mirror native ``ParallelRunner._init_global``.
+
+    Marks the process non-main (plugin machinery), disables SIGINT so the
+    parent owns Ctrl-C handling, and builds the per-worker linter once.
+    """
+    import signal
+
+    from sqlfluff.core import Linter as _Linter
+    from sqlfluff.core.plugin.host import is_main_process
+
+    is_main_process.set(False)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _POOL_STATE["config"] = config
+    _POOL_STATE["linter"] = _Linter(config=config)
+
+
+def _facade_lint_pool_worker(fname: str) -> tuple:
+    """Run one file's lint unit in a pool worker; failures route to native."""
+    try:
+        return facade_lint_file_unit(
+            fname, _POOL_STATE["config"], _POOL_STATE["linter"]
+        )
+    except Exception as e:  # noqa: BLE001 — worker failure -> native owns it
+        linter_logger.info("Façade pool worker failed on %s: %s", fname, e)
+        return ("routed", fname, None, None, False)
+
+
+def _facade_fix_pool_worker(fname: str) -> tuple:
+    """Run one file's fix unit in a pool worker; failures route to native."""
+    try:
+        return facade_fix_file_unit(fname, _POOL_STATE["config"], _POOL_STATE["linter"])
+    except Exception as e:  # noqa: BLE001 — worker failure -> native owns it
+        linter_logger.info("Façade pool worker failed on %s: %s", fname, e)
+        return ("routed", fname, None)
+
+
+def resolve_facade_processes(config: Any, processes: Optional[int]) -> int:
+    """Resolve the worker count exactly like native ``get_runner``.
+
+    Positive = that many processes; zero/negative = ``cpu_count + n``
+    (min 1). ``None`` falls back to the ``processes`` config (default 1).
+    """
+    import multiprocessing
+
+    procs = processes if processes is not None else int(config.get("processes") or 1)
+    if procs <= 0:
+        procs = max(multiprocessing.cpu_count() + procs, 1)
+    return procs
+
+
+def facade_pool(processes: int, config: Any) -> Any:
+    """A spawn-context pool matching native ``MultiProcessRunner``'s choice."""
+    import multiprocessing
+
+    return multiprocessing.get_context("spawn").Pool(
+        processes=processes, initializer=_facade_pool_init, initargs=(config,)
+    )
