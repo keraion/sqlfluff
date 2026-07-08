@@ -368,6 +368,32 @@ per-file blocks as sets (and the trailing dialect-WARNING /
 "All Finished!" lines attach to whichever block prints last). JSON
 record comparisons must drop ``timings`` (wall-clock floats).
 
+## --bench / --persist-timing on the fast paths (2026-07-08)
+
+The last flag carve-outs, now lifted. LINT needed only the gate lift:
+façade LintedFiles already carry real FileTimings and merge into
+``result``, so ``timing_summary()``/``persist_timing_records()`` cover
+both engines. FIX: ``facade_fix_loop`` gained ``rule_timing_sink``
+(a timing per crawl, EVERY loop pass, root variant only — mirroring
+native linter.py:659-662 and its discarded alternate timings); the fix
+unit times the engine parse + whole loop and ships a violation-free
+"timing carrier" LintedFile per handled file; ``_paths_fix`` aggregates
+carriers with native's result in a SEPARATE LintingResult used only by
+the timing consumers (adding them to ``result`` would leak empty
+records into --show-lint-violations and the stats).
+
+Timing semantics on the engine: template+lex+parse is one Rust call, so
+it all lands under "parsing" (templating/lexing report 0.0 — that IS
+the engine's truth, and the CSV signature the tests pin).
+
+Traps hit: a str.replace edited BOTH commands' byte-identical bench
+blocks (lint's got fix-local variables — NameError); and _paths_fix's
+façade-handled-everything early exit skipped the bench/persist section
+that was unreachable while the gate existed (condition now includes
+``not bench and not persist_timing``).
+
+Nothing routes for CLI flags anymore.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

@@ -334,3 +334,51 @@ def test_facade_fix_multi_variant_render_matches_native() -> None:
     # BOTH branches' spacing was fixed.
     assert "select a, b from tbl" in fixed
     assert "select c, d from other_tbl" in fixed
+
+
+def test_fix_bench_and_persist_timing_on_fast_path(tmp_path) -> None:
+    """--bench and --persist-timing work on the façade fix path.
+
+    The CSV gets a row per façade-fixed file (parsing/linting > 0, the
+    engine's templating/lexing == 0 signature, and per-rule columns); the
+    bench output prints the timing sections.
+    """
+    import csv
+
+    from click.testing import CliRunner
+
+    from sqlfluff.cli.commands import fix as fix_cmd
+
+    for i in range(3):
+        (tmp_path / f"q{i}.sql").write_text("SeLeCt a ,  b from tbl\n")
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nrules = CP01,LT01\nuse_rust_engine = True\n"
+    )
+    csv_path = tmp_path / "timings.csv"
+    result = CliRunner().invoke(
+        fix_cmd,
+        [
+            "--disable-progress-bar",
+            "-f",
+            "--bench",
+            "--persist-timing",
+            str(csv_path),
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0
+    # Files actually got fixed (fast path engaged end-to-end).
+    assert (tmp_path / "q0.sql").read_text() == "SELECT a, b FROM tbl\n"
+    # Bench sections rendered.
+    assert "==== overall timings ====" in result.output
+    assert "=== parsing ===" in result.output
+    # CSV: one row per file with the engine's timing signature.
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 3
+    for row in rows:
+        assert float(row["parsing"]) > 0
+        assert float(row["linting"]) > 0
+        assert float(row["templating"]) == 0.0  # engine lands it in parsing
+        assert float(row["CP01"]) > 0  # per-rule crawl timings captured
+        assert int(row["segments"]) > 0  # statistics columns populated

@@ -809,19 +809,20 @@ def lint(
             # EXPERIMENTAL: Rust-engine façade fast path. Lint (and stream
             # output for) every file it can safely handle, and hand the rest
             # back to the native path below. Skipped for --bench /
-            # --persist-timing, which rely on native's per-file timing records.
+            # Façade LintedFiles carry real FileTimings (the engine's
+            # template+lex+parse lands under "parsing"), so --bench and
+            # --persist-timing aggregate normally through the merged result.
             _facade_lint = None
-            if not bench and not persist_timing:
-                try:
-                    _facade_lint = _try_facade_paths_lint(
-                        lnt,
-                        formatter,
-                        paths,
-                        not disregard_sqlfluffignores,
-                        processes=processes,
-                    )
-                except Exception:  # noqa: BLE001
-                    _facade_lint = None
+            try:
+                _facade_lint = _try_facade_paths_lint(
+                    lnt,
+                    formatter,
+                    paths,
+                    not disregard_sqlfluffignores,
+                    processes=processes,
+                )
+            except Exception:  # noqa: BLE001
+                _facade_lint = None
             if _facade_lint is None:
                 remaining_paths: tuple[str, ...] = paths
                 facade_dirs: list[Any] = []
@@ -1051,6 +1052,8 @@ def lint(
 
     output_stream.close()
     if bench:
+        # Façade-handled files merged into ``result`` with real FileTimings,
+        # so the summary covers both engines.
         click.echo("==== overall timings ====")
         click.echo(formatter.cli_table([("Clock time", result.total_time)]))
         timing_summary = result.timing_summary()
@@ -1545,7 +1548,7 @@ def _try_facade_paths_fix(
     ignore_files: bool,
     check: bool = False,
     processes: Optional[int] = None,
-) -> tuple[Optional[list[str]], int, int, list, list]:
+) -> tuple[Optional[list[str]], int, int, list, list, list]:
     """EXPERIMENTAL fast path: fix discovered files over the Rust arena façade.
 
     Mirrors :func:`_try_facade_stdin_fix` but for the file-based ``fix`` command.
@@ -1556,7 +1559,11 @@ def _try_facade_paths_fix(
     other file is handed back to the native path unchanged.
 
     Returns ``(remaining_paths, num_facade_fixable, num_facade_unfixable,
-    unfixable_records, pending_writes)``. ``num_facade_fixable`` is the count
+    unfixable_records, pending_writes, timing_files)``. ``timing_files`` is
+    one violation-free timing-carrier ``LintedFile`` per handled file —
+    --bench/--persist-timing aggregate these alongside native's result (they
+    must NOT join ``result`` itself, which would leak empty records into
+    ``--show-lint-violations`` and the stats). ``num_facade_fixable`` is the count
     of fixable violations the façade fixed and ``num_facade_unfixable`` the
     count of unfixable violations found in façade-handled files (both feed
     the native summary lines; the latter also drives the failure exit code).
@@ -1572,7 +1579,14 @@ def _try_facade_paths_fix(
     (distinct from an empty list, which means the façade handled
     *everything*).
     """
-    bail: tuple[Optional[list[str]], int, int, list, list] = (None, 0, 0, [], [])
+    bail: tuple[Optional[list[str]], int, int, list, list, list] = (
+        None,
+        0,
+        0,
+        [],
+        [],
+        [],
+    )
     try:
         from sqlfluff.core.linter.discovery import paths_from_path
         from sqlfluff.core.linter.linted_file import LintedFile
@@ -1606,6 +1620,7 @@ def _try_facade_paths_fix(
         num_facade_unfixable = 0
         unfixable_records: list[tuple[str, list]] = []
         pending_writes: list[tuple[str, str, str]] = []
+        timing_files: list = []
 
         from sqlfluff.core.rules.rs_lint import (
             _facade_fix_pool_worker,
@@ -1696,6 +1711,7 @@ def _try_facade_paths_fix(
                         )
                 num_facade_fixable += sum(1 for v in kept if v.fixable)
                 num_facade_unfixable += len(pre_unfixable)
+                timing_files.append(payload["timing_file"])
                 handled_any = True
         finally:
             if pool is not None:
@@ -1712,6 +1728,7 @@ def _try_facade_paths_fix(
             num_facade_unfixable,
             unfixable_records,
             pending_writes,
+            timing_files,
         )
     except Exception:  # noqa: BLE001
         return bail
@@ -1811,33 +1828,43 @@ def _paths_fix(
     num_facade_unfixable = 0
     facade_unfixable_records: list = []
     facade_pending_writes: list = []
-    # Skip the fast path for --bench / --persist-timing (which exist to
-    # measure native's per-file timing records). --check IS supported: the
-    # façade defers its writes to the confirmation prompt below.
-    if not bench and not persist_timing:
-        try:
-            (
-                facade_remaining,
-                num_facade_fixable,
-                num_facade_unfixable,
-                facade_unfixable_records,
-                facade_pending_writes,
-            ) = _try_facade_paths_fix(
-                linter,
-                formatter,
-                paths,
-                fixed_suffix,
-                ignore_files,
-                check=check,
-                processes=processes,
-            )
-        except Exception:  # noqa: BLE001
-            facade_remaining, num_facade_fixable, num_facade_unfixable = None, 0, 0
-            facade_unfixable_records, facade_pending_writes = [], []
+    # --bench / --persist-timing are supported: façade-handled files carry
+    # violation-free timing-carrier LintedFiles (real step + rule timings; the
+    # engine's template+lex+parse lands under "parsing") which the timing
+    # consumers below aggregate alongside native's result. --check IS
+    # supported too: the façade defers its writes to the confirmation prompt.
+    facade_timing_files: list = []
+    try:
+        (
+            facade_remaining,
+            num_facade_fixable,
+            num_facade_unfixable,
+            facade_unfixable_records,
+            facade_pending_writes,
+            facade_timing_files,
+        ) = _try_facade_paths_fix(
+            linter,
+            formatter,
+            paths,
+            fixed_suffix,
+            ignore_files,
+            check=check,
+            processes=processes,
+        )
+    except Exception:  # noqa: BLE001
+        facade_remaining, num_facade_fixable, num_facade_unfixable = None, 0, 0
+        facade_unfixable_records, facade_pending_writes = [], []
+        facade_timing_files = []
 
     if facade_remaining is None:
         remaining_paths: list[str] = list(paths)
-    elif not facade_remaining and not check and not formatter.show_lint_violations:
+    elif (
+        not facade_remaining
+        and not check
+        and not formatter.show_lint_violations
+        and not bench
+        and not persist_timing
+    ):
         # The façade fully handled every file; synthesise the same summary native
         # prints and exit without touching the native path.
         if num_facade_fixable > 0:
@@ -1949,10 +1976,29 @@ def _paths_fix(
         click.echo("  [{} unfixable linting violations found]".format(num_unfixable))
         exit_code = max(exit_code, EXIT_FAIL)
 
+    # For --bench / --persist-timing, aggregate the façade's timing-carrier
+    # files alongside native's result. A SEPARATE LintingResult keeps the
+    # carriers out of ``result`` (their empty records would pollute
+    # --show-lint-violations and the stats).
+    timing_result = result
+    if facade_timing_files and (bench or persist_timing):
+        from sqlfluff.core.linter.linted_dir import LintedDir as _LintedDir
+        from sqlfluff.core.linter.linting_result import (
+            LintingResult as _LintingResult,
+        )
+
+        _facade_dir = _LintedDir("<rust engine>", retain_files=False)
+        for _tf_file in facade_timing_files:
+            _facade_dir.add(_tf_file)
+        timing_result = _LintingResult()
+        for _p in result.paths:
+            timing_result.add(_p)
+        timing_result.add(_facade_dir)
+
     if bench:
         click.echo("==== overall timings ====")
         click.echo(formatter.cli_table([("Clock time", result.total_time)]))
-        timing_summary = result.timing_summary()
+        timing_summary = timing_result.timing_summary()
         for step in timing_summary:
             click.echo(f"=== {step} ===")
             click.echo(
@@ -1977,7 +2023,7 @@ def _paths_fix(
                 click.echo(formatter.format_violation(violation))
 
     if persist_timing:
-        result.persist_timing_records(persist_timing)
+        timing_result.persist_timing_records(persist_timing)
 
     # If large_file_skip_fail is set and files were skipped, fail.
     if result.files_skipped and linter.config.get("large_file_skip_fail"):

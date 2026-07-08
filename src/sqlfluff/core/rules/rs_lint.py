@@ -1397,6 +1397,7 @@ def facade_fix_loop(
     ignore_mask: Any = None,
     reference_map: Optional[dict[str, set[str]]] = None,
     patch_sink: Optional[list[Any]] = None,
+    rule_timing_sink: Optional[list[tuple[str, str, float]]] = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1438,6 +1439,8 @@ def facade_fix_loop(
     file (native reverts just that variant; deferral reproduces its output
     exactly via the native pipeline).
     """
+    import time
+
     import sqlfluffrs
     from sqlfluff.core.linter.fix import compute_anchor_edit_info
     from sqlfluff.core.linter.linted_file import LintedFile
@@ -1467,7 +1470,7 @@ def facade_fix_loop(
         return source
     feu = bool(config.get("fix_even_unparsable"))
 
-    def _fix_tree(rst_v: Any, tf_v: Any, mask_v: Any) -> bool:
+    def _fix_tree(rst_v: Any, tf_v: Any, mask_v: Any, timing_sink: Any = None) -> bool:
         """Run the phase loop over one variant tree; True = runaway."""
         root = RsSegment(rst_v.root)
         root_handle = rst_v.root
@@ -1504,6 +1507,7 @@ def facade_fix_loop(
                     # reported to the user anyway.
                     if not first_pass and not rule.is_fix_compatible:
                         continue
+                    _rt0 = time.monotonic()
                     _v, _r, fixes, _m = rule.crawl(
                         tree=root,
                         dialect=dialect_obj,
@@ -1516,6 +1520,12 @@ def facade_fix_loop(
                         fname=fname,
                         config=config,
                     )
+                    if timing_sink is not None:
+                        # Native records EVERY crawl, every loop
+                        # (linter.py:659-662).
+                        timing_sink.append(
+                            (rule.code, rule.name, time.monotonic() - _rt0)
+                        )
                     if lint_sink is not None and first_pass:
                         # Native's ``initial_linting_errors``: only the first
                         # pass of the main phase reports (linter.py:573-574).
@@ -1613,8 +1623,10 @@ def facade_fix_loop(
         trees.append((alt, alt_tf, alt_mask))
 
     patch_sets: list[list[Any]] = []
-    for rst_v, tf_v, mask_v in trees:
-        if _fix_tree(rst_v, tf_v, mask_v):
+    for _idx, (rst_v, tf_v, mask_v) in enumerate(trees):
+        # Only the ROOT variant reports rule timings (native discards
+        # alternates' — linter.py:786-798 "_,  # Timings").
+        if _fix_tree(rst_v, tf_v, mask_v, rule_timing_sink if _idx == 0 else None):
             if loop_state is not None:
                 loop_state["runaway"] = True
             return source
@@ -2181,10 +2193,12 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
     Display filtering, counts, records and writes all happen in the parent
     from this payload (once — the same consumption for -p 1 and -p N).
     """
+    import time
+
     import sqlfluffrs
     from sqlfluff.core.errors import SQLLintError as _SQLLintError
     from sqlfluff.core.linter import Linter as _Linter
-    from sqlfluff.core.linter.linted_file import LintedFile
+    from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
 
     routed = ("routed", fname, None)
     raw_file, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
@@ -2198,7 +2212,9 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
     # Core allowlist or explicit plugin ``rust_compatible`` opt-in.
     if not rules or any(not rule_is_facade_safe(r) for r in rules):
         return routed
+    _t0 = time.monotonic()
     rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
+    parse_time = time.monotonic() - _t0
     if rst is None:
         return routed  # unparsable / templater error
     # Parse errors (an ``unparsable`` section) are native's: PRS violations,
@@ -2218,6 +2234,8 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
     )
     pre: list = list(noqa_violations)
     loop_state: dict = {}
+    rule_timings: list[tuple[str, str, float]] = []
+    _t1 = time.monotonic()
     fixed = facade_fix_loop(
         raw_file,
         fname,
@@ -2229,7 +2247,9 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
         loop_state=loop_state,
         ignore_mask=ignore_mask,
         reference_map=rule_pack.reference_map,
+        rule_timing_sink=rule_timings,
     )
+    lint_time = time.monotonic() - _t1
     # A runaway revert is the one gave-up case whose bookkeeping we don't
     # reproduce (native strips fixes from every reported violation —
     # linter.py:683-693): let native own the file.
@@ -2269,6 +2289,35 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
             for v in (*pre_unfixable, *post)
         ):
             return routed
+    # A violation-free "timing carrier" LintedFile: --bench and
+    # --persist-timing aggregate step + rule timings (and the per-file
+    # statistics columns) through LintedDir records. The engine
+    # templates/lexes/parses in one call, so the whole front-of-pipeline
+    # lands under "parsing"; "linting" is the whole fix loop, like native's.
+    # Tree counts read the post-fix (mutated) tree, matching native's fixed
+    # LintedFile.
+    timing_file = LintedFile(
+        path=fname,
+        violations=[],
+        timings=FileTimings(
+            {
+                "templating": 0.0,
+                "lexing": 0.0,
+                "parsing": parse_time,
+                "linting": lint_time,
+            },
+            rule_timings,
+        ),
+        tree=_TransportedTreeStats(  # type: ignore[arg-type]
+            root.count_segments(raw_only=False),
+            root.count_segments(raw_only=True),
+        ),
+        ignore_mask=None,
+        templated_file=_TransportedTemplatedFileStats(  # type: ignore[arg-type]
+            tf.source_str, tf.templated_str
+        ),
+        encoding=encoding,
+    )
     return (
         "handled",
         fname,
@@ -2279,6 +2328,7 @@ def facade_fix_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
             "pre": [transport_violation(v) for v in pre],
             "mask": ignore_mask,
             "warn_unused": bool(cfg.get("warn_unused_ignores")),
+            "timing_file": timing_file,
         },
     )
 

@@ -290,8 +290,8 @@ def test_facade_fix_noqa_masks_fixes_like_native(tmp_path) -> None:
     linter = Linter(config=c)
     stream = make_output_stream(c)
     formatter = OutputStreamFormatter(stream, False)
-    remaining, _fixable, _unfixable, _records, _pending = _try_facade_paths_fix(
-        linter, formatter, (str(tmp_path),), "", True
+    remaining, _fixable, _unfixable, _records, _pending, _timing = (
+        _try_facade_paths_fix(linter, formatter, (str(tmp_path),), "", True)
     )
     assert remaining == []  # facade handled the file
     fixed = f.read_text()
@@ -448,3 +448,39 @@ def test_facade_lint_multi_variant_render_matches_native() -> None:
     # The untaken else-branch's LT01s are present (only an alternate
     # variant can see them).
     assert any(k[1] == 4 for k in fac)
+
+
+def test_lint_bench_and_persist_timing_on_fast_path(tmp_path) -> None:
+    """--bench/--persist-timing no longer route lint to native."""
+    import csv
+
+    from click.testing import CliRunner
+
+    from sqlfluff.cli.commands import lint as lint_cmd
+
+    for i in range(2):
+        (tmp_path / f"q{i}.sql").write_text("SeLeCt 1 from tbl\n")
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nrules = CP01\nuse_rust_engine = True\n"
+    )
+    csv_path = tmp_path / "timings.csv"
+    result = CliRunner().invoke(
+        lint_cmd,
+        [
+            "--disable-progress-bar",
+            "--bench",
+            "--persist-timing",
+            str(csv_path),
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 1  # CP01 violations
+    assert "==== overall timings ====" in result.output
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 2
+    for row in rows:
+        # The engine's signature: whole front-of-pipeline under "parsing".
+        assert float(row["parsing"]) > 0
+        assert float(row["templating"]) == 0.0
+        assert float(row["CP01"]) > 0
