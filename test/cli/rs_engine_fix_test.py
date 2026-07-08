@@ -113,7 +113,9 @@ def test_facade_stdin_fix_completes_gave_up_files() -> None:
     result = _try_facade_stdin_fix(_linter(rules), src, None)
     assert result is not None
     fixed, num_unfixable = result
-    config = FluffConfig(overrides={"dialect": "ansi", "rules": rules})
+    config = FluffConfig(
+        overrides={"dialect": "ansi", "rules": rules, "use_rust_engine": False}
+    )
     native = Linter(config=config).lint_string(src, fix=True).fix_string()[0]
     assert fixed == native
     assert num_unfixable == 0  # gave-up fixes stay "fixable", like native
@@ -193,7 +195,13 @@ def test_facade_fix_plugin_rule_opt_in() -> None:
     assert result is not None  # flagged plugin rule doesn't disqualify
     fixed, num_unfixable = result
 
-    nat_cfg = FluffConfig(overrides={"dialect": "ansi", "rules": "Example_L001,CP01"})
+    nat_cfg = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": "Example_L001,CP01",
+            "use_rust_engine": False,
+        }
+    )
     nat_res = Linter(config=nat_cfg).lint_string(src, fix=True)
     assert fixed == nat_res.fix_string()[0]
     assert num_unfixable == 1  # the Example_L001 finding has no fixes
@@ -311,7 +319,12 @@ def test_facade_fix_multi_variant_render_matches_native() -> None:
     nat = (
         Linter(
             config=FluffConfig(
-                overrides={"dialect": "ansi", "templater": "jinja", "rules": "LT01"}
+                overrides={
+                    "dialect": "ansi",
+                    "templater": "jinja",
+                    "rules": "LT01",
+                    "use_rust_engine": False,
+                }
             )
         )
         .lint_string(src, fix=True)

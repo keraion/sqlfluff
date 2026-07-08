@@ -1170,132 +1170,17 @@ def _facade_lint_file(
     linter: Linter,
     encoding: str = "utf-8",
 ) -> Optional["LintedFile"]:
-    """Lint one literal source over the Rust arena façade, or ``None`` to defer.
+    """Lint one source over the Rust arena façade, or ``None`` to defer.
 
-    Applies the same routing gates as the fix fast paths (engine enabled,
-    every rule façade-safe and detection-verified, no ``noqa``, parses via the
-    engine with no unparsable section, source == templated) and native's
-    violation post-processing (``ignore_if_in``/``warning_if_in`` config
-    handling, source-space dedupe — the latter inside ``facade_violations``).
-    Returns a real ``LintedFile`` so every downstream consumer (formatters,
-    ``as_records`` serialisation, stats, exit codes) behaves natively.
+    Thin CLI wrapper around :func:`sqlfluff.core.rules.rs_lint.facade_linted_file`
+    (the shared per-file core, also used by ``Linter.lint_string``), keeping
+    the CLI's output-format concern in ``_use_rust_engine``.
     """
-    import sqlfluffrs
-    from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
-    from sqlfluff.core.rules.rs_lint import (
-        FACADE_SAFE_RULES_DETECTION_UNSAFE,
-        RsSegment,
-        facade_ignore_mask,
-        facade_unknown_rule_violations,
-        facade_violations,
-        rule_is_facade_safe,
-    )
+    from sqlfluff.core.rules.rs_lint import facade_linted_file
 
     if not _use_rust_engine(cfg, None):
         return None
-    if not raw_file:
-        # Not façade-eligible: under a templater whose zero-byte render keeps
-        # a raw slice (e.g. ``raw``), native lexes a zero-width placeholder
-        # that LT12 lints — and the arena's bare ``file`` node also makes the
-        # statistics record differ (no end-of-file meta). Native handles it
-        # trivially fast.
-        return None
-    rule_pack = linter.get_rulepack(config=cfg)
-    rules = list(rule_pack.rules)
-    if not rules:
-        return None
-    # Façade-safe rules (core allowlist or an explicit plugin
-    # ``rust_compatible`` opt-in) crawl the façade; anything else runs on
-    # the classic Python pipeline via ``facade_unknown_rule_violations``.
-    safe_rules = [
-        r
-        for r in rules
-        if rule_is_facade_safe(r) and r.code not in FACADE_SAFE_RULES_DETECTION_UNSAFE
-    ]
-    unknown_rules = [r for r in rules if r not in safe_rules]
-    t0 = time.monotonic()
-    rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
-    parse_time = time.monotonic() - t0
-    if rst is None:
-        return None  # unrenderable / lexer error -> native (TMP reporting)
-    root = RsSegment(rst.root)
-    if next(root.recursive_crawl("unparsable"), None) is not None:
-        return None  # parse error -> native (PRS violations + exit code)
-    tf = rst.templated_file
-    if tf is None:
-        return None
-    # Templated sources are eligible (arena markers carry the full source
-    # mapping; multi-variant renders crawl every variant tree) EXCEPT when
-    # the render produced templater violations, which native reports
-    # alongside lint results (the façade LintedFile below would drop them).
-    if getattr(rst, "templater_violations", None):
-        return None
-    # ``noqa`` handling, exactly like native (linter.py:490-499): build the
-    # ignore mask from the parsed tree's comments; masked results are dropped
-    # inside the rule crawls and the mask rides on the LintedFile for
-    # unused-noqa warnings. Malformed directives are SQLParseErrors reported
-    # alongside the lint results.
-    ignore_mask, noqa_violations = facade_ignore_mask(
-        root, cfg, rule_pack.reference_map
-    )
-    rule_timings: list[tuple[str, str, float]] = []
-    t1 = time.monotonic()
-    violations = facade_violations(
-        raw_file,
-        fname,
-        cfg,
-        safe_rules,
-        rst=rst,
-        rule_timing_sink=rule_timings,
-        ignore_mask=ignore_mask,
-        reference_map=rule_pack.reference_map,
-    )
-    if violations is None:
-        return None
-    if unknown_rules:
-        unknown_violations = facade_unknown_rule_violations(
-            raw_file,
-            fname,
-            cfg,
-            unknown_rules,
-            ignore_mask=ignore_mask,
-            rule_timing_sink=rule_timings,
-        )
-        if unknown_violations is None:
-            return None  # native reference parse failed -> native
-        # The same templated-area filter facade_violations applies.
-        if cfg.get("ignore_templated_areas", default=True):
-            unknown_violations = Linter.remove_templated_errors(unknown_violations)
-        violations = violations + unknown_violations
-    lint_time = time.monotonic() - t1
-    violations = LintedFile.deduplicate_in_source_space(violations + noqa_violations)
-    # Native's violation post-processing (linter.py:840-843).
-    for violation in violations:
-        violation.ignore_if_in(cfg.get("ignore"))
-        violation.warning_if_in(cfg.get("warnings"))
-    return LintedFile(
-        fname,
-        violations,
-        # The engine templates/lexes/parses in one call, so the whole
-        # front-of-pipeline time lands under "parsing" (the record keys still
-        # match native's; --bench and --persist-timing route to native).
-        timings=FileTimings(
-            {
-                "templating": 0.0,
-                "lexing": 0.0,
-                "parsing": parse_time,
-                "linting": lint_time,
-            },
-            rule_timings,
-        ),
-        # ``LintedDir.add`` reads these for the per-file ``statistics`` record
-        # (char and segment counts); the engine's TemplatedFile and the façade
-        # root duck-type the accessors it uses.
-        tree=root,  # type: ignore[arg-type]
-        ignore_mask=ignore_mask,
-        templated_file=tf,
-        encoding=encoding,
-    )
+    return facade_linted_file(raw_file, fname, cfg, linter, encoding=encoding)
 
 
 def _dispatch_facade_lint_output(

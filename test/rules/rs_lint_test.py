@@ -337,7 +337,15 @@ def test_facade_lint_matches_native(test_case) -> None:
     if fac is None:
         # Engine can't parse this case -> routes to native in production.
         pytest.skip("engine parse unavailable for this case")
-    nat = [v for v in linter.lint_string(src).violations if isinstance(v, SQLLintError)]
+    # NATIVE reference: pin the engine off — lint_string itself fast-paths
+    # via the façade now (the API integration), which would make this a
+    # façade-vs-façade comparison.
+    nat_config = _setup_config(test_case.rule, test_case.configs)
+    nat_config.set_value(["use_rust_engine"], False)
+    nat_linter = Linter(config=nat_config)
+    nat = [
+        v for v in nat_linter.lint_string(src).violations if isinstance(v, SQLLintError)
+    ]
     assert [(v.rule_code(), v.line_no, v.line_pos, v.description) for v in fac] == [
         (v.rule_code(), v.line_no, v.line_pos, v.description) for v in nat
     ]

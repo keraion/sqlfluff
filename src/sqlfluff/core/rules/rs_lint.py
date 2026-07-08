@@ -903,6 +903,13 @@ class RsSegment:
             )
         return new_segment
 
+    def stringify(self, *args: Any, **kwargs: Any) -> str:
+        # Display/debug output (e.g. the rule-testing utilities print the
+        # tree when an expected failure doesn't materialise, and API users
+        # may too). Materialise a native copy and delegate — display-only,
+        # so the copy cost is acceptable.
+        return self.copy().stringify(*args, **kwargs)
+
     def edit(
         self,
         raw: Optional[str] = None,
@@ -1387,6 +1394,7 @@ def facade_fix_loop(
     loop_state: Optional[dict[str, Any]] = None,
     ignore_mask: Any = None,
     reference_map: Optional[dict[str, set[str]]] = None,
+    patch_sink: Optional[list[Any]] = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1473,12 +1481,27 @@ def facade_fix_loop(
         }
 
         for phase in ("main", "post"):
+            rules_this_phase = by_phase[phase]
             nloops = limit if phase == "main" else 2
             for loop in range(nloops):
-                this = rules if (phase == "main" and loop == 0) else by_phase[phase]
                 first_pass = phase == "main" and loop == 0
+                if first_pass:
+                    # Native reassigns to ALL rules on the first pass "to
+                    # compute initial_linting_errors correctly"
+                    # (linter.py:532-536) — and that assignment LEAKS into
+                    # every later loop of the MAIN phase, so post-phase rules
+                    # keep crawling during main loops (the docstring above it
+                    # says otherwise; the code wins). Mirrored deliberately:
+                    # e.g. AL09/CP02/RF06 need CP02's main-loop applications
+                    # for AL09 to see the aliases they make redundant.
+                    rules_this_phase = rules
                 changed = False
-                for rule in this:
+                for rule in rules_this_phase:
+                    # Native skips non-fix-compatible rules after the first
+                    # pass (linter.py:545-553): their added results aren't
+                    # reported to the user anyway.
+                    if not first_pass and not rule.is_fix_compatible:
+                        continue
                     _v, _r, fixes, _m = rule.crawl(
                         tree=root,
                         dialect=dialect_obj,
@@ -1615,8 +1638,300 @@ def facade_fix_loop(
     from sqlfluff.core.linter.patch import merge_source_patches
 
     patches = merge_source_patches(patch_sets)
+    if patch_sink is not None:
+        # For callers building a ``LintedFile`` (the API fast path): the
+        # merged patches are what native stores as ``source_patches`` for
+        # ``fix_string`` to apply.
+        patch_sink[:] = patches
     source_only = tf.source_only_slices()
     slices = LintedFile._slice_source_file_using_patches(
         patches, source_only, tf.source_str
     )
     return LintedFile._build_up_fixed_source_string(slices, patches, tf.source_str)
+
+
+def engine_enabled(config: Any) -> bool:
+    """Whether ``core.use_rust_engine`` permits the engine (and it imports).
+
+    Mirrors the CLI's ``_use_rust_engine`` minus the output-format concern:
+    explicit False disables; anything else (``auto``/True) requires the
+    extension to import with the engine entrypoints present.
+    """
+    val = config.get("use_rust_engine")
+    if val in (False, "False", "false", 0, "0"):
+        return False
+    try:
+        import sqlfluffrs
+
+        return hasattr(sqlfluffrs, "engine_parse_to_tree")
+    except ImportError:  # pragma: no cover
+        return False
+
+
+def facade_linted_file(
+    raw_file: str,
+    fname: str,
+    cfg: Any,
+    linter: Any,
+    encoding: str = "utf-8",
+) -> Optional[Any]:
+    """Lint one source over the arena façade into a ``LintedFile``, or ``None``.
+
+    The per-file core of the lint fast path (shared by the CLI gates and
+    ``Linter.lint_string``): eligibility routing (engine enabled, parses via
+    the engine with no unparsable section, violation-free render), noqa
+    masks, the safe/unknown rule crawl split, and native's violation
+    post-processing. Returns a real ``LintedFile`` so every downstream
+    consumer (formatters, ``as_records``, stats, exit codes, the API)
+    behaves natively — NOTE its ``tree`` is the façade root (a duck-typed
+    ``RsSegment``), not a native ``BaseSegment``.
+    """
+    import time
+
+    import sqlfluffrs
+    from sqlfluff.core.linter import Linter as _Linter
+    from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
+
+    if not engine_enabled(cfg):
+        return None
+    # A custom templater INSTANCE on the linter is authoritative for
+    # native rendering (``render_string`` uses ``self.templater``); the
+    # engine renders via ``config.get_templater()`` and would silently use
+    # the CONFIGURED templater instead. Route custom-templater linters to
+    # native (e.g. ``Linter(templater=...)`` API usage).
+    _custom_templater = getattr(linter, "templater", None)
+    if (
+        _custom_templater is not None
+        and type(_custom_templater) is not cfg.get_templater_class()
+    ):
+        return None
+    if not raw_file:
+        # Not façade-eligible: under a templater whose zero-byte render keeps
+        # a raw slice (e.g. ``raw``), native lexes a zero-width placeholder
+        # that LT12 lints — and the arena's bare ``file`` node also makes the
+        # statistics record differ (no end-of-file meta). Native handles it
+        # trivially fast.
+        return None
+    rule_pack = linter.get_rulepack(config=cfg)
+    rules = list(rule_pack.rules)
+    if not rules:
+        return None
+    # Façade-safe rules (core allowlist or an explicit plugin
+    # ``rust_compatible`` opt-in) crawl the façade; anything else runs on
+    # the classic Python pipeline via ``facade_unknown_rule_violations``.
+    safe_rules = [
+        r
+        for r in rules
+        if rule_is_facade_safe(r) and r.code not in FACADE_SAFE_RULES_DETECTION_UNSAFE
+    ]
+    unknown_rules = [r for r in rules if r not in safe_rules]
+    t0 = time.monotonic()
+    rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
+    parse_time = time.monotonic() - t0
+    if rst is None:
+        return None  # unrenderable / lexer error -> native (TMP reporting)
+    root = RsSegment(rst.root)
+    if next(root.recursive_crawl("unparsable"), None) is not None:
+        return None  # parse error -> native (PRS violations + exit code)
+    tf = rst.templated_file
+    if tf is None:
+        return None
+    # Templated sources are eligible (arena markers carry the full source
+    # mapping; multi-variant renders crawl every variant tree) EXCEPT when
+    # the render produced templater violations, which native reports
+    # alongside lint results (the façade LintedFile below would drop them).
+    if getattr(rst, "templater_violations", None):
+        return None
+    # ``noqa`` handling, exactly like native (linter.py:490-499): build the
+    # ignore mask from the parsed tree's comments; masked results are dropped
+    # inside the rule crawls and the mask rides on the LintedFile for
+    # unused-noqa warnings. Malformed directives are SQLParseErrors reported
+    # alongside the lint results.
+    ignore_mask, noqa_violations = facade_ignore_mask(
+        root, cfg, rule_pack.reference_map
+    )
+    rule_timings: list[tuple[str, str, float]] = []
+    t1 = time.monotonic()
+    violations = facade_violations(
+        raw_file,
+        fname,
+        cfg,
+        safe_rules,
+        rst=rst,
+        rule_timing_sink=rule_timings,
+        ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
+    )
+    if violations is None:
+        return None
+    if unknown_rules:
+        unknown_violations = facade_unknown_rule_violations(
+            raw_file,
+            fname,
+            cfg,
+            unknown_rules,
+            ignore_mask=ignore_mask,
+            rule_timing_sink=rule_timings,
+        )
+        if unknown_violations is None:
+            return None  # native reference parse failed -> native
+        # The same templated-area filter facade_violations applies.
+        if cfg.get("ignore_templated_areas", default=True):
+            unknown_violations = _Linter.remove_templated_errors(unknown_violations)
+        violations = violations + unknown_violations
+    lint_time = time.monotonic() - t1
+    violations = LintedFile.deduplicate_in_source_space(violations + noqa_violations)
+    # Native's violation post-processing (linter.py:840-843).
+    for violation in violations:
+        violation.ignore_if_in(cfg.get("ignore"))
+        violation.warning_if_in(cfg.get("warnings"))
+    return LintedFile(
+        fname,
+        violations,
+        # The engine templates/lexes/parses in one call, so the whole
+        # front-of-pipeline time lands under "parsing" (the record keys still
+        # match native's; --bench and --persist-timing route to native).
+        timings=FileTimings(
+            {
+                "templating": 0.0,
+                "lexing": 0.0,
+                "parsing": parse_time,
+                "linting": lint_time,
+            },
+            rule_timings,
+        ),
+        # ``LintedDir.add`` reads these for the per-file ``statistics`` record
+        # (char and segment counts); the engine's TemplatedFile and the façade
+        # root duck-type the accessors it uses.
+        tree=root,  # type: ignore[arg-type]
+        ignore_mask=ignore_mask,
+        templated_file=tf,
+        encoding=encoding,
+    )
+
+
+def facade_fixed_linted_file(
+    raw_file: str,
+    fname: str,
+    cfg: Any,
+    linter: Any,
+    encoding: str = "utf-8",
+) -> Optional[Any]:
+    """FIX one source over the arena façade into a ``LintedFile``, or ``None``.
+
+    The fix-mode counterpart of :func:`facade_linted_file` for
+    ``Linter.lint_string(fix=True)``: runs the arena mutation loop, stores
+    the merged source patches on the ``LintedFile`` (native's
+    ``source_patches``) so ``fix_string()`` reconstructs identically, and
+    reports the pre-fix violations like native's ``initial_linting_errors``.
+    Fix requires EVERY rule to be façade-safe (no split-crawl); anything
+    else — or a runaway loop revert — returns ``None`` for native handling.
+    """
+    import time
+
+    import sqlfluffrs
+    from sqlfluff.core.linter.linted_file import FileTimings, LintedFile
+
+    if not engine_enabled(cfg):
+        return None
+    # A custom templater INSTANCE on the linter is authoritative for
+    # native rendering (``render_string`` uses ``self.templater``); the
+    # engine renders via ``config.get_templater()`` and would silently use
+    # the CONFIGURED templater instead. Route custom-templater linters to
+    # native (e.g. ``Linter(templater=...)`` API usage).
+    _custom_templater = getattr(linter, "templater", None)
+    if (
+        _custom_templater is not None
+        and type(_custom_templater) is not cfg.get_templater_class()
+    ):
+        return None
+    if not raw_file:
+        return None
+    rule_pack = linter.get_rulepack(config=cfg)
+    rules = list(rule_pack.rules)
+    if not rules or any(not rule_is_facade_safe(r) for r in rules):
+        return None
+    t0 = time.monotonic()
+    rst = sqlfluffrs.engine_parse_to_tree(raw_file, fname, cfg, None, True)
+    parse_time = time.monotonic() - t0
+    if rst is None:
+        return None
+    root = RsSegment(rst.root)
+    if next(root.recursive_crawl("unparsable"), None) is not None:
+        return None
+    tf = rst.templated_file
+    if tf is None:
+        return None
+    if getattr(rst, "templater_violations", None):
+        return None
+    ignore_mask, noqa_violations = facade_ignore_mask(
+        root, cfg, rule_pack.reference_map
+    )
+    pre: list[Any] = list(noqa_violations)
+    loop_state: dict[str, Any] = {}
+    patches: list[Any] = []
+    t1 = time.monotonic()
+    facade_fix_loop(
+        raw_file,
+        fname,
+        cfg,
+        rules,
+        int(cfg.get("runaway_limit")),
+        rst=rst,
+        lint_sink=pre,
+        loop_state=loop_state,
+        ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
+        patch_sink=patches,
+    )
+    lint_time = time.monotonic() - t1
+    if loop_state.get("runaway"):
+        # Native's runaway bookkeeping (strip fixes, all-unfixable) is not
+        # reproduced here -> native owns the file.
+        return None
+    violations = LintedFile.deduplicate_in_source_space(pre)
+    # Native's violation post-processing (linter.py:840-843).
+    for violation in violations:
+        violation.ignore_if_in(cfg.get("ignore"))
+        violation.warning_if_in(cfg.get("warnings"))
+    return LintedFile(
+        fname,
+        violations,
+        timings=FileTimings(
+            {
+                "templating": 0.0,
+                "lexing": 0.0,
+                "parsing": parse_time,
+                "linting": lint_time,
+            },
+            [],
+        ),
+        # The MUTATED façade root: ``fix_string()`` uses the stored
+        # ``source_patches`` below (native's merged-variant mechanism), so it
+        # never re-walks the tree — but stats/serialisation duck-type it.
+        tree=root,  # type: ignore[arg-type]
+        ignore_mask=ignore_mask,
+        templated_file=tf,
+        encoding=encoding,
+        source_patches=patches,
+    )
+
+
+def try_facade_lint_string(
+    in_str: str,
+    fname: str,
+    config: Any,
+    linter: Any,
+    fix: bool = False,
+    encoding: str = "utf8",
+) -> Optional[Any]:
+    """The ``Linter.lint_string`` fast-path entry: a ``LintedFile`` or ``None``.
+
+    Never raises — ANY failure defers to the native pipeline.
+    """
+    try:
+        if fix:
+            return facade_fixed_linted_file(in_str, fname, config, linter, encoding)
+        return facade_linted_file(in_str, fname, config, linter, encoding)
+    except Exception:  # noqa: BLE001 — any uncertainty -> native handles it
+        return None

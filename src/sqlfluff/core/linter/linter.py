@@ -1079,9 +1079,27 @@ class Linter:
         Returns:
             :obj:`LintedFile`: an object representing that linted file.
 
+        NOTE: When the Rust engine is enabled (``use_rust_engine``, default
+        ``auto``) and this linter carries no formatter, eligible sources are
+        linted/fixed over the Rust arena façade — same violations, counts and
+        ``fix_string()`` bytes, but the returned ``LintedFile.tree`` is a
+        duck-typed façade segment rather than a native ``BaseSegment``.
+        Anything the façade can't cover identically falls back to the native
+        pipeline below. Set ``use_rust_engine = False`` to pin native.
         """
         # Sort out config, defaulting to the built in config if no override
         config = config or self.config
+        # EXPERIMENTAL: Rust-engine façade fast path (API usage only — a
+        # formatter implies CLI-style per-file output dispatch, which the
+        # native path below performs and the CLI's own gates handle).
+        if self.formatter is None:
+            from sqlfluff.core.rules.rs_lint import try_facade_lint_string
+
+            _linted = try_facade_lint_string(
+                in_str, fname, config, self, fix=fix, encoding=encoding
+            )
+            if _linted is not None:
+                return _linted
         # Parse the string.
         parsed = self.parse_string(
             in_str=in_str,

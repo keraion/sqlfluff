@@ -27,6 +27,10 @@ def _linter(policy, use_rust_rules, ignore_words=None):
         "dialect=ansi",
         "rules=CP01",
         "use_rust_parser=True",
+        # These tests exercise the NATIVE pipeline's tree-based CP01 rust
+        # dispatch — pin the engine off so lint_string doesn't take the
+        # arena-façade fast path (which has its own arena-side CP01 entry).
+        "use_rust_engine=False",
         f"use_rust_rules={use_rust_rules}",
         "[sqlfluff:rules:capitalisation.keywords]",
         f"capitalisation_policy={policy}",
@@ -165,8 +169,10 @@ def test__dispatch__cp04_not_hijacked_by_cp01_rust_path():
 def test__dispatch__rust_error_is_recoverable():
     """A Rust-side error surfaces as a violation, not a crash that aborts linting."""
     cfg = FluffConfig.from_string(
+        # Engine pinned off: this exercises the NATIVE pipeline's dispatch
+        # error handling (see _linter above).
         "[sqlfluff]\ndialect=ansi\nrules=CP01\nuse_rust_parser=True\n"
-        "use_rust_rules=True\n"
+        "use_rust_engine=False\nuse_rust_rules=True\n"
     )
     with mock.patch("sqlfluffrs.cp01_violations", side_effect=RuntimeError("boom")):
         result = Linter(config=cfg).lint_string("SeLeCt 1", fix=False)

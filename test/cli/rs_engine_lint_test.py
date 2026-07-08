@@ -39,7 +39,13 @@ def _linter(rules: str, engine: str = "true", dialect: str = "ansi") -> Linter:
 
 
 def _native_violation_tuples(linter_rules: str, src: str) -> list[tuple]:
-    config = FluffConfig(overrides={"dialect": "ansi", "rules": linter_rules})
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "rules": linter_rules,
+            "use_rust_engine": False,
+        }
+    )
     return [
         (v.rule_code(), v.line_no, v.line_pos, v.description)
         for v in Linter(config=config).lint_string(src).violations

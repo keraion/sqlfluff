@@ -268,6 +268,39 @@ variant native never sees. The cap is mirrored now (a cost fix for
 Baselines after: templated lint AND fix 269 eligible of 282 (was 229) /
 0 divergences / 0 errors; literal sweeps and full suites unchanged.
 
+## Python API on the façade fast path (2026-07-08)
+
+``Linter.lint_string`` (the funnel for ``sqlfluff.lint``/``sqlfluff.fix``
+and ``lint_string_wrapped``) now tries the façade first when
+``use_rust_engine`` permits AND the linter carries NO formatter (a
+formatter implies CLI-style per-file dispatch that only the native path
+performs; the CLI has its own gates). The shared per-file core moved to
+``rs_lint.facade_linted_file`` (the CLI's ``_facade_lint_file`` is now a
+thin wrapper); fix mode builds a ``LintedFile`` whose ``source_patches``
+carry the loop's merged patches so ``fix_string()`` reconstructs
+byte-identically. NOTE: a fast-pathed ``LintedFile.tree`` is the façade
+root (duck-typed), not a native ``BaseSegment`` — documented on
+``lint_string``. Custom templater INSTANCES on the linter route to
+native (the engine renders via ``config.get_templater()``, which ignores
+them — caught by the mocked-templater dedup test). ``RsSegment`` gained
+``stringify()`` (materialise + delegate; the rule-testing utilities call
+it).
+
+**Major latent bug found** (via the AL09/CP02/RF06 combo test, config no
+corpus run used): the façade fix loop's phase model scoped the all-rules
+crawl to the first pass only. Native reassigns
+``rules_this_phase = rule_pack.rules`` on the first pass and the
+assignment LEAKS into every later MAIN-phase loop (linter.py:532-536 —
+its own comment says post rules skip intervening loops; the code wins).
+Cascades where a post-phase rule's main-loop application unlocks a
+main-phase rule (CP02 lowercases ``C as C`` -> AL09 strips the redundant
+alias) converged differently — latent in the CLI fast path all along.
+Also mirrored: non-fix-compatible rules skip after the first pass.
+
+Native-reference discipline reminder, now sharper: ``lint_string``
+itself fast-paths — ANY probe using it as the native side must pin
+``use_rust_engine = False`` (several façade tests were re-pinned).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser
