@@ -301,6 +301,41 @@ Native-reference discipline reminder, now sharper: ``lint_string``
 itself fast-paths — ANY probe using it as the native side must pin
 ``use_rust_engine = False`` (several façade tests were re-pinned).
 
+## PY_TEMPLATED_FILE_CACHE collision + growth: FIXED (2026-07-08)
+
+The upstream (#7386-era) conversion cache in
+``sqlfluffrs_python/src/templater/templatefile.rs`` was keyed by
+``fname:source_str:templated_str`` — unsound, since two TemplatedFiles
+can share all three strings with different SLICINGS (jinja vs raw over
+the same rendered text; minimal case an empty file), making the second
+conversion silently reuse the first's slices (LT12 flips, and the
+mismatched pair could crash ``fix_string`` in
+``generate_source_patches``). It also never evicted.
+
+Now keyed by PYTHON OBJECT IDENTITY (address) with a ``weakref.ref``
+whose callback evicts the entry on GC — the ref itself is stored in the
+entry so the callback stays alive, entries die with their objects
+(bounded by live TemplatedFiles), and a recycled address can never hit
+a stale entry (eviction runs during dealloc, before reuse). Identity
+keying preserves the cache's real contract: one Python object → one
+``Arc<TemplatedFile>`` (marker combination compares Arcs by pointer
+first, value fallback second — sqlfluffrs_python/src/marker.rs:147).
+Two extras: the lock is NO LONGER held across the getattr extraction
+(GC-triggered eviction callbacks take the same lock — deadlock
+otherwise), and actual ``RsTemplatedFile`` objects short-circuit via
+downcast. Hit path got cheaper (pointer read vs three string extracts +
+format!).
+
+Cross-templater single-process probes are now reliable; the pitfall
+below (same-source dual-templater comparisons) is resolved, though
+native-side pinning discipline still applies for OTHER reasons.
+Regression tests: test/core/rules/rs_templatedfile_cache_test.py
+(collision via span-marker literalness — POINT markers can't
+discriminate, both slicings report literal; eviction with a
+gc.collect() BEFORE baselining, or prior tests' pending garbage drags
+the count below base under xdist; the original jinja-then-raw
+empty-file symptom).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

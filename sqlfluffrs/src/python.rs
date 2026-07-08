@@ -47,5 +47,15 @@ fn sqlfluffrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::engine_entry::engine_parse_to_tree,
         m
     )?)?;
+    // TemplatedFile conversion-cache internals (weakref eviction + test
+    // introspection).
+    m.add_function(wrap_pyfunction!(
+        sqlfluffrs_python::templater::templatefile::evict_templated_file_cache_entry,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        sqlfluffrs_python::templater::templatefile::templated_file_cache_len,
+        m
+    )?)?;
     Ok(())
 }
