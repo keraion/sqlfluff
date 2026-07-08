@@ -284,7 +284,7 @@ def test_facade_fix_noqa_masks_fixes_like_native(tmp_path) -> None:
     linter = Linter(config=c)
     stream = make_output_stream(c)
     formatter = OutputStreamFormatter(stream, False)
-    remaining, _fixable, _unfixable = _try_facade_paths_fix(
+    remaining, _fixable, _unfixable, _records, _pending = _try_facade_paths_fix(
         linter, formatter, (str(tmp_path),), "", True
     )
     assert remaining == []  # facade handled the file

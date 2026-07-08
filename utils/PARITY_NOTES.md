@@ -219,6 +219,32 @@ harness sets them). NOTE: the dbt env's click version can't import
 ``sqlfluff.cli.commands``, so the harness mirrors the gate logic inline
 instead of calling the production functions.
 
+## CLI-flag carve-outs closed on the fix fast path (2026-07-07)
+
+- ``[sqlfluff:warnings]`` (and the ``ignore`` config) now apply on both
+  fix gates: native's ``ignore_if_in``/``warning_if_in`` post-processing
+  runs over the harvested violations; warned/ignored drop out of every
+  count while their fixes still apply, and the per-file display mirrors
+  ``dispatch_file_violations`` (ignored dropped, warned shown,
+  unused-noqa warnings appended under ``warn_unused_ignores``). Files
+  with non-``SQLLintError`` violations (e.g. malformed-noqa parse
+  errors) route to native, whose parse-error machinery owns them.
+- ``fix --check`` engages the fast path: fixes are computed but held as
+  pending writes; the confirmation prompt in ``_paths_fix`` writes them
+  (with the FIXED dispatch) on confirm and discards on abort.
+- ``--show-lint-violations``: façade-handled files contribute records,
+  merged with native's and rendered in path order (native's
+  ``as_records`` sort). Previously such files routed wholesale.
+- ``--bench``/``--persist-timing`` still route to native BY DESIGN: they
+  exist to produce native's per-file timing records.
+
+Two integration traps caught by the CLI test suite: an empty
+``remaining`` list must only produce an empty ``LintingResult`` when the
+FAÇADE emptied it (a no-path invocation relies on ``lint_paths(())``
+defaulting to CWD), and the unfixable-violations section must merge and
+SORT façade+native records (files split across engines otherwise break
+the alphabetical ordering).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

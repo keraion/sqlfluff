@@ -197,3 +197,86 @@ def test_facade_fix_plugin_rule_opt_in() -> None:
     nat_res = Linter(config=nat_cfg).lint_string(src, fix=True)
     assert fixed == nat_res.fix_string()[0]
     assert num_unfixable == 1  # the Example_L001 finding has no fixes
+
+
+def test_facade_fix_warnings_config_matches_native() -> None:
+    """[sqlfluff:warnings] demotion works on the fix fast path.
+
+    A warned rule's violations drop out of the unfixable count (no failure
+    exit) but its fixes still apply — exactly like native.
+    """
+    src = "SeLeCt * from tbl\n"  # AM04: unfixable; CP01: fixable
+    linter = Linter(
+        config=FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "rules": "AM04,CP01",
+                "warnings": "AM04",
+                "use_rust_engine": "true",
+            }
+        )
+    )
+    result = _try_facade_stdin_fix(linter, src, None)
+    assert result is not None  # warnings config no longer routes to native
+    fixed, num_unfixable = result
+    nat = (
+        Linter(config=FluffConfig(overrides={"dialect": "ansi", "rules": "AM04,CP01"}))
+        .lint_string(src, fix=True)
+        .fix_string()[0]
+    )
+    assert fixed == nat  # CP01 fixes still applied
+    assert fixed != src
+    assert num_unfixable == 0  # the AM04 finding is demoted to a warning
+
+    # Same config WITHOUT the demotion: the finding counts.
+    linter2 = _linter("AM04,CP01")
+    result2 = _try_facade_stdin_fix(linter2, src, None)
+    assert result2 is not None
+    assert result2[1] == 1
+
+
+def test_fix_check_mode_uses_facade_and_defers_writes(tmp_path) -> None:
+    """`fix --check` engages the fast path; writes wait for confirmation."""
+    from click.testing import CliRunner
+
+    from sqlfluff.cli.commands import fix
+
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nuse_rust_engine = True\nuse_rust_parser = True\n"
+    )
+    src = "select a ,  b from tbl\n"
+    f = tmp_path / "dirty.sql"
+
+    # Decline: nothing written.
+    f.write_text(src)
+    result = CliRunner().invoke(fix, ["--check", "--rules", "LT01", str(f)], input="n")
+    assert "Aborting" in result.output
+    assert f.read_text() == src
+
+    # Confirm: the façade's held-back fix is written.
+    f.write_text(src)
+    result = CliRunner().invoke(fix, ["--check", "--rules", "LT01", str(f)], input="y")
+    assert result.exit_code == 0, result.output
+    assert f.read_text() == "select a, b from tbl\n"
+
+
+def test_fix_show_lint_violations_renders_facade_records(tmp_path) -> None:
+    """--show-lint-violations renders unfixables from façade-handled files."""
+    from click.testing import CliRunner
+
+    from sqlfluff.cli.commands import fix
+
+    (tmp_path / ".sqlfluff").write_text(
+        "[sqlfluff]\ndialect = ansi\nuse_rust_engine = True\nuse_rust_parser = True\n"
+    )
+    # AM04 (unfixable) + LT01 (fixable) in one file.
+    f = tmp_path / "mixed.sql"
+    f.write_text("select  * from tbl\n")
+
+    result = CliRunner().invoke(
+        fix,
+        ["--show-lint-violations", "--rules", "AM04,LT01", str(f)],
+    )
+    assert "==== lint for unfixable violations ====" in result.output
+    assert "AM04" in result.output  # the unfixable finding is rendered
+    assert f.read_text() == "select * from tbl\n"  # LT01 fix applied
