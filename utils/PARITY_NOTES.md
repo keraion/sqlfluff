@@ -394,6 +394,38 @@ that was unreachable while the gate existed (condition now includes
 
 Nothing routes for CLI flags anymore.
 
+## Benchmark snapshot (2026-07-08, post -p N + flags + API)
+
+Min-of-3 subprocess CLI wall-clock, 20-core box, release wheel.
+
+Testbed (jinja-heavy, 191 small files + 7 large-file skips):
+  parse 3.58x | lint -p1 1.32x | lint -p8 ~0.9x | fix -p1 ~1.0x | fix -p8 ~0.9x
+Literal corpus (100 x 8KB, nothing routes):
+  parse 3.84x | lint -p1 1.50x | lint -p8 2.31x | fix -p1 1.82x | fix -p8 1.64x
+Python API (Linter.lint_string, in-process, per-call):
+  lint 2.3-2.5x | fix 1.8-2.2x (holds from 0.7KB to 23KB)
+
+Reading the shape:
+- parse-type work (the engine's core) is a steady ~3.6-3.8x end-to-end.
+- lint/fix wins scale with file size and literal-ness: per-rule PYTHON
+  crawl overhead (shared by both engines) dominates small files —
+  --persist-timing showed testbed per-file work at 4.81s engine vs
+  6.74s native (1.40x) with wall diluted to 1.32x by startup/config.
+- lint -p8 LITERAL 2.31x > -p1 1.50x: the façade pool parallelizes the
+  WHOLE pipeline per worker while native renders in its main process.
+- testbed -p8 slightly UNDER native: fixed-cost regime (spawn + import
+  ~= the total useful work for 191 tiny files); ruled OUT the
+  second-pool theory by deleting the 7 skip files (still ~0.9x).
+- Profiling found + fixed a real waste: facade_lint_file_unit built the
+  rulepack TWICE per file (~10% of the small-file unit) — dedup took
+  testbed lint -p1 from 1.19x to 1.32x.
+
+Known follow-up opportunities (not taken): per-directory child-config
+caching (dialect_selector is ~5ms/file in FluffConfig construction —
+but inline `-- sqlfluff:` directives mutate the child, so a cache needs
+copy-on-use); running routed files natively INSIDE the façade pool
+workers (needs SQLFluffSkipFile accounting to ride the transport).
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

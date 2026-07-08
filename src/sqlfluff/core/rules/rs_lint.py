@@ -1688,6 +1688,7 @@ def facade_linted_file(
     cfg: Any,
     linter: Any,
     encoding: str = "utf-8",
+    rule_pack: Any = None,
 ) -> Optional[Any]:
     """Lint one source over the arena façade into a ``LintedFile``, or ``None``.
 
@@ -1726,7 +1727,8 @@ def facade_linted_file(
         # statistics record differ (no end-of-file meta). Native handles it
         # trivially fast.
         return None
-    rule_pack = linter.get_rulepack(config=cfg)
+    if rule_pack is None:
+        rule_pack = linter.get_rulepack(config=cfg)
     rules = list(rule_pack.rules)
     if not rules:
         return None
@@ -2164,10 +2166,15 @@ def facade_lint_file_unit(fname: str, root_config: Any, linter: Any) -> tuple:
     from sqlfluff.core.linter import Linter as _Linter
 
     raw, cfg, encoding = _Linter.load_raw_file_and_config(fname, root_config)
-    lf = facade_linted_file(raw, fname, cfg, linter, encoding=encoding)
+    # ONE rulepack per file (building it is ~3.5ms — doubling it up showed in
+    # profiles as ~10% of the whole small-file unit).
+    rule_pack = linter.get_rulepack(config=cfg)
+    lf = facade_linted_file(
+        raw, fname, cfg, linter, encoding=encoding, rule_pack=rule_pack
+    )
     if lf is None:
         return ("routed", fname, None, None, False)
-    codes = sorted(r.code for r in linter.get_rulepack(config=cfg).rules)
+    codes = sorted(r.code for r in rule_pack.rules)
     return (
         "handled",
         fname,
