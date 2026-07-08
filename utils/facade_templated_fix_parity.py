@@ -73,8 +73,6 @@ def facade_fix(src: str, fname: str, cfg) -> "str | None":
     tf = rst.templated_file
     if tf is None:
         return None
-    if getattr(rst, "num_variants", 1) > 1:
-        return None
     if getattr(rst, "templater_violations", None):
         return None
     # noqa masks are applied facade-side now (like the CLI gates).
@@ -93,6 +91,7 @@ def facade_fix(src: str, fname: str, cfg) -> "str | None":
         lint_sink=pre,
         loop_state=loop_state,
         ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
     )
     if loop_state.get("runaway"):
         return None

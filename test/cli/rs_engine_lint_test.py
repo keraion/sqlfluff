@@ -395,3 +395,50 @@ def test_facade_unknown_rule_never_crawls_facade() -> None:
     out = facade_unknown_rule_violations(src, "<t>", cfg, [FakeIncompatibleRule()])
     assert out is not None and [v.description for v in out] == ["fake finding"]
     assert "RsSegment" not in crawled_trees  # façade never attempted
+
+
+def test_facade_lint_multi_variant_render_matches_native() -> None:
+    """Multi-variant renders lint every variant tree and merge like native.
+
+    An untaken jinja branch's violations only surface via the alternate
+    variants (native lints every parsed variant, capped at
+    render_variant_limit); the façade must produce the identical merged set.
+    """
+    from sqlfluff.cli.commands import _facade_lint_file
+
+    src = (
+        "{% if true %}\n"
+        "select a ,  b from tbl\n"
+        "{% else %}\n"
+        "select c ,  d from other_tbl\n"
+        "{% endif %}\n"
+    )
+
+    def cfg(rust: bool) -> FluffConfig:
+        return FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "templater": "jinja",
+                "rules": "LT01",
+                "use_rust_engine": rust,
+                "use_rust_parser": rust,
+                "use_rust_rules": rust,
+            }
+        )
+
+    def keys(violations):
+        return sorted(
+            (v.rule_code(), v.line_no, v.line_pos)
+            for v in violations
+            if isinstance(v, SQLLintError)
+        )
+
+    c = cfg(True)
+    linted = _facade_lint_file(src, "multi.sql", c, Linter(config=c))
+    assert linted is not None  # multi-variant no longer routes to native
+    fac = keys(linted.violations)
+    nat = keys(Linter(config=cfg(False)).lint_string(src).violations)
+    assert fac == nat
+    # The untaken else-branch's LT01s are present (only an alternate
+    # variant can see them).
+    assert any(k[1] == 4 for k in fac)

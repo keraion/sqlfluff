@@ -1225,12 +1225,9 @@ def _facade_lint_file(
     if tf is None:
         return None
     # Templated sources are eligible (arena markers carry the full source
-    # mapping) EXCEPT when the render itself needs native handling: native
-    # lints EVERY variant and merges (the arena tree is only the first),
-    # and reports templater violations alongside lint results (which the
-    # façade LintedFile below would drop).
-    if getattr(rst, "num_variants", 1) > 1:
-        return None
+    # mapping; multi-variant renders crawl every variant tree) EXCEPT when
+    # the render produced templater violations, which native reports
+    # alongside lint results (the façade LintedFile below would drop them).
     if getattr(rst, "templater_violations", None):
         return None
     # ``noqa`` handling, exactly like native (linter.py:490-499): build the
@@ -1251,6 +1248,7 @@ def _facade_lint_file(
         rst=rst,
         rule_timing_sink=rule_timings,
         ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
     )
     if violations is None:
         return None
@@ -1520,13 +1518,11 @@ def _try_facade_stdin_fix(
             return None
         # Templated sources are eligible (fix reconstruction runs native
         # ``generate_source_patches`` against the real TemplatedFile, which
-        # only patches literal regions) EXCEPT when the render itself needs
-        # native handling: multi-variant renders (native lints/fixes over
-        # every variant) and violation-bearing renders (TMP reporting).
+        # only patches literal regions; multi-variant renders fix every
+        # variant tree and merge patches) EXCEPT violation-bearing renders
+        # (TMP reporting stays native).
         tf = rst.templated_file
         if tf is None:
-            return None
-        if getattr(rst, "num_variants", 1) > 1:
             return None
         if getattr(rst, "templater_violations", None):
             return None
@@ -1553,6 +1549,7 @@ def _try_facade_stdin_fix(
             lint_sink=pre,
             loop_state=loop_state,
             ignore_mask=ignore_mask,
+            reference_map=rule_pack.reference_map,
         )
         # A runaway revert is the one gave-up case whose bookkeeping we don't
         # reproduce (native strips the fixes from every reported violation,
@@ -1727,14 +1724,11 @@ def _try_facade_paths_fix(
                 if next(root.recursive_crawl("unparsable"), None) is not None:
                     remaining.append(fname)
                     continue
-                # Templated sources are eligible except when the render needs
-                # native handling (see ``_try_facade_stdin_fix``): multi-variant
-                # or violation-bearing renders route to native.
+                # Templated sources are eligible except violation-bearing
+                # renders (see ``_try_facade_stdin_fix``); multi-variant
+                # renders fix every variant tree and merge patches.
                 tf = rst.templated_file
                 if tf is None:
-                    remaining.append(fname)
-                    continue
-                if getattr(rst, "num_variants", 1) > 1:
                     remaining.append(fname)
                     continue
                 if getattr(rst, "templater_violations", None):
@@ -1764,6 +1758,7 @@ def _try_facade_paths_fix(
                     lint_sink=pre,
                     loop_state=loop_state,
                     ignore_mask=ignore_mask,
+                    reference_map=rule_pack.reference_map,
                 )
                 # A runaway revert is the one gave-up case whose bookkeeping
                 # we don't reproduce (native strips the fixes from every

@@ -250,9 +250,12 @@ class RsTree:
     # an empty list for a clean render). Native lint reports these, so a
     # violation-bearing render must route to native.
     templater_violations: Optional[list[Any]]
-    # Variants the render produced. Native lints EVERY variant; the arena tree
-    # is only the first, so multi-variant renders must route to native.
+    # Variants the render produced. Native lints EVERY variant and merges.
     num_variants: int
+    # Arena trees for the render's ALTERNATE variants (root variant is this
+    # tree), each carrying its own ``templated_file``. Variants that failed
+    # to parse are omitted (native's ``not alternate_variant.tree`` skip).
+    alternate_trees: list["RsTree"]
     # Mutation epoch — bumped once per committed edit batch. Python wrapper
     # caches key their validity off this.
     epoch: int

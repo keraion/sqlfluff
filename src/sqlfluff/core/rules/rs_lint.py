@@ -1091,6 +1091,7 @@ def facade_violations(
     rst: Any = None,
     rule_timing_sink: Optional[list[tuple[str, str, float]]] = None,
     ignore_mask: Any = None,
+    reference_map: Optional[dict[str, set[str]]] = None,
 ) -> Optional[list[Any]]:
     """Crawl ``rules`` over the arena façade and return their ``SQLLintError``s.
 
@@ -1102,6 +1103,12 @@ def facade_violations(
     directives used). Build one with :func:`facade_ignore_mask`; the caller
     owns reporting the malformed-noqa violations it returns and storing the
     mask on the ``LintedFile`` (unused-noqa warnings).
+
+    Multi-variant renders: every ALTERNATE variant tree is crawled too and
+    the results merge (native lints every variant, linter.py:779-805).
+    ``reference_map`` (the rule pack's), when given, builds each alternate's
+    own noqa mask — untaken template branches can carry their own
+    directives — and their malformed-directive violations join the output.
 
     ``rst`` may be a tree already parsed from ``source`` (the crawl is read-only,
     so a caller can share one parse across the gate checks, the pre-count and the
@@ -1164,6 +1171,31 @@ def facade_violations(
         if rule_timing_sink is not None:
             rule_timing_sink.append((rule.code, rule.name, time.monotonic() - t0))
         out.extend(lints)
+    # ALTERNATE variants (native lints every variant and merges the results
+    # — linter.py:779-805): crawl each alternate tree with its own noqa mask
+    # and templated file, appending after the root's results so the shared
+    # templated-area filter + source-space dedupe below merge them exactly
+    # like native's LintedFile handling. Native discards alternate timings.
+    for alt in getattr(rst, "alternate_trees", []) or []:
+        alt_tf = alt.templated_file
+        if alt_tf is None:  # pragma: no cover
+            continue
+        alt_root = RsSegment(alt.root)
+        alt_mask = None
+        if reference_map is not None:
+            alt_mask, alt_ivs = facade_ignore_mask(alt_root, config, reference_map)
+            out.extend(alt_ivs)
+        for rule in rules:
+            lints, _, _, _ = rule.crawl(
+                tree=alt_root,
+                dialect=dialect_obj,
+                fix=False,
+                templated_file=alt_tf,
+                ignore_mask=alt_mask,
+                fname=fname,
+                config=config,
+            )
+            out.extend(lints)
     # Native filters out lint errors anchored in templated (non-literal)
     # sections unless the anchor is semantically literal or the rule targets
     # templated code (``Linter.remove_templated_errors``, applied in
@@ -1354,6 +1386,7 @@ def facade_fix_loop(
     lint_sink: Optional[list[Any]] = None,
     loop_state: Optional[dict[str, Any]] = None,
     ignore_mask: Any = None,
+    reference_map: Optional[dict[str, set[str]]] = None,
 ) -> str:
     """Iteratively fix ``source`` by MUTATING the arena (no reparse).
 
@@ -1384,6 +1417,16 @@ def facade_fix_loop(
 
     ``ignore_mask`` (see :func:`facade_ignore_mask`) drops masked results
     and their fixes inside the crawls, exactly like native.
+
+    Multi-variant renders run the SAME loop over every variant tree
+    (native ``lint_parsed`` runs ``lint_fix_parsed`` per variant,
+    linter.py:779-805) and the per-variant patches merge via
+    ``merge_source_patches``. ``reference_map`` (the rule pack's), when
+    given, builds each ALTERNATE variant's own noqa mask — untaken
+    template branches can carry their own directives; the root's mask
+    arrives via ``ignore_mask``. A runaway on ANY variant defers the whole
+    file (native reverts just that variant; deferral reproduces its output
+    exactly via the native pipeline).
     """
     import sqlfluffrs
     from sqlfluff.core.linter.fix import compute_anchor_edit_info
@@ -1412,112 +1455,147 @@ def facade_fix_loop(
     tf = rst.templated_file
     if tf is None:
         return source
-    root = RsSegment(rst.root)
-    root_handle = rst.root
     feu = bool(config.get("fix_even_unparsable"))
 
-    def current_version() -> tuple[str, tuple[Any, ...]]:
-        return (root.raw, tuple(root_handle.source_fixes()))
+    def _fix_tree(rst_v: Any, tf_v: Any, mask_v: Any) -> bool:
+        """Run the phase loop over one variant tree; True = runaway."""
+        root = RsSegment(rst_v.root)
+        root_handle = rst_v.root
 
-    previous_versions: set[tuple[str, tuple[Any, ...]]] = {current_version()}
-    last_fixes: Any = None
-    by_phase = {
-        "main": [r for r in rules if r.lint_phase == "main"],
-        "post": [r for r in rules if r.lint_phase == "post"],
-    }
+        def current_version() -> tuple[str, tuple[Any, ...]]:
+            return (root.raw, tuple(root_handle.source_fixes()))
 
-    for phase in ("main", "post"):
-        nloops = limit if phase == "main" else 2
-        for loop in range(nloops):
-            this = rules if (phase == "main" and loop == 0) else by_phase[phase]
-            first_pass = phase == "main" and loop == 0
-            changed = False
-            for rule in this:
-                _v, _r, fixes, _m = rule.crawl(
-                    tree=root,
-                    dialect=dialect_obj,
-                    fix=True,
-                    templated_file=tf,
-                    # Masked results (and their fixes) are dropped inside the
-                    # crawl (_process_lint_result), exactly like native.
-                    ignore_mask=ignore_mask,
-                    fname=fname,
-                    config=config,
-                )
-                if lint_sink is not None and first_pass:
-                    # Native's ``initial_linting_errors``: only the first pass
-                    # of the main phase reports (linter.py:573-574).
-                    lint_sink.extend(_v)
-                if not fixes:
-                    continue
-                anchor_info = compute_anchor_edit_info(fixes)
-                if any(not info.is_valid for info in anchor_info.values()):
-                    continue  # conflicting fixes on one anchor (native drops)
-                if fixes == last_fixes:
-                    # Same fixes twice in a row -> we're looping; stop
-                    # applying (native linter.py:597-608).
-                    continue
-                last_fixes = fixes
-                ops = _anchor_info_to_ops(anchor_info)
-                (
-                    staged_raw,
-                    staged_sfx,
-                    _applied,
-                    _unapplied,
-                    _reverted,
-                    st_changed,
-                ) = rst.stage_edit_batch(ops, feu)
-                staged_version = (staged_raw, tuple(staged_sfx))
-                if not st_changed or staged_version == current_version():
-                    rst.discard_staged()
-                    continue
-                # Native ``apply_fixes`` grammar re-validation (linter.py:637-645):
-                # reject a staged batch that would produce an unparsable file,
-                # leave the tree untouched, and warn on the same channel/text.
-                # Ordered before the previous-versions check, like native, so a
-                # batch that is both invalid and version-revisiting warns the
-                # same way on both engines.
-                if not rst.validate_staged(
-                    dialect_name,
-                    int(config.get("max_parse_depth") or 0),
-                    int(config.get("max_parse_nodes") or 0),
-                ):
-                    rst.discard_staged()
-                    linter_logger.warning(
-                        "Fixes for %s not applied, as it would result in an "
-                        "unparsable file. Please report this as a bug with a "
-                        "minimal query which demonstrates this warning.",
-                        rule.code,
+        previous_versions: set[tuple[str, tuple[Any, ...]]] = {current_version()}
+        last_fixes: Any = None
+        by_phase = {
+            "main": [r for r in rules if r.lint_phase == "main"],
+            "post": [r for r in rules if r.lint_phase == "post"],
+        }
+
+        for phase in ("main", "post"):
+            nloops = limit if phase == "main" else 2
+            for loop in range(nloops):
+                this = rules if (phase == "main" and loop == 0) else by_phase[phase]
+                first_pass = phase == "main" and loop == 0
+                changed = False
+                for rule in this:
+                    _v, _r, fixes, _m = rule.crawl(
+                        tree=root,
+                        dialect=dialect_obj,
+                        fix=True,
+                        templated_file=tf_v,
+                        # Masked results (and their fixes) are dropped inside
+                        # the crawl (_process_lint_result), exactly like
+                        # native.
+                        ignore_mask=mask_v,
+                        fname=fname,
+                        config=config,
                     )
-                    continue
-                if staged_version in previous_versions:
-                    # Applying these fixes would take us back to a state we've
-                    # seen before -> we're in a loop; don't apply (native
-                    # linter.py:653-657 + ``_warn_unfixable``).
-                    rst.discard_staged()
-                    linter_logger.warning(
-                        "One fix for %s not applied, it would re-cause the same error.",
-                        rule.code,
-                    )
-                    continue
-                rst.commit_staged()
-                _sweep_wrapper_caches()
-                previous_versions.add(staged_version)
-                changed = True
-            if not changed:
-                break
-        else:
-            # The phase hit its loop limit while fixes were still being applied
-            # — one or more rules aren't converging. Native (linter.py:673-699)
-            # warns and returns ``save_tree``, the tree from BEFORE any fixes,
-            # so the user never sees the half-churned file. Returning the
-            # original source reproduces that exactly; the ``loop_state``
-            # signal makes the CLI fast path defer the file to the native
-            # fixer (which reverts the same way — byte- and exit-code parity).
-            linter_logger.warning("Loop limit on fixes reached [%s].", limit)
+                    if lint_sink is not None and first_pass:
+                        # Native's ``initial_linting_errors``: only the first
+                        # pass of the main phase reports (linter.py:573-574).
+                        # Alternates report too (violations merge,
+                        # linter.py:798).
+                        lint_sink.extend(_v)
+                    if not fixes:
+                        continue
+                    anchor_info = compute_anchor_edit_info(fixes)
+                    if any(not info.is_valid for info in anchor_info.values()):
+                        continue  # conflicting fixes on one anchor
+                    if fixes == last_fixes:
+                        # Same fixes twice in a row -> we're looping; stop
+                        # applying (native linter.py:597-608).
+                        continue
+                    last_fixes = fixes
+                    ops = _anchor_info_to_ops(anchor_info)
+                    (
+                        staged_raw,
+                        staged_sfx,
+                        _applied,
+                        _unapplied,
+                        _reverted,
+                        st_changed,
+                    ) = rst_v.stage_edit_batch(ops, feu)
+                    staged_version = (staged_raw, tuple(staged_sfx))
+                    if not st_changed or staged_version == current_version():
+                        rst_v.discard_staged()
+                        continue
+                    # Native ``apply_fixes`` grammar re-validation
+                    # (linter.py:637-645): reject a staged batch that would
+                    # produce an unparsable file, leave the tree untouched,
+                    # and warn on the same channel/text. Ordered before the
+                    # previous-versions check, like native, so a batch that is
+                    # both invalid and version-revisiting warns the same way
+                    # on both engines.
+                    if not rst_v.validate_staged(
+                        dialect_name,
+                        int(config.get("max_parse_depth") or 0),
+                        int(config.get("max_parse_nodes") or 0),
+                    ):
+                        rst_v.discard_staged()
+                        linter_logger.warning(
+                            "Fixes for %s not applied, as it would result in "
+                            "an unparsable file. Please report this as a bug "
+                            "with a minimal query which demonstrates this "
+                            "warning.",
+                            rule.code,
+                        )
+                        continue
+                    if staged_version in previous_versions:
+                        # Applying these fixes would take us back to a state
+                        # we've seen before -> we're in a loop; don't apply
+                        # (native linter.py:653-657 + ``_warn_unfixable``).
+                        rst_v.discard_staged()
+                        linter_logger.warning(
+                            "One fix for %s not applied, it would re-cause "
+                            "the same error.",
+                            rule.code,
+                        )
+                        continue
+                    rst_v.commit_staged()
+                    _sweep_wrapper_caches()
+                    previous_versions.add(staged_version)
+                    changed = True
+                if not changed:
+                    break
+            else:
+                # The phase hit its loop limit while fixes were still being
+                # applied — one or more rules aren't converging. Native
+                # (linter.py:673-699) warns and reverts that variant's tree;
+                # the ``loop_state`` signal makes the CLI fast path defer the
+                # file to the native fixer (byte- and exit-code parity).
+                linter_logger.warning("Loop limit on fixes reached [%s].", limit)
+                return True
+        return False
+
+    # The work-list: the root variant, then every ALTERNATE variant tree
+    # (native lints/fixes every variant and merges — linter.py:779-805).
+    # Alternates build their own noqa masks (untaken template branches can
+    # carry their own directives); their malformed-directive violations
+    # report like native's per-variant initial_linting_errors.
+    trees: list[tuple[Any, Any, Any]] = [(rst, tf, ignore_mask)]
+    for alt in getattr(rst, "alternate_trees", []) or []:
+        alt_tf = alt.templated_file
+        if alt_tf is None:  # pragma: no cover
+            continue
+        alt_mask = None
+        if reference_map is not None:
+            alt_mask, alt_ivs = facade_ignore_mask(
+                RsSegment(alt.root), config, reference_map
+            )
+            if lint_sink is not None:
+                lint_sink.extend(alt_ivs)
+        trees.append((alt, alt_tf, alt_mask))
+
+    patch_sets: list[list[Any]] = []
+    for rst_v, tf_v, mask_v in trees:
+        if _fix_tree(rst_v, tf_v, mask_v):
             if loop_state is not None:
                 loop_state["runaway"] = True
             return source
+        patch_sets.append(
+            generate_source_patches(RsSegment(rst_v.root), tf_v)  # type: ignore[arg-type]
+        )
 
     # Native's post-loop filter on ``initial_linting_errors`` (linter.py:701):
     # drop templated-anchored violations from reporting. Native does NOT apply
@@ -1528,18 +1606,15 @@ def facade_fix_loop(
 
         lint_sink[:] = _Linter.remove_templated_errors(lint_sink)
 
-    # Reconstruction: native patch generation over the mutated façade.
+    # Reconstruction: native patch generation over the mutated façade(s).
     # Native routes patches through ``merge_source_patches`` even for a
-    # single variant (linter.py:770-778 -> LintedFile.source_patches):
-    # it sorts in source space, dedupes, and drops same-position
-    # CONFLICTING patches — e.g. two different zero-width insertions at a
-    # jinja block-tag boundary, which the raw patch list would apply
-    # doubled. Mirror it exactly.
+    # single variant (linter.py:770-808 -> LintedFile.source_patches): it
+    # sorts in source space, dedupes ACROSS VARIANTS, and drops
+    # same-position conflicting patches. All variants share one source, so
+    # the root's TemplatedFile drives the slicing.
     from sqlfluff.core.linter.patch import merge_source_patches
 
-    patches = merge_source_patches(
-        [generate_source_patches(root, tf)]  # type: ignore[arg-type]
-    )
+    patches = merge_source_patches(patch_sets)
     source_only = tf.source_only_slices()
     slices = LintedFile._slice_source_file_using_patches(
         patches, source_only, tf.source_str

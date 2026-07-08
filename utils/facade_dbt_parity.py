@@ -76,13 +76,17 @@ def facade_lint(src: str, fname: str, c: FluffConfig) -> "list | None":
     tf = rst.templated_file
     if tf is None:
         return None
-    if getattr(rst, "num_variants", 1) > 1:
-        return None
     if getattr(rst, "templater_violations", None):
         return None
     ignore_mask, ivs = facade_ignore_mask(root, c, rule_pack.reference_map)
     violations = facade_violations(
-        src, fname, c, rules, rst=rst, ignore_mask=ignore_mask
+        src,
+        fname,
+        c,
+        rules,
+        rst=rst,
+        ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
     )
     if violations is None:
         return None
@@ -101,8 +105,6 @@ def facade_fix(src: str, fname: str, c: FluffConfig) -> "str | None":
         return None
     tf = rst.templated_file
     if tf is None:
-        return None
-    if getattr(rst, "num_variants", 1) > 1:
         return None
     if getattr(rst, "templater_violations", None):
         return None

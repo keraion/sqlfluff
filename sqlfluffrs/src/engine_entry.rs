@@ -143,6 +143,16 @@ fn render_via_python<'py>(
     let violations = PyList::empty(py);
     let mut variants = Vec::new();
 
+    // `render_string` stops collecting at `render_variant_limit`
+    // (linter.py:950-966) — the variant generator is lazy and native never
+    // renders past the cap, so neither may we (parity AND cost).
+    let variant_limit: usize = child
+        .call_method1("get", ("render_variant_limit",))
+        .ok()
+        .and_then(|v| v.extract::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(usize::MAX);
+
     // Iterate templater variants. A raised `SQLTemplaterError` is a fatal
     // templating error captured as a violation (mirrors `Linter.render_string`);
     // any other exception propagates.
@@ -159,6 +169,9 @@ fn render_via_python<'py>(
                 for e in errs_obj.try_iter()? {
                     violations.append(e?)?;
                 }
+            }
+            if variants.len() >= variant_limit {
+                break; // Stop if we hit the limit (like native).
             }
         }
         Ok(())
@@ -423,12 +436,34 @@ pub fn engine_parse_to_tree<'py>(
 
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (tokens, _lex_errors) = pipeline::lex_variant(&templated, dialect, tbi);
-        pipeline::parse_tokens(&tokens, dialect, indent, limits)
+        pipeline::parse_tokens(&tokens, dialect, indent.clone(), limits)
     }));
     match parsed {
         Ok(Ok(node)) => {
             let mut tree = PyTree::from_node_with_templated_file(&node, tf_obj);
             tree.set_render_meta(templater_violations.into_any().unbind(), num_variants);
+            // Parse the ALTERNATE variants too (native lints every variant
+            // and merges). A variant that fails to lex/parse is skipped,
+            // mirroring native's `not alternate_variant.tree` skip.
+            let mut alternates: Vec<Py<PyTree>> = Vec::new();
+            for alt in variants.iter().skip(1) {
+                let Ok(alt_pf) = alt.extract::<PySqlFluffTemplatedFile>() else {
+                    continue;
+                };
+                let alt_templated: Arc<TemplatedFile> = alt_pf.into();
+                let alt_obj: Py<PyAny> = alt.clone().unbind();
+                let alt_parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (tokens, _lex_errors) = pipeline::lex_variant(&alt_templated, dialect, tbi);
+                    pipeline::parse_tokens(&tokens, dialect, indent.clone(), limits)
+                }));
+                if let Ok(Ok(alt_node)) = alt_parsed {
+                    alternates.push(Py::new(
+                        py,
+                        PyTree::from_node_with_templated_file(&alt_node, alt_obj),
+                    )?);
+                }
+            }
+            tree.set_alternate_trees(alternates);
             Ok(Some(Py::new(py, tree)?))
         }
         _ => Ok(None),

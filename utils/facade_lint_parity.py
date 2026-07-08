@@ -78,7 +78,13 @@ for dialect in sorted(os.listdir(CORPUS)):
                 RsSegment(rst.root), cfg_rs, rule_pack.reference_map
             )
             fac = facade_violations(
-                src, f, cfg_rs, rules, rst=rst, ignore_mask=ignore_mask
+                src,
+                f,
+                cfg_rs,
+                rules,
+                rst=rst,
+                ignore_mask=ignore_mask,
+                reference_map=rule_pack.reference_map,
             )
             if fac is None:
                 continue

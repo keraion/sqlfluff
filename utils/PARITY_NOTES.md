@@ -245,6 +245,29 @@ defaulting to CWD), and the unfixable-violations section must merge and
 SORT façade+native records (files split across engines otherwise break
 the alphabetical ordering).
 
+## Multi-variant renders on the façade fast paths (2026-07-07)
+
+The last templater routing carve-out. The engine parses EVERY render
+variant into its own arena tree (``RsTree.alternate_trees``, each with
+its own TemplatedFile; unparsable variants skipped like native's
+``not alternate_variant.tree``). ``facade_violations`` crawls each
+alternate with its own noqa mask (untaken branches can carry their own
+directives) and merges through the shared templated filter +
+source-space dedupe; ``facade_fix_loop`` runs the full mutation loop per
+variant and merges per-variant patch sets via ``merge_source_patches``
+(natively that IS the multi-variant mechanism). A runaway on any variant
+defers the whole file. All gates dropped ``num_variants > 1`` routing.
+
+Bug found by the sweep (via jinja_lint_unreached_code's 6-variant
+chain-scoring fixture): native's ``render_string`` stops the lazy
+variant generator at ``render_variant_limit`` (default 5) — the engine's
+``render_via_python`` collected all of them, so the façade linted a
+variant native never sees. The cap is mirrored now (a cost fix for
+``parse``/``render`` too: the engine no longer over-renders).
+
+Baselines after: templated lint AND fix 269 eligible of 282 (was 229) /
+0 divergences / 0 errors; literal sweeps and full suites unchanged.
+
 ## Pitfall: pinning the native side of ANY parity probe
 
 `use_rust_parser` defaults to AUTO and silently enables the rust parser

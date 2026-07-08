@@ -57,6 +57,11 @@ pub struct PyTree {
     /// gates route multi-variant renders to native. 1 for trees built without
     /// an engine render.
     num_variants: usize,
+    /// Arena trees for the render's ALTERNATE variants (root variant is this
+    /// tree). Each carries its own `templated_file`. Variants that failed to
+    /// parse are omitted, mirroring native's `not alternate_variant.tree`
+    /// skip. Empty for single-variant renders or non-engine trees.
+    alternate_trees: Vec<Py<PyTree>>,
 }
 
 impl PyTree {
@@ -66,6 +71,7 @@ impl PyTree {
             templated_file: None,
             templater_violations: None,
             num_variants: 1,
+            alternate_trees: Vec::new(),
         }
     }
 
@@ -92,6 +98,11 @@ impl PyTree {
     pub fn set_render_meta(&mut self, templater_violations: Py<PyAny>, num_variants: usize) {
         self.templater_violations = Some(templater_violations);
         self.num_variants = num_variants;
+    }
+
+    /// Attach the parsed ALTERNATE variant trees (see the field docs).
+    pub fn set_alternate_trees(&mut self, alternates: Vec<Py<PyTree>>) {
+        self.alternate_trees = alternates;
     }
 
     fn handle(&self, node: NodeId) -> PyHandle {
@@ -141,6 +152,16 @@ impl PyTree {
     #[getter]
     fn num_variants(&self) -> usize {
         self.num_variants
+    }
+
+    /// Arena trees for the render's alternate variants (empty when
+    /// single-variant or not engine-rendered).
+    #[getter]
+    fn alternate_trees(&self, py: Python) -> Vec<Py<PyTree>> {
+        self.alternate_trees
+            .iter()
+            .map(|t| t.clone_ref(py))
+            .collect()
     }
 
     /// Number of nodes in the arena.

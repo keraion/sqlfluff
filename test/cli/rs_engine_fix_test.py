@@ -280,3 +280,44 @@ def test_fix_show_lint_violations_renders_facade_records(tmp_path) -> None:
     assert "==== lint for unfixable violations ====" in result.output
     assert "AM04" in result.output  # the unfixable finding is rendered
     assert f.read_text() == "select * from tbl\n"  # LT01 fix applied
+
+
+def test_facade_fix_multi_variant_render_matches_native() -> None:
+    """Fixes apply across ALL render variants and merge, like native.
+
+    The untaken else-branch's spacing fix can only come from an alternate
+    variant's tree; merge_source_patches combines patches across variants.
+    """
+    src = (
+        "{% if true %}\n"
+        "select a ,  b from tbl\n"
+        "{% else %}\n"
+        "select c ,  d from other_tbl\n"
+        "{% endif %}\n"
+    )
+    linter = Linter(
+        config=FluffConfig(
+            overrides={
+                "dialect": "ansi",
+                "templater": "jinja",
+                "rules": "LT01",
+                "use_rust_engine": "true",
+            }
+        )
+    )
+    result = _try_facade_stdin_fix(linter, src, None)
+    assert result is not None
+    fixed, _ = result
+    nat = (
+        Linter(
+            config=FluffConfig(
+                overrides={"dialect": "ansi", "templater": "jinja", "rules": "LT01"}
+            )
+        )
+        .lint_string(src, fix=True)
+        .fix_string()[0]
+    )
+    assert fixed == nat
+    # BOTH branches' spacing was fixed.
+    assert "select a, b from tbl" in fixed
+    assert "select c, d from other_tbl" in fixed

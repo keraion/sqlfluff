@@ -95,6 +95,7 @@ def facade_fix(src, fname, dialect):
         lint_sink=pre,
         loop_state=loop_state,
         ignore_mask=ignore_mask,
+        reference_map=rule_pack.reference_map,
     )
     if loop_state.get("runaway"):
         return None  # the CLI defers runaway reverts to native
