@@ -84,3 +84,36 @@ piece by piece, with byte-parity as the gate at every step.*
 - **11 is independent** of 08–10 in content (it only needs the façade to
   exist) and could be reordered earlier if a quick standalone bugfix PR is
   useful — it fixes an upstream bug that predates this branch.
+
+## Extractions — independent of the stack (2026-07-08)
+
+Seven commits cherry-pick onto `main` cleanly AND pass the full suite
+there (`keraion/rs-picks-verify` = main + all seven, wheel rebuilt,
+12,634 passed). Each is its own branch, PR-able immediately in any
+order, no stacking:
+
+| branch | commit (on branch) | what |
+|---|---|---|
+| `rs-pick-core-copy-reparent` | c1af221d7 | `BaseSegment.copy` re-parents provided children |
+| `rs-pick-cv07-deterministic` | d1bf647fe | CV07 deterministic fix order |
+| `rs-pick-cv11-parse-shaped` | 626430c23 | CV11 parse-shaped replacements |
+| `rs-pick-st05-lazy-clonemap` | 856d0a1c9 | ST05 lazy SegmentCloneMap (native perf) |
+| `rs-pick-regex-ignore-case` | e769c8c7e | RegexParser ignore_case — completes 2155/2155 parser parity on main |
+| `rs-pick-bracketed-metas` | 4e912a64d | Bracketed direct-child Indent/Dedent metas |
+| `rs-pick-templatedfile-cache` | 457931e06 | identity-keyed conversion cache + weakref eviction |
+
+Notes from the extraction:
+- The cache pick needed conflict resolution (python.rs registration
+  context; PARITY_NOTES dropped — it doesn't exist on main) and a test
+  adaptation: the span-marker literalness probe doesn't discriminate on
+  main (whose marker semantics predate this branch's marker fixes), so
+  the extracted test asserts on CACHE ENTRY COUNT instead — a more
+  direct probe of the collision.
+- `48c73d248` (token-typing fidelity) cherry-picks CLEANLY but does not
+  COMPILE on main — it uses `MatchedClass.class_type`, added by
+  stack-02's arena class-type commit. Textually-clean != independent;
+  it stays stacked. (`27a6ace8b`, `0cb6c9f41` conflict outright and
+  stay stacked too.)
+- These commits remain in the stack elements. As each extraction merges
+  to main, they vanish from the stack diffs automatically; do NOT also
+  rewrite the stack branches.
