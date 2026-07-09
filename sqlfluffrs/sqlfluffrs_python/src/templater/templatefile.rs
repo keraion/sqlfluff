@@ -13,8 +13,32 @@ use sqlfluffrs_types::templater::fileslice::{RawFileSlice, TemplatedFileSlice};
 use once_cell::sync::Lazy;
 use sqlfluffrs_types::templater::templatefile::TemplatedFile;
 
-static PY_TEMPLATED_FILE_CACHE: Lazy<Mutex<HashMap<String, Arc<TemplatedFile>>>> =
+/// Cache of Python→Rust `TemplatedFile` conversions, keyed by source Python
+/// object address rather than content: markers compare their
+/// `Arc<TemplatedFile>`s by pointer (see `sqlfluffrs_types/src/marker.rs`),
+/// so one Python object must always normalize to the same `Arc`, and two
+/// objects can share the same `fname`/`source`/`templated` strings with
+/// different slicings. Each entry holds a `weakref.ref` whose callback evicts
+/// it when the source object is GC'd, keeping the cache bounded to live
+/// objects and safe from address reuse.
+static PY_TEMPLATED_FILE_CACHE: Lazy<Mutex<HashMap<usize, (Arc<TemplatedFile>, Py<PyAny>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Weakref callback: evicts one cache entry. Bound to its key via
+/// `functools.partial`; the weakref machinery passes the dead ref as `_r`.
+#[pyfunction]
+#[pyo3(name = "_evict_templated_file_cache_entry")]
+#[pyo3(signature = (key, _r=None))]
+pub fn evict_templated_file_cache_entry(key: usize, _r: Option<Py<PyAny>>) {
+    PY_TEMPLATED_FILE_CACHE.lock().unwrap().remove(&key);
+}
+
+/// Live entry count of the conversion cache (test introspection).
+#[pyfunction]
+#[pyo3(name = "_templated_file_cache_len")]
+pub fn templated_file_cache_len() -> usize {
+    PY_TEMPLATED_FILE_CACHE.lock().unwrap().len()
+}
 
 #[pyclass(
     name = "RsTemplatedFile",
@@ -246,16 +270,22 @@ impl<'a, 'py> FromPyObject<'a, 'py> for PySqlFluffTemplatedFile {
     type Error = PyErr;
 
     fn extract(obj: pyo3::Borrowed<'a, 'py, pyo3::PyAny>) -> Result<Self, Self::Error> {
+        // Fast path: an actual RsTemplatedFile — share its Arc directly.
+        if let Ok(native) = obj.cast::<PyTemplatedFile>() {
+            return Ok(Self(native.get().clone()));
+        }
+
+        let key = obj.as_ptr() as usize;
+        if let Some((cached, _)) = PY_TEMPLATED_FILE_CACHE.lock().unwrap().get(&key) {
+            return Ok(Self(PyTemplatedFile(cached.clone())));
+        }
+
+        // NOTE: the lock is NOT held during extraction — the `getattr` calls
+        // run arbitrary Python which can trigger GC, whose eviction callbacks
+        // take the same (non-reentrant) lock.
         let source_str = obj.getattr("source_str")?.extract::<String>()?;
         let fname = obj.getattr("fname")?.extract::<String>()?;
         let templated_str = obj.getattr("templated_str")?.extract::<String>()?;
-
-        let key = format!("{}:{}:{}", fname, &source_str, &templated_str);
-        let mut cache = PY_TEMPLATED_FILE_CACHE.lock().unwrap();
-
-        if let Some(cached) = cache.get(&key) {
-            return Ok(Self(PyTemplatedFile(cached.clone())));
-        }
 
         let py_sliced_file = obj
             .getattr("sliced_file")?
@@ -289,7 +319,27 @@ impl<'a, 'py> FromPyObject<'a, 'py> for PySqlFluffTemplatedFile {
             py_templated_newlines,
         ));
 
-        cache.insert(key, tf.0 .0.clone());
+        // Cache only when eviction-on-GC can be arranged; an object that
+        // doesn't support weakrefs stays uncached (correct, just slower).
+        let py = obj.py();
+        let weakref = (|| -> PyResult<Py<PyAny>> {
+            let evict = pyo3::wrap_pyfunction!(evict_templated_file_cache_entry, py)?;
+            let callback = py
+                .import("functools")?
+                .getattr("partial")?
+                .call1((evict, key))?;
+            Ok(py
+                .import("weakref")?
+                .getattr("ref")?
+                .call1((obj.to_owned(), callback))?
+                .unbind())
+        })();
+        if let Ok(weakref) = weakref {
+            PY_TEMPLATED_FILE_CACHE
+                .lock()
+                .unwrap()
+                .insert(key, (tf.0 .0.clone(), weakref));
+        }
         Ok(tf)
     }
 }
