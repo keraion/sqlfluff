@@ -1165,7 +1165,12 @@ def _try_facade_stdin_fix(
         return None
 
 
-def _try_facade_paths_fix(
+# No coverage: the happy path is wired-tested (``test/cli/rs_engine_fix_test.py``
+# enables the engine per-invocation), but the many per-file fallback branches
+# below are only exercised end-to-end by the forced-engine env
+# (``tox -e py311-rust-engine``), which CI's coverage combine doesn't include —
+# so the function-level pragma stays until the stack folds that env in.
+def _try_facade_paths_fix(  # pragma: no cover
     linter: Linter,
     formatter: OutputStreamFormatter,
     paths,
