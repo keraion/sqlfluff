@@ -40,7 +40,7 @@ jobs:
               fs.readFileSync("./agentscan-result/moderation.json", "utf8")
             );
 
-            let eventPrNumber = context.payload.workflow_run?.pull_requests?.[0]?.number;
+            let eventPrNumber = undefined; // TEST ONLY: force the fork fallback path
             if (!eventPrNumber) {
               // Fork-originated PRs arrive with pull_requests empty. Commit-based
               // lookup can't see fork-only commits, so resolve via head repo + branch.
