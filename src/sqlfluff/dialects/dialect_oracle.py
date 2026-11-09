@@ -23,6 +23,7 @@ from sqlfluff.core.parser import (
     Indent,
     LiteralSegment,
     Matchable,
+    NewlineSegment,
     Nothing,
     OneOf,
     OptionallyBracketed,
@@ -36,6 +37,7 @@ from sqlfluff.core.parser import (
     StringParser,
     SymbolSegment,
     TypedParser,
+    WhitespaceSegment,
     WordSegment,
 )
 from sqlfluff.core.parser.grammar.lookbehind import (
@@ -171,6 +173,23 @@ oracle_dialect.insert_lexer_matchers(
         StringLexer("power_operator", "**", CodeSegment),
     ],
     before="star",
+)
+
+oracle_dialect.insert_lexer_matchers(
+    [
+        # SQL*Plus only runs the buffer for a `/` alone on its line (whitespace
+        # ok, comments not), so lex that apart from division.
+        RegexLexer(
+            "slash_buffer_executor",
+            r"\r?\n[^\S\r\n]*/(?=[^\S\r\n]*(?:\r?\n|$))",
+            CodeSegment,
+            subdivider=RegexLexer("newline", r"\r\n|\n", NewlineSegment),
+            trim_post_subdivide=RegexLexer(
+                "whitespace", r"[^\S\r\n]+", WhitespaceSegment
+            ),
+        ),
+    ],
+    before="newline",
 )
 
 oracle_dialect.add(
@@ -700,6 +719,10 @@ oracle_dialect.add(
         Sequence("WITH", "CREDENTIAL"),
     ),
     BatchDelimiterGrammar=Ref("SlashBufferExecutorSegment"),
+    # Never division, so safe as a terminator.
+    StandaloneSlashGrammar=TypedParser(
+        "slash_buffer_executor", SymbolSegment, type="slash"
+    ),
 )
 
 oracle_dialect.replace(
@@ -1470,6 +1493,7 @@ class FileSegment(BaseFileSegment):
     """
 
     match_grammar = Sequence(
+        Ref("LeadingBatchSegment", optional=True),
         AnyNumberOf(
             Ref("BatchSegment"),
             Ref("ExecuteFileSegment"),
@@ -1481,7 +1505,7 @@ class BatchSegment(BaseSegment):
     """A segment representing a '/' batch within a file or script."""
 
     type = "batch"
-    match_grammar = OneOf(
+    match_grammar: Matchable = OneOf(
         Sequence(
             Delimited(
                 OneOf(
@@ -1503,7 +1527,23 @@ class SlashBufferExecutorSegment(BaseSegment):
     """A `/` standalone, functioning as a batch delimiter for SQL*Plus."""
 
     type = "slash_buffer_executor"
-    match_grammar = Ref("SlashSegment")
+    match_grammar: Matchable = Ref("StandaloneSlashGrammar")
+
+
+class LeadingBatchSegment(BatchSegment):
+    """A batch of just a buffer executor on the first line of a file."""
+
+    match_grammar = Ref("LeadingSlashBufferExecutorSegment")
+
+
+class LeadingSlashBufferExecutorSegment(SlashBufferExecutorSegment):
+    """A buffer executor on the first line of a file.
+
+    With no preceding newline it is lexed as `divide`, not
+    `slash_buffer_executor`.
+    """
+
+    match_grammar = TypedParser("divide", SymbolSegment, type="slash")
 
 
 class SqlplusSetStatementSegment(BaseSegment):
@@ -1725,9 +1765,7 @@ class CreateViewStatementSegment(ansi.CreateViewStatementSegment):
         # Optional list of column names
         Ref("BracketedColumnReferenceListGrammar", optional=True),
         "AS",
-        OptionallyBracketed(
-            Ref("SelectableGrammar"), terminators=[Ref("BatchDelimiterGrammar")]
-        ),
+        OptionallyBracketed(Ref("SelectableGrammar")),
         Ref("WithNoSchemaBindingClauseSegment", optional=True),
     )
 
@@ -1989,6 +2027,7 @@ class UnorderedSelectStatementSegment(ansi.UnorderedSelectStatementSegment):
         terminators=[
             Ref("HierarchicalQueryClauseSegment"),
             "LOG",
+            Ref("StandaloneSlashGrammar"),
         ],
     ).copy(
         insert=[
@@ -2021,6 +2060,7 @@ class SelectStatementSegment(ansi.SelectStatementSegment):
             Ref("WithNoSchemaBindingClauseSegment"),
             Ref("WithDataClauseSegment"),
             "LOG",
+            Ref("StandaloneSlashGrammar"),
         ],
     )
 
