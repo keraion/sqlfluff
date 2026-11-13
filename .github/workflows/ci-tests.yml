@@ -479,6 +479,24 @@ jobs:
     secrets:
       gh_token: ${{ secrets.github_token }}
 
+  # Run the suite with `use_rust_engine` and `use_rust_parser` forced to True
+  # (see the `engine` factor in tox.ini and test/conftest.py). One Python
+  # version is enough: this checks the engine routing, not Python support.
+  rust-engine-tests:
+    name: Rust Engine Tests
+    needs: rs-build-linux-x86_64
+    permissions:
+      contents: read
+      pull-requests: write
+
+    uses: ./.github/workflows/ci-test-python.yml
+    with:
+      python-version: "3.14"
+      coverage: false
+      with-rust: "-rust-engine"
+    secrets:
+      gh_token: ${{ secrets.github_token }}
+
   dbt-tests:
     name: dbt Plugin Tests
     strategy:
