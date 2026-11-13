@@ -30,6 +30,33 @@ from sqlfluff.core.templaters import TemplatedFile
 # When writing YAML files, double quotes string values needing escapes.
 yaml.add_representer(str, quoted_presenter)
 
+# Force the Rust engine on for the whole suite when requested. The
+# `py*-rust-engine` tox environments set this (see tox.ini). Patching the
+# default config means any test that doesn't pin the flags itself runs with
+# the engine and parser forced to True; a test that pins them keeps its pin,
+# because overrides win over defaults. "auto" would fall back to pure Python
+# when the extension is missing, so a green run would prove nothing. This
+# fails the run instead.
+if os.environ.get("SQLFLUFF_TESTENV_RUST_ENGINE"):
+    import sqlfluff.core.plugin.lib as _plugin_lib
+    import sqlfluffrs
+
+    assert hasattr(sqlfluffrs, "engine_parse_paths"), (
+        "SQLFLUFF_TESTENV_RUST_ENGINE is set but the installed sqlfluffrs "
+        "build lacks the engine entry points. Rebuild with: tox -e build-rs"
+    )
+
+    _orig_load_config_resource = _plugin_lib.load_config_resource
+
+    def _rust_engine_default_config(package: str, file_name: str) -> Any:
+        cfg = _orig_load_config_resource(package=package, file_name=file_name)
+        if file_name == "default_config.cfg":
+            cfg["core"]["use_rust_engine"] = True
+            cfg["core"]["use_rust_parser"] = True
+        return cfg
+
+    _plugin_lib.load_config_resource = _rust_engine_default_config
+
 
 class ParseExample(NamedTuple):
     """A tuple representing an example SQL file to parse."""
