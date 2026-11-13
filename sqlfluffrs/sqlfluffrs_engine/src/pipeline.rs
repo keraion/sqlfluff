@@ -30,7 +30,9 @@ pub fn lex_variant(
     dialect: Dialect,
     template_blocks_indent: bool,
 ) -> (Vec<Token>, Vec<String>) {
-    let lexer = Lexer::new(None, dialect.get_lexers().to_vec());
+    // `for_dialect` adds the dialect's bracket pairs and client command rules
+    // (e.g. MySQL `DELIMITER`), which `Lexer::new` leaves out.
+    let lexer = Lexer::for_dialect(dialect);
     let (tokens, violations) = lexer.lex(
         LexInput::TemplatedFile(variant.clone()),
         template_blocks_indent,
