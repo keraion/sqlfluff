@@ -1,5 +1,7 @@
 """Basic code analysis tools for SELECT statements."""
 
+import os
+import weakref
 from collections.abc import Iterator
 from typing import NamedTuple, Optional, cast
 
@@ -206,10 +208,45 @@ def _get_object_references(
     )
 
 
+# PROTOTYPE: analysis results per select segment, shared by every rule that
+# asks. Segments are immutable, so a result stays valid while its segment is
+# alive. Keyed by id() because segment equality is by content, not identity;
+# the weakref both guards against id reuse and evicts the entry. The cached
+# tuple leaves out the select itself so the entry doesn't keep it alive.
+_INFO_CACHE: dict[
+    tuple[int, Optional[str]],
+    tuple["weakref.ref[BaseSegment]", Optional[tuple[list, ...]]],
+] = {}
+
+
 def get_select_statement_info(
     segment: BaseSegment, dialect: Optional[Dialect], early_exit: bool = True
 ) -> Optional[SelectStatementColumnsAndTables]:
     """Analyze a select statement: targets, aliases, etc. Return info."""
+    if os.environ.get("SQLFLUFF_NO_SELECT_CACHE") is not None:
+        return _get_select_statement_info(segment, dialect, early_exit)
+    key = (id(segment), dialect.name if dialect else None)
+    entry = _INFO_CACHE.get(key)
+    if entry is None or entry[0]() is not segment:
+        info = _get_select_statement_info(segment, dialect, early_exit=False)
+        entry = (
+            weakref.ref(segment, lambda _, key=key: _INFO_CACHE.pop(key, None)),  # type: ignore[misc]
+            tuple(info[1:]) if info else None,
+        )
+        _INFO_CACHE[key] = entry
+    fields = entry[1]
+    if fields is None:
+        return None
+    # As the early exit below: no table or value-table-function aliases.
+    if early_exit and not fields[0] and not fields[1]:
+        return None
+    # Fresh lists each time: callers are free to extend what they get back.
+    return SelectStatementColumnsAndTables(segment, *(list(f) for f in fields))
+
+
+def _get_select_statement_info(
+    segment: BaseSegment, dialect: Optional[Dialect], early_exit: bool = True
+) -> Optional[SelectStatementColumnsAndTables]:
     assert segment.is_type("select_statement")
     table_aliases, standalone_aliases = get_aliases_from_select(segment, dialect)
     if early_exit and not table_aliases and not standalone_aliases:

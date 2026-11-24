@@ -65,8 +65,143 @@ impl PyTree {
     }
 }
 
+/// One step of [`PyTree::from_segments`]: rebuild the node at `*cursor`.
+#[allow(clippy::too_many_arguments)]
+fn node_from_flat(
+    cursor: &mut usize,
+    leaf: &mut usize,
+    text: &mut usize,
+    kinds: &[u8],
+    a: &[u32],
+    b: &[u32],
+    classes: &[(String, String, Vec<String>)],
+    instance_types: &[Vec<String>],
+    texts: &[String],
+    positions: &[i64],
+    templated_file: &Arc<sqlfluffrs_types::TemplatedFile>,
+) -> Option<super::types::Node> {
+    use super::types::{MetaType, Node, RawSegmentKwargs};
+    use sqlfluffrs_types::{PositionMarker, Slice};
+    let i = *cursor;
+    *cursor += 1;
+    let kind = *kinds.get(i)?;
+    if kind == 0 {
+        let (name, class_type, class_types) = classes.get(a[i] as usize)?;
+        let mut children = Vec::with_capacity(b[i] as usize);
+        for _ in 0..b[i] {
+            children.push(node_from_flat(
+                cursor, leaf, text, kinds, a, b, classes, instance_types, texts, positions, templated_file,
+            )?);
+        }
+        return Some(Node::Segment {
+            segment_class: std::borrow::Cow::Owned(name.clone()),
+            segment_type: Some(std::borrow::Cow::Owned(class_type.clone())),
+            pos_marker: None,
+            class_types: class_types.clone(),
+            children,
+        });
+    }
+    // A leaf: six position values, all -1 when it has no marker.
+    let p = positions.get(*leaf * 6..*leaf * 6 + 6)?;
+    *leaf += 1;
+    let pos_marker = (p[0] >= 0).then(|| {
+        PositionMarker::new(
+            Slice { start: p[0] as usize, stop: p[1] as usize },
+            Slice { start: p[2] as usize, stop: p[3] as usize },
+            templated_file,
+            Some(p[4] as usize),
+            Some(p[5] as usize),
+        )
+    });
+    let mut next_text = || {
+        let t = texts.get(*text).cloned();
+        *text += 1;
+        t
+    };
+    Some(match kind {
+        1 => {
+            let (name, class_type, class_types) = classes.get(a[i] as usize)?;
+            let inst = instance_types.get(b[i] as usize)?.clone();
+            let segment_type = inst.first().cloned().unwrap_or_else(|| class_type.clone());
+            Node::new_raw_with_class_types(
+                name.clone(),
+                segment_type,
+                class_type.clone(),
+                next_text()?,
+                pos_marker,
+                inst,
+                class_types,
+                RawSegmentKwargs::default(),
+            )
+        }
+        2 => Node::Meta {
+            meta_type: MetaType::Indent { is_implicit: a[i] != 0 },
+            pos_marker,
+            block_uuid: None,
+        },
+        3 => Node::Meta {
+            meta_type: MetaType::Dedent { is_implicit: a[i] != 0 },
+            pos_marker,
+            block_uuid: None,
+        },
+        4 => Node::Meta {
+            meta_type: MetaType::Template {
+                source_str: next_text()?,
+                block_type: next_text()?,
+            },
+            pos_marker,
+            block_uuid: None,
+        },
+        5 => Node::Meta {
+            meta_type: MetaType::TemplateLoop,
+            pos_marker,
+            block_uuid: None,
+        },
+        6 => Node::Meta {
+            meta_type: MetaType::EndOfFile,
+            pos_marker,
+            block_uuid: None,
+        },
+        _ => return None,
+    })
+}
+
 #[pymethods]
 impl PyTree {
+    /// SPIKE: build an arena from a Python segment tree, flattened in
+    /// pre-order by `rust_parser.rebuild_rs_tree`. Used to give Rust rules a
+    /// current arena after a fix has replaced the tree. `None` if the
+    /// flattened tree is malformed.
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    fn from_segments(
+        templated_file: sqlfluffrs_python::templater::templatefile::PySqlFluffTemplatedFile,
+        kinds: Vec<u8>,
+        a: Vec<u32>,
+        b: Vec<u32>,
+        classes: Vec<(String, String, Vec<String>)>,
+        instance_types: Vec<Vec<String>>,
+        texts: Vec<String>,
+        positions: Vec<i64>,
+    ) -> Option<PyTree> {
+        let templated_file: Arc<sqlfluffrs_types::TemplatedFile> = templated_file.into();
+        let (mut cursor, mut leaf, mut text) = (0, 0, 0);
+        let node = node_from_flat(
+            &mut cursor,
+            &mut leaf,
+            &mut text,
+            &kinds,
+            &a,
+            &b,
+            &classes,
+            &instance_types,
+            &texts,
+            &positions,
+            &templated_file,
+        )?;
+        (cursor == kinds.len()).then(|| PyTree::new(Arena::from_node(&node)))
+    }
+
     /// The root node handle.
     #[getter]
     fn root(&self) -> PyHandle {

@@ -3,8 +3,14 @@
 import logging
 from collections.abc import Iterable
 from itertools import chain
+from typing import Any
 
-from sqlfluff.core.parser import BaseSegment, RawSegment
+from sqlfluff.core.parser import (
+    BaseSegment,
+    NewlineSegment,
+    RawSegment,
+    WhitespaceSegment,
+)
 from sqlfluff.core.rules import LintFix, LintResult
 
 # We're in the utils module, but users will expect reflow
@@ -49,3 +55,56 @@ def deduce_line_indent(raw_segment: RawSegment, root_segment: BaseSegment) -> st
             break
     reflow_logger.debug("Deduced indent for %s as %s", raw_segment, indent_seg)
     return indent_seg.raw if indent_seg else ""
+
+
+def results_from_rust(raws: list[RawSegment], found: list[Any]) -> list[LintResult]:
+    """SPIKE: build LintResults from the Rust reflow's compact results.
+
+    Each result is ``(anchor, description, source, fixes)`` and each fix is
+    ``(kind, target, text, extra)``, with segments given as indices into
+    ``raws`` (the root segment's ``raw_segments``).
+    """
+    results = []
+    for anchor_idx, description, source, fix_specs in found:
+        fixes = []
+        for kind, target_idx, text, extra_idx in fix_specs:
+            target = raws[target_idx]
+            if kind == "delete":
+                fixes.append(LintFix.delete(target))
+            elif kind == "replace_whitespace":
+                fixes.append(LintFix.replace(target, [target.edit(text)]))
+            elif kind == "indent_after_newline":
+                fixes.append(LintFix.replace(target, [target, WhitespaceSegment(text)]))
+            elif kind == "create_before":
+                new_segs: list[BaseSegment] = [NewlineSegment()]
+                if text:
+                    new_segs.append(WhitespaceSegment(text))
+                fixes.append(LintFix.create_before(target, new_segs))
+            elif kind == "replace_with_newline":
+                new_segs = [NewlineSegment()]
+                if text:
+                    new_segs.append(target.edit(text))
+                fixes.append(LintFix.replace(target, new_segs))
+            elif kind == "create_after":
+                new_segs = [NewlineSegment()]
+                if text:
+                    new_segs.append(WhitespaceSegment(text))
+                fixes.append(LintFix.create_after(target, new_segs))
+            elif kind == "create_space_after":
+                fixes.append(LintFix("create_after", target, [WhitespaceSegment()]))
+            elif kind == "create_space_before":
+                fixes.append(LintFix("create_before", target, [WhitespaceSegment()]))
+            else:  # move_comment_before
+                new_segs = [raws[extra_idx], NewlineSegment()]
+                if text:
+                    new_segs.append(WhitespaceSegment(text))
+                fixes.append(LintFix.create_before(target, new_segs))
+        results.append(
+            LintResult(
+                raws[anchor_idx],
+                fixes,
+                description=description,
+                source=source or None,
+            )
+        )
+    return results

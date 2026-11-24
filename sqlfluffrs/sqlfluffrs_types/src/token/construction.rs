@@ -58,6 +58,35 @@ impl Token {
         }
     }
 
+    /// SPIKE: a leaf as it stands in a parsed (and possibly fixed) tree, with
+    /// the types and flags the parser gave it rather than the lexer's. Used
+    /// to re-match a segment's grammar against its own leaves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn typed_leaf(
+        raw: String,
+        pos_marker: PositionMarker,
+        class_name: String,
+        token_type: String,
+        class_types: HashSet<String>,
+        instance_types: Vec<String>,
+        is_code: bool,
+        is_whitespace: bool,
+        is_comment: bool,
+    ) -> Self {
+        let config = TokenConfig {
+            instance_types,
+            ..TokenConfig::default()
+        };
+        let mut token = Token::base_token(raw, pos_marker, config, vec![]);
+        token.class_name = Cow::Owned(class_name);
+        token.token_type = Cow::Owned(token_type);
+        token.class_types = Arc::new(class_types);
+        token.is_code = is_code;
+        token.is_whitespace = is_whitespace;
+        token.is_comment = is_comment;
+        token
+    }
+
     pub fn raw_token(raw: String, pos_marker: PositionMarker, config: TokenConfig) -> Self {
         // Render the stringify suffix with the shared python_repr helper (the
         // same one the token Display uses), rather than a second ad-hoc

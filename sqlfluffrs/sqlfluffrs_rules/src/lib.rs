@@ -16,6 +16,7 @@ pub mod capitalisation;
 pub mod cp01;
 pub mod cp03;
 pub mod cp04;
+pub mod reflow;
 
 #[cfg(feature = "python")]
 pub mod python;

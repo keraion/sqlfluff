@@ -38,6 +38,105 @@ if TYPE_CHECKING:  # pragma: no cover
 parser_logger = logging.getLogger("sqlfluff.parser")
 
 
+_NO_POSITION = (-1, -1, -1, -1, -1, -1)
+_META_KINDS = {"indent": 2, "dedent": 3, "placeholder": 4, "template_loop": 5}
+
+
+def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
+    """SPIKE: build a Rust arena (``RsTree``) from a Python segment tree.
+
+    The parser attaches an arena to the tree it builds, but applying a fix
+    replaces that tree, and the new one has none. This flattens the current
+    tree in pre-order, with leaves in the order of ``raw_segments``, and has
+    Rust rebuild an arena from it. Returns ``None`` if that isn't possible.
+    """
+    try:
+        from sqlfluffrs import RsTree
+    except ImportError:  # pragma: no cover
+        return None
+    if not hasattr(RsTree, "from_segments"):
+        return None  # pragma: no cover
+    kinds: list[int] = []
+    # Per node: (class, child count) for a container, (class, instance types)
+    # for a raw, (is_implicit, 0) for an indent.
+    a: list[int] = []
+    b: list[int] = []
+    classes: list[tuple[str, str, list[str]]] = []
+    class_idx: dict[type, int] = {}
+    instance_types: list[list[str]] = [[]]
+    instance_idx: dict[tuple[str, ...], int] = {(): 0}
+    texts: list[str] = []
+    positions: list[int] = []
+    stack = [tree]
+    while stack:
+        seg = stack.pop()
+        children = seg.segments
+        cls = type(seg)
+        if children:
+            idx = class_idx.get(cls)
+            if idx is None:
+                idx = class_idx[cls] = len(classes)
+                classes.append((cls.__name__, cls.type, list(cls._class_types)))
+            kinds.append(0)
+            a.append(idx)
+            b.append(len(children))
+            stack.extend(reversed(children))
+            continue
+        pos_marker = seg.pos_marker
+        if pos_marker is None:
+            positions.extend(_NO_POSITION)
+        else:
+            source, templated = pos_marker.source_slice, pos_marker.templated_slice
+            positions.extend(
+                (
+                    source.start,
+                    source.stop,
+                    templated.start,
+                    templated.stop,
+                    pos_marker.working_line_no,
+                    pos_marker.working_line_pos,
+                )
+            )
+        if seg.is_meta:
+            seg_type = seg.type
+            if seg_type == "end_of_file":
+                kinds.append(6)
+                a.append(0)
+            elif seg_type in _META_KINDS:
+                kinds.append(_META_KINDS[seg_type])
+                a.append(1 if getattr(seg, "is_implicit", False) else 0)
+                if seg_type == "placeholder":
+                    texts.append(seg.source_str)  # type: ignore[attr-defined]
+                    texts.append(seg.block_type)  # type: ignore[attr-defined]
+            else:
+                return None
+            b.append(0)
+        elif not seg.is_type("raw"):
+            # A container with no children isn't in `raw_segments`, so the
+            # arena's leaves would no longer line up with it.
+            return None
+        else:
+            idx = class_idx.get(cls)
+            if idx is None:
+                idx = class_idx[cls] = len(classes)
+                classes.append((cls.__name__, cls.type, list(cls._class_types)))
+            types = tuple(seg.instance_types)  # type: ignore[attr-defined]
+            type_idx = instance_idx.get(types)
+            if type_idx is None:
+                type_idx = instance_idx[types] = len(instance_types)
+                instance_types.append(list(types))
+            kinds.append(1)
+            a.append(idx)
+            b.append(type_idx)
+            texts.append(seg.raw)
+    try:
+        return RsTree.from_segments(
+            templated_file, kinds, a, b, classes, instance_types, texts, positions
+        )
+    except Exception:  # pragma: no cover
+        return None
+
+
 # --- Sub-stage parse profiling -------------------------------------------------
 # RustParser.parse() is a fast Rust core wrapped in O(nodes) Python work. To find
 # out where the time actually goes (Rust parse vs. the Python re-conversion vs.

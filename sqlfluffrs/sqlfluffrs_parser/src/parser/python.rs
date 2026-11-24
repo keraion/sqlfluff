@@ -463,6 +463,56 @@ pub struct PyParser {
     max_parse_nodes: usize,
 }
 
+impl PyParser {
+    /// Match the named segment's grammar against `tokens`; see
+    /// `rematch_segment`.
+    fn run_rematch(&self, name: &str, mut rust_tokens: Vec<Token>) -> PyResult<Option<(usize, usize)>> {
+        fn count_unparsable(node: &Node) -> usize {
+            match node {
+                Node::Unparsable { children, .. } => {
+                    1 + children.iter().map(count_unparsable).sum::<usize>()
+                }
+                Node::Segment { children, .. } => children.iter().map(count_unparsable).sum(),
+                _ => 0,
+            }
+        }
+        self.dialect
+            .get_bracket_pairs()
+            .compute_matching_indices(&mut rust_tokens);
+        let mut parser = Parser::new_with_max_parse_depth(
+            &rust_tokens,
+            self.dialect,
+            self.indent_config.clone(),
+            self.max_parse_depth,
+        )
+        .with_parser_limits(self.max_parser_iterations, self.parser_warn_threshold);
+        let Some(m) = parser.rematch_segment(name).map_err(parse_error_to_pyerr)? else {
+            return Ok(None);
+        };
+        if std::env::var_os("SQLFLUFF_RS_REMATCH_DEBUG").is_some() {
+            fn dump(m: &MatchResult, depth: usize, tokens: &[Token]) {
+                let class = m
+                    .matched_class
+                    .as_ref()
+                    .map(|c| format!("{} ({:?})", c.class_name, c.segment_type))
+                    .unwrap_or_else(|| "-".to_string());
+                let raws: Vec<&str> = tokens[m.matched_slice.clone()].iter().map(|t| t.raw()).collect();
+                eprintln!("{}{:?} {} {:?}", "  ".repeat(depth), m.matched_slice, class, raws);
+                for c in &m.child_matches {
+                    dump(c, depth + 1, tokens);
+                }
+            }
+            dump(&m, 0, &rust_tokens);
+        }
+        let matched = m.matched_slice.end.saturating_sub(m.matched_slice.start);
+        // The match tree marks unparsable sections by class; the applied
+        // nodes are checked too in case they're only made on apply.
+        let unparsable = usize::from(m.contains_unparsable())
+            + m.apply(&rust_tokens).iter().map(count_unparsable).sum::<usize>();
+        Ok(Some((matched, unparsable)))
+    }
+}
+
 #[pymethods]
 impl PyParser {
     #[new]
@@ -507,6 +557,70 @@ impl PyParser {
     #[getter]
     fn dialect(&self) -> String {
         format!("{:?}", self.dialect).to_lowercase()
+    }
+
+    /// SPIKE: re-match a segment class's grammar against leaves taken from a
+    /// (possibly fixed) Python tree, as `validate_segment_with_reparse` does.
+    /// Returns `(matched_length, unparsable_count)`, or `None` if Rust has no
+    /// grammar for that class.
+    pub fn rematch_segment(
+        &self,
+        name: &str,
+        leaves: Vec<Bound<'_, PyAny>>,
+    ) -> PyResult<Option<(usize, usize)>> {
+        let mut rust_tokens: Vec<Token> = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            let pos_marker: sqlfluffrs_python::marker::PySqlFluffPositionMarker =
+                leaf.getattr("pos_marker")?.extract()?;
+            rust_tokens.push(Token::typed_leaf(
+                leaf.getattr("raw")?.extract()?,
+                pos_marker.into(),
+                leaf.get_type().name()?.extract()?,
+                leaf.getattr("type")?.extract()?,
+                leaf.getattr("class_types")?.extract()?,
+                leaf.getattr("instance_types")?.extract()?,
+                leaf.getattr("is_code")?.extract()?,
+                leaf.getattr("is_whitespace")?.extract()?,
+                leaf.getattr("is_comment")?.extract()?,
+            ));
+        }
+        self.run_rematch(name, rust_tokens)
+    }
+
+    /// SPIKE: as `rematch_segment`, with the leaves read from an arena.
+    /// `leaf_indices` index the arena's leaves in order (as Python's
+    /// `raw_segments`); the caller has already dropped metas and trimmed
+    /// non-code from the ends.
+    pub fn rematch_arena_leaves(
+        &self,
+        tree: &super::arena_py::PyTree,
+        name: &str,
+        leaf_indices: Vec<usize>,
+    ) -> PyResult<Option<(usize, usize)>> {
+        let tokens: Option<Vec<Token>> = tree.with_arena(|arena| {
+            let leaves = arena.raw_segments(arena.root());
+            leaf_indices
+                .iter()
+                .map(|i| {
+                    let id = *leaves.get(*i)?;
+                    Some(Token::typed_leaf(
+                        arena.raw(id),
+                        arena.pos_marker(id)?,
+                        arena.segment_class(id).unwrap_or_default(),
+                        arena.class_type(id),
+                        arena.class_types(id).iter().cloned().collect(),
+                        arena.instance_types_arc(id).as_ref().clone(),
+                        arena.is_code(id),
+                        arena.is_whitespace(id),
+                        arena.is_comment(id),
+                    ))
+                })
+                .collect()
+        });
+        match tokens {
+            Some(tokens) => self.run_rematch(name, tokens),
+            None => Ok(None),
+        }
     }
 
     /// Parse SQL from tokens and return MatchResult (deferred AST construction)

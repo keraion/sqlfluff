@@ -1,12 +1,22 @@
 """Implementation of Rule LT05."""
 
-from typing import cast
+import os
+from typing import Optional, cast
 
 from sqlfluff.core.parser.segments import TemplateSegment
 from sqlfluff.core.rules import LintResult, RuleContext
 from sqlfluff.core.rules.base import BaseRule
 from sqlfluff.core.rules.crawlers import RootOnlyCrawler
+from sqlfluff.utils.reflow.config import ReflowConfig
+from sqlfluff.utils.reflow.helpers import results_from_rust
 from sqlfluff.utils.reflow.sequence import ReflowSequence
+
+try:
+    import sqlfluffrs
+
+    _HAS_RUST_LONG_LINE = hasattr(sqlfluffrs, "reflow_long_lines")
+except ImportError:  # pragma: no cover
+    _HAS_RUST_LONG_LINE = False
 
 
 class Rule_LT05(BaseRule):
@@ -16,6 +26,7 @@ class Rule_LT05(BaseRule):
     aliases = ("L016",)
     groups = ("all", "core", "layout")
     crawl_behaviour = RootOnlyCrawler()
+    _rebuild_rust_arena = True
     targets_templated = True
     template_safe_fixes = True
     _adjust_anchors = True
@@ -26,6 +37,41 @@ class Rule_LT05(BaseRule):
         "ignore_comment_lines",
         "ignore_comment_clauses",
     ]
+
+    def _eval_rust(self, context: RuleContext) -> Optional[list[LintResult]]:
+        """SPIKE: long lines in Rust over the arena. See ``BaseRule._eval_rust``.
+
+        Returns ``None`` (Python path) when the extension has no support, when
+        either comment-ignoring option is on (they filter the results after
+        the fact), or when Rust reports a case it doesn't cover.
+        """
+        if not _HAS_RUST_LONG_LINE or os.environ.get("SQLFLUFF_NO_RUST_LT05"):
+            return None
+        if self.ignore_comment_lines or self.ignore_comment_clauses:
+            return None
+        rs_tree = getattr(context.segment, "_rs_tree", None) or getattr(
+            context.segment, "_rs_tree_rebuilt", None
+        )
+        if rs_tree is None:
+            return None  # pragma: no cover
+        reflow_config = ReflowConfig.from_fluff_config(context.config)
+        layout = {
+            seg_type: {k: str(v) for k, v in cfg.items() if v is not None}
+            for seg_type, cfg in reflow_config._config_dict.items()
+        }
+        found = sqlfluffrs.reflow_long_lines(  # type: ignore[attr-defined]
+            rs_tree,
+            layout,
+            str(reflow_config.indent_unit),
+            int(reflow_config.tab_space_size),
+            str(reflow_config.implicit_indents),
+            str(reflow_config.trailing_comments),
+            str(reflow_config.list_wrapping),
+            int(reflow_config.max_line_length),
+        )
+        if found is None:
+            return None
+        return results_from_rust(context.segment.raw_segments, found)
 
     def _eval(self, context: RuleContext) -> list[LintResult]:
         """Line is too long."""

@@ -1,10 +1,20 @@
 """Implementation of Rule LT01."""
 
+import os
 from typing import Optional
 
-from sqlfluff.core.rules import BaseRule, LintResult, RuleContext
+from sqlfluff.core.parser import WhitespaceSegment
+from sqlfluff.core.rules import BaseRule, LintFix, LintResult, RuleContext
 from sqlfluff.core.rules.crawlers import RootOnlyCrawler
+from sqlfluff.utils.reflow.config import ReflowConfig
 from sqlfluff.utils.reflow.sequence import ReflowSequence
+
+try:
+    import sqlfluffrs
+
+    _HAS_RUST_RESPACE = hasattr(sqlfluffrs, "reflow_respace")
+except ImportError:  # pragma: no cover
+    _HAS_RUST_RESPACE = False
 
 
 class Rule_LT01(BaseRule):
@@ -63,7 +73,43 @@ class Rule_LT01(BaseRule):
     aliases = ("L001", "L005", "L006", "L008", "L023", "L024", "L039", "L048", "L071")
     groups = ("all", "core", "layout")
     crawl_behaviour = RootOnlyCrawler()
+    _rebuild_rust_arena = True
     is_fix_compatible = True
+
+    def _eval_rust(self, context: RuleContext) -> Optional[list[LintResult]]:
+        """SPIKE: respace in Rust over the arena. See ``BaseRule._eval_rust``.
+
+        Returns ``None`` (Python path) when the extension has no respace, or
+        when Rust reports a case it doesn't cover.
+        """
+        if not _HAS_RUST_RESPACE or os.environ.get("SQLFLUFF_NO_RUST_LT01"):
+            return None
+        rs_tree = getattr(context.segment, "_rs_tree", None) or getattr(
+            context.segment, "_rs_tree_rebuilt", None
+        )
+        if rs_tree is None:
+            return None  # pragma: no cover
+        layout = {
+            seg_type: {k: str(v) for k, v in cfg.items() if v is not None}
+            for seg_type, cfg in ReflowConfig.from_fluff_config(
+                context.config
+            )._config_dict.items()
+        }
+        found = sqlfluffrs.reflow_respace(rs_tree, layout)  # type: ignore[attr-defined]
+        if found is None:
+            return None
+        raws = context.segment.raw_segments
+        results = []
+        for anchor_idx, description, kind, fix_idx, edit in found:
+            target = raws[fix_idx]
+            if kind == "delete":
+                fix = LintFix.delete(target)
+            elif kind == "replace":
+                fix = LintFix("replace", anchor=target, edit=[target.edit(edit)])
+            else:
+                fix = LintFix(kind, anchor=target, edit=[WhitespaceSegment()])
+            results.append(LintResult(raws[anchor_idx], [fix], description=description))
+        return results
 
     def _eval(self, context: RuleContext) -> Optional[list[LintResult]]:
         """Unnecessary whitespace."""

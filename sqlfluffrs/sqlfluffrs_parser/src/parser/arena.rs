@@ -497,6 +497,17 @@ impl Arena {
         }
     }
 
+    /// SPIKE: source text of a template placeholder; `None` for anything else.
+    pub fn source_str(&self, id: NodeId) -> Option<&str> {
+        match &self.node(id).kind {
+            ArenaKind::Meta {
+                meta_type: MetaType::Template { source_str, .. },
+                ..
+            } => Some(source_str.as_str()),
+            _ => None,
+        }
+    }
+
     /// Template block identity (`Uuid::as_u128`) of a meta; `None` for
     /// parser-inserted metas and non-metas.
     pub fn block_uuid(&self, id: NodeId) -> Option<u128> {

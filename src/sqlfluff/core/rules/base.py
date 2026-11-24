@@ -18,6 +18,7 @@ import bdb
 import copy
 import fnmatch
 import logging
+import os
 import pathlib
 import re
 import threading
@@ -492,6 +493,9 @@ class BaseRule(metaclass=RuleMetaclass):
         """Whether Rust-native rule detection is enabled (core.use_rust_rules)."""
         return config.rust_rules_enabled()
 
+    # SPIKE: see `crawl()`.
+    _rebuild_rust_arena = False
+
     def _eval_rust(self, context: RuleContext) -> Optional[list[LintResult]]:
         """Optionally evaluate the whole rule natively in Rust.
 
@@ -546,7 +550,26 @@ class BaseRule(metaclass=RuleMetaclass):
         # are post-processed identically to _eval results. Rules without a Rust
         # path — or parses with no arena (Python parser) — fall through to the
         # Python crawl below.
-        if self._rust_rules_enabled(config) and getattr(tree, "_rs_tree", None):
+        # SPIKE: a rule which sets `_rebuild_rust_arena` gets a fresh arena
+        # when a fix has replaced the tree the parser built one for. It's kept
+        # apart from `_rs_tree` so only the rules which asked for it use it.
+        rust_tree = None
+        if self._rust_rules_enabled(config):
+            rust_tree = getattr(tree, "_rs_tree", None)
+            if (
+                rust_tree is None
+                and self._rebuild_rust_arena
+                and templated_file is not None
+                and os.environ.get("SQLFLUFF_NO_ARENA_REBUILD") is None
+            ):
+                rust_tree = getattr(tree, "_rs_tree_rebuilt", None)
+                if rust_tree is None:
+                    from sqlfluff.core.parser.rust_parser import rebuild_rs_tree
+
+                    rust_tree = rebuild_rs_tree(tree, templated_file)
+                    # `False` records a failed attempt, so it isn't repeated.
+                    setattr(tree, "_rs_tree_rebuilt", rust_tree or False)
+        if rust_tree:
             try:
                 rust_results = self._eval_rust(root_context)
             except (bdb.BdbQuit, KeyboardInterrupt):  # pragma: no cover

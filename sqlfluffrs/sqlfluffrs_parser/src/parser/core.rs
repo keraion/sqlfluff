@@ -331,6 +331,18 @@ impl<'a> Parser<'a> {
         self.table_cache.len()
     }
 
+    /// SPIKE: match one named segment's grammar against all of the tokens,
+    /// from the start. This is what Python's
+    /// `BaseSegment.validate_segment_with_reparse` does after a fix.
+    pub fn rematch_segment(&mut self, name: &str) -> Result<Option<MatchResult>, ParseError> {
+        let Some(root) = self.dialect.get_segment_grammar(name) else {
+            return Ok(None);
+        };
+        self.grammar_ctx = GrammarContext::new(root.tables);
+        self.parse_table_iterative_match_result(root.grammar_id, &[])
+            .map(Some)
+    }
+
     /// Parse and return MatchResult
     ///
     /// We can pass either Rust's or Python's implementation of `apply` to convert the MatchResult into a Node.
