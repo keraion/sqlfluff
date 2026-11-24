@@ -157,7 +157,8 @@ Handed back to Python (378 passes in the parity run):
 
 - fixes that move an existing subtree (ST06, ST09, CV11, some LT09): 358;
 - anchor not in the tree: 10; validation failed (Python rejects these too): 10;
-- templated files, unparsable sections and source fixes never reach it.
+- unparsable sections never reach it. (Templated files did not either at
+  this point; see "Templated fix mode: ported" at the end.)
 
 Not ported: `max_parse_nodes` in validation, `fix_even_unparsable`. Rebuilt
 containers get new uuids where Python sometimes keeps them; no parity
@@ -192,7 +193,8 @@ Goal: no Python in lint/fix except legacy plugin rules.
    the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
-   (section 6). Left: moved subtrees, templated files, unparsable sections.
+   (section 6) and for templated files (last section). Left: moved subtrees,
+   unparsable sections.
 4. Reporting straight from Rust results.
 5. Plugin bridge: build the Python tree on demand, only when a Python rule
    is loaded.
@@ -431,11 +433,64 @@ This is at or above the 1.20–1.22× ceiling estimated in the scope section.
 
 ### Not covered
 
-- **Templated fix mode.** The Rust apply declines templated files, so their
-  fixes still go through Python's `apply_fixes`.
+- **Templated fix mode.** Not at this point; ported in the next section.
 - **Trees with source fixes.** Once a tree carries source fixes from an
-  earlier pass, the three rules fall back to Python for that pass: the arena
+  earlier pass, the three rules detect in Python for that pass: the arena
   doesn't hold source fixes.
 - **The dbt templater.** Everything here used the jinja templater.
 - **A real dbt project of any size.** jaffle shop is 7 models and the repo
   files are test snippets.
+
+## Templated fix mode: ported
+
+The Rust apply (section 6) now takes templated files and trees which already
+carry source fixes. Commit `033b4ced1`.
+
+### What it took
+
+- **Placeholder source edits.** A fix which edits a tag's source (the
+  reflow's `edit_source`, and rules such as JJ01) is applied as the same
+  placeholder carrying a source fix, with no validation, as Python does.
+- **Templated positioning.** An expression which rendered nothing is not
+  used as the end point when a new segment is positioned.
+- **Rebuild scope.** Python re-positions every segment it walks through
+  while fixes are left to apply, not only those above a fix. That shows only
+  where positions aren't already what a rebuild gives, which is templated
+  files. Rust mirrors it there and keeps the cheaper path elsewhere.
+- **Condensed fixes.** Several source edits to one anchor are merged into
+  one fix (`compute_anchor_edit_info`) before applying; the Rust path was
+  given the unmerged list.
+- **Loop check.** The linter compares the Rust result on text plus source
+  fixes: a source-only fix doesn't change the rendered text.
+
+### Results
+
+Fix mode, in process, min of 3:
+
+| | Python rules | Rust reflow, Python apply | Rust reflow, Rust apply |
+|---|---|---|---|
+| Templated repo files (127) | 4.32s | 4.02s (1.07×) | 2.59s (1.67×) |
+| testbed (191 files, 12 templated) | 6.60s | 5.92s (1.11×) | 3.50s (1.89×) |
+
+On the testbed nothing goes to Python's `apply_fixes` any more. On the repo
+files 72 passes are handed back, leaving 0.34s of Python apply.
+
+Parity, on the final build:
+
+- Each of 4,836 Rust apply passes (2,944 rule fixture cases, templated repo
+  files, testbed, and the eight dialect corpora) matches Python's
+  `apply_fixes` on the same tree, node by node: class, raw, source slice,
+  templated slice, working position, and for leaves the placeholder source,
+  source fixes and block uuid.
+- The final fixed output is identical with the Rust apply on and off for
+  every fixture case and file.
+- Lint parity for the four reflow rules is unchanged: identical on the
+  templated corpora and on the untemplated regression.
+
+Handed back to Python across that run (464 passes): edits which move an
+existing subtree 396; fixes inside unparsable sections 51 (all from repo
+files forced to the ansi dialect); anchor not in the tree 10; validation
+failed, which Python rejects too, 7.
+
+jaffle shop has nothing to fix under the default rules, so it contributed no
+apply passes.
