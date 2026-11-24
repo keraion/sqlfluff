@@ -67,7 +67,7 @@ across the four rules through a thread-local cache keyed on root uuid and
 layout config.
 
 Rust returns `None`, and Python runs as before, for anything not covered:
-templated files, alignment, `implicit_indents = require`, LT05
+alignment, `implicit_indents = require`, LT05
 `ignore_comment_lines` / `ignore_comment_clauses`.
 
 Results, untemplated files, lint and fix output identical on 629 rule
@@ -188,7 +188,7 @@ not been profiled.
 
 Goal: no Python in lint/fix except legacy plugin rules.
 
-1. Rules in Rust: reflow first (done here for untemplated files), then
+1. Rules in Rust: reflow first (done here, templated files included), then
    templated reflow, then the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
@@ -221,6 +221,9 @@ tree optional.
   branch.
 
 ## Templated reflow scope
+
+> Superseded: the port this section scopes is done. See "Templated reflow:
+> ported" at the end. The measurements here are from before it.
 
 Measured 2026-11-24 on this branch. In process, parse + full-rule lint, min
 of 3, Rust parser. "Templated" = the same test as `is_untemplated()` in
@@ -358,3 +361,81 @@ less than nothing, from the Rust reflow.
 - 36 repo fixture files that fail to template or parse.
 - Script: `scope.py` and `warm.py` in the session scratchpad, not on this
   branch.
+
+## Templated reflow: ported
+
+LT02, LT05 and LT14 now run in Rust on every templated file (LT01 already
+did). Done in three slices, each checked for identical output before the
+next:
+
+1. `a56456b5b` — files whose only templating is `{{ }}` expressions,
+   `{# #}` comments and non-block tags such as `{% set %}`.
+2. `3616f6cb6` — block tags and loops.
+3. `964b459e1` — tags which consume whitespace (`{%-`, `-%}`).
+
+### What it took
+
+- **Templated newlines.** A newline a tag rendered is not a line break, not
+  an indent, and not a place to insert one.
+- **Deferred indent points.** An empty placeholder, or an expression
+  mid-line, can't take an indent.
+- **Multi-line tags.** A line starting with a tag which spans lines isn't
+  linted.
+- **Long lines (LT05).** Templated code is measured by its source length;
+  no break goes between two segments a tag rendered, or around a comment
+  with a tag in its source.
+- **Keyword breaks (LT14).** A location whose neighbouring newline came from
+  a tag is skipped.
+- **Block tags.** Ports of `_rebalance_unrendered_block_indents`,
+  `_revise_skipped_source_lines`, `_revise_templated_lines` and
+  `_revise_loop_repeated_lines`, and the block check in
+  `_lint_line_untaken_negative_indents`.
+- **Consumed whitespace.** Whitespace a tag swallowed counts as a line break
+  and as the line's indent. Changing it needs a new fix kind,
+  `edit_source`: the Rust result carries a source fix and Python builds the
+  edited placeholder from it.
+- **Rebuilt arenas carry block uuids,** so this also holds after a fix pass.
+
+### A bug in the parser's arena
+
+`match_result.rs::token_to_node` stored a template placeholder's raw (always
+empty) as its source string, so every tag looked empty and consumed
+whitespace was never recognised. This is in main's arena build, not only the
+spike, and affects anything that reads `source_str` from the arena under
+`use_rust_rules`. Fixed in `3616f6cb6`.
+
+### Results
+
+Rust vs Python: lint results, fixes and fixed text.
+
+| Corpus | Identical | LT02 / LT05 / LT14 answered in Rust |
+|---|---|---|
+| Templated rule fixture cases | 92 / 92 | 108 / 106 / 108 of 108 runs |
+| Repo jinja files | 133 / 133 | 202 of 202 each |
+| jaffle shop | 7 / 7 | 10 of 10 each |
+| testbed templated files | 12 / 12 | 12 of 12 each |
+| Untemplated regression (629 fixtures, 1,765 files) | all identical | |
+
+The two LT05 runs left in Python use `ignore_comment_lines` /
+`ignore_comment_clauses`, which were already excluded.
+
+Parse + lint on templated files, min of 3, Rust reflow vs Python reflow:
+
+| Corpus | Python | Rust | After slice 3 | After slice 2 | After slice 1 |
+|---|---|---|---|---|---|
+| Repo jinja files (136) | 1,898ms | 1,471ms | 1.29× | 1.19× | 1.02× |
+| jaffle shop (7) | 160ms | 122ms | 1.31× | 1.00× | 1.13× |
+| testbed templated (12) | 122ms | 103ms | 1.19× | 1.10× | not measured |
+
+This is at or above the 1.20–1.22× ceiling estimated in the scope section.
+
+### Not covered
+
+- **Templated fix mode.** The Rust apply declines templated files, so their
+  fixes still go through Python's `apply_fixes`.
+- **Trees with source fixes.** Once a tree carries source fixes from an
+  earlier pass, the three rules fall back to Python for that pass: the arena
+  doesn't hold source fixes.
+- **The dbt templater.** Everything here used the jinja templater.
+- **A real dbt project of any size.** jaffle shop is 7 models and the repo
+  files are test snippets.
