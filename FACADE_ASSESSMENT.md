@@ -193,8 +193,8 @@ Goal: no Python in lint/fix except legacy plugin rules.
    the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
-   (section 6) and for templated files (last section). Left: moved subtrees,
-   unparsable sections.
+   (section 6), for templated files and for moved subtrees (last two
+   sections). Left: unparsable sections, moved subtrees on templated files.
 4. Reporting straight from Rust results.
 5. Plugin bridge: build the Python tree on demand, only when a Python rule
    is loaded.
@@ -494,3 +494,54 @@ failed, which Python rejects too, 7.
 
 jaffle shop has nothing to fix under the default rules, so it contributed no
 apply passes.
+
+## Moved-subtree fixes: ported
+
+Fixes whose edit is a segment taken from the old tree (ST06 reordering select
+targets, LT09, ST09, CV11, ST05) now go through the Rust apply on untemplated
+files. Commit `267764c3b`.
+
+### What it took
+
+- **Edit subtrees carry their positions.** A moved segment keeps the source
+  and templated slices of everything inside it; only the top of the edit is
+  positioned afresh. Python sends each new segment's position (or none)
+  alongside its class and text.
+- **Indent metas inside edits.** Moved clauses contain them.
+- **Recursive positioning.** New segments are positioned level by level, as
+  `_position_segments` does, instead of collapsing a new container's
+  contents to one point.
+- **Python's stale working locations.** When a moved container's working
+  location happens not to change, Python doesn't re-position what is inside
+  it, so those segments keep their old line and column. Rust mirrors that.
+  It caused the only 2 mismatching passes seen.
+
+Not taken, deliberately: moved subtrees on templated files. There Python's
+walk order affects positions (see "Rebuild scope" above) and that isn't
+mirrored for moved segments.
+
+### Results
+
+Fix mode, in process, min of 3:
+
+| | Python rules | Rust reflow, Python apply | Rust reflow, Rust apply | Before this step |
+|---|---|---|---|---|
+| testbed (191) | 6.81s | 6.09s (1.12×) | 3.23s (2.11×) | 1.89× |
+| snowflake (280) | 21.61s | 18.99s (1.14×) | 7.47s (2.89×) | 2.72× |
+| postgres (227) | 18.93s | 16.04s (1.18×) | 6.65s (2.85×) | 2.72× |
+| Templated repo files (127) | 4.71s | 4.18s (1.13×) | 2.51s (1.88×) | 1.67× |
+
+Python's `apply_fixes` is down to 18ms on snowflake and 23ms on postgres
+(about 300ms each before). The repo figure moved only through run-to-run
+noise: its handed-back passes are unparsable sections and templated moves.
+
+Parity, on the final build: each of 5,174 Rust apply passes matches Python's
+`apply_fixes` on the same tree, node by node, and the final fixed output is
+identical for all 2,944 rule fixture cases and 1,892 files. Lint parity for
+the reflow rules is unchanged.
+
+Handed back to Python across that run (126 passes, down from 464): fixes
+inside unparsable sections 51; edits not taken 40 (moved subtrees on
+templated files, fresh edits with non-code at their ends); anchor not in the
+tree 17; a replacement which keeps its anchor's position but changes class
+11; validation failed, which Python rejects too, 7.
