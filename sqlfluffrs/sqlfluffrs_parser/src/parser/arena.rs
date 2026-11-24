@@ -790,6 +790,96 @@ impl Arena {
     }
 }
 
+// SPIKE: what `arena_fix` needs to rebuild a tree with edits.
+impl NodeId {
+    /// Pre-order position of the node: ids are allocated in pre-order.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Arena {
+    /// A `Node` copy of `id`, with the given position, and optionally a new
+    /// raw (leaves) or new children (containers).
+    pub(crate) fn node_like(
+        &self,
+        id: NodeId,
+        pos_marker: Option<PositionMarker>,
+        new_raw: Option<String>,
+        children: Vec<Node>,
+    ) -> Node {
+        match &self.node(id).kind {
+            ArenaKind::Raw {
+                segment_class,
+                segment_type,
+                class_type,
+                raw,
+                instance_types,
+                class_types,
+                kwargs,
+            } => Node::Raw {
+                segment_class: segment_class.clone(),
+                segment_type: segment_type.clone(),
+                class_type: class_type.clone(),
+                raw: new_raw.unwrap_or_else(|| raw.clone()),
+                pos_marker,
+                instance_types: instance_types.as_ref().clone(),
+                class_types: class_types.clone(),
+                segment_kwargs: kwargs.clone(),
+            },
+            ArenaKind::Segment {
+                segment_class,
+                segment_type,
+                class_types,
+            } => Node::Segment {
+                segment_class: segment_class.clone(),
+                segment_type: segment_type.clone(),
+                pos_marker,
+                class_types: class_types.clone(),
+                children,
+            },
+            ArenaKind::Meta {
+                meta_type,
+                block_uuid,
+            } => Node::Meta {
+                meta_type: meta_type.clone(),
+                pos_marker,
+                block_uuid: *block_uuid,
+            },
+            ArenaKind::Unparsable { expected } => Node::Unparsable {
+                expected: expected.clone(),
+                pos_marker,
+                children,
+            },
+            ArenaKind::Empty => Node::Empty,
+        }
+    }
+
+    /// A `Node` copy of the whole subtree at `id`, unchanged.
+    pub(crate) fn node_deep(&self, id: NodeId) -> Node {
+        let children = self
+            .children(id)
+            .iter()
+            .map(|&c| self.node_deep(c))
+            .collect();
+        self.node_like(id, self.node(id).pos_marker.clone(), None, children)
+    }
+
+    /// Position of `id` without cloning the marker.
+    pub(crate) fn pos_ref(&self, id: NodeId) -> Option<&PositionMarker> {
+        self.node(id).pos_marker.as_ref()
+    }
+
+    /// Raw text of a leaf, borrowed ("" for metas and containers).
+    pub(crate) fn leaf_raw(&self, id: NodeId) -> &str {
+        match &self.node(id).kind {
+            ArenaKind::Raw { raw, .. } => raw,
+            _ => "",
+        }
+    }
+}
+
 fn meta_type_str(meta_type: &MetaType) -> &'static str {
     match meta_type {
         MetaType::Indent { .. } => "indent",

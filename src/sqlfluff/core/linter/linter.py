@@ -632,15 +632,39 @@ class Linter:
                             # This is the happy path. We have fixes, now we want to
                             # apply them.
                             last_fixes = fixes
-                            new_tree, _, _, _valid = apply_fixes(
-                                tree,
-                                config.get("dialect_obj"),
-                                crawler.code,
-                                anchor_info,
-                                fix_even_unparsable=config.get("fix_even_unparsable"),
-                                max_parse_depth=config.get("max_parse_depth"),
-                                max_parse_nodes=config.get("max_parse_nodes"),
-                            )
+                            # SPIKE: fixes from the Rust reflow rules are
+                            # applied on the arena. Anything it declines, makes
+                            # no change with, or which leads back to a version
+                            # seen before, is left to `apply_fixes` below.
+                            rs_tree: Optional[BaseSegment] = None
+                            if os.environ.get("SQLFLUFF_NO_RUST_APPLY") is None:
+                                from sqlfluff.core.parser.rust_parser import (
+                                    apply_fixes_rust,
+                                )
+
+                                applied = apply_fixes_rust(
+                                    tree, fixes, templated_file, config
+                                )
+                                if (
+                                    applied
+                                    and applied[0] != tree.raw
+                                    and (applied[0], ()) not in previous_versions
+                                ):
+                                    rs_tree = applied[1]()
+                            if rs_tree is not None:
+                                new_tree, _valid = rs_tree, True
+                            else:
+                                new_tree, _, _, _valid = apply_fixes(
+                                    tree,
+                                    config.get("dialect_obj"),
+                                    crawler.code,
+                                    anchor_info,
+                                    fix_even_unparsable=config.get(
+                                        "fix_even_unparsable"
+                                    ),
+                                    max_parse_depth=config.get("max_parse_depth"),
+                                    max_parse_nodes=config.get("max_parse_nodes"),
+                                )
 
                             # Check for infinite loops. We use a combination of the
                             # fixed templated file and the list of source fixes to

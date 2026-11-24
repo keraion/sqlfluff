@@ -72,16 +72,6 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
         seg = stack.pop()
         children = seg.segments
         cls = type(seg)
-        if children:
-            idx = class_idx.get(cls)
-            if idx is None:
-                idx = class_idx[cls] = len(classes)
-                classes.append((cls.__name__, cls.type, list(cls._class_types)))
-            kinds.append(0)
-            a.append(idx)
-            b.append(len(children))
-            stack.extend(reversed(children))
-            continue
         pos_marker = seg.pos_marker
         if pos_marker is None:
             positions.extend(_NO_POSITION)
@@ -97,6 +87,16 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
                     pos_marker.working_line_pos,
                 )
             )
+        if children:
+            idx = class_idx.get(cls)
+            if idx is None:
+                idx = class_idx[cls] = len(classes)
+                classes.append((cls.__name__, cls.type, list(cls._class_types)))
+            kinds.append(0)
+            a.append(idx)
+            b.append(len(children))
+            stack.extend(reversed(children))
+            continue
         if seg.is_meta:
             seg_type = seg.type
             if seg_type == "end_of_file":
@@ -135,6 +135,149 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
         )
     except Exception:  # pragma: no cover
         return None
+
+
+# SPIKE: seconds spent in each stage of `apply_fixes_rust`, for measuring.
+APPLY_STATS: dict[str, float] = defaultdict(float)
+_APPLY_PARSERS: dict[tuple[str, int], Any] = {}
+
+
+def apply_fixes_rust(
+    tree: BaseSegment, fixes: list[Any], templated_file: Any, config: FluffConfig
+) -> Optional[tuple[str, Any]]:
+    """SPIKE: apply fixes on the Rust arena instead of with `apply_fixes`.
+
+    Only for fixes the Rust reflow rules made (each carries `_rs_spec`) on an
+    untemplated file. Rust applies them to the arena, validates each rebuilt
+    segment by re-matching it, and returns a new arena plus a plan for
+    building the Python tree. Returns `(new raw, build)`, where `build()`
+    makes the new tree, or `None` if Python should apply the fixes.
+    """
+    from sqlfluff.core.parser.markers import PositionMarker
+    from sqlfluff.core.parser.segments import NewlineSegment, WhitespaceSegment
+
+    arena = getattr(tree, "_rs_tree", None) or getattr(tree, "_rs_tree_rebuilt", None)
+    if (
+        not arena
+        or templated_file is None
+        or templated_file.source_str != templated_file.templated_str
+        or tree.source_fixes
+    ):
+        return None
+    specs = []
+    for fix in fixes:
+        spec = getattr(fix, "_rs_spec", None)
+        if spec is None:
+            return None
+        # The rule may have hoisted the anchor from the leaf to an ancestor
+        # (`_choose_anchor_segment`): count how far up it went.
+        seg, levels = spec[4], 0
+        while seg is not fix.anchor:
+            parent = seg.get_parent()
+            if parent is None:
+                return None
+            seg, levels = parent[0], levels + 1
+        specs.append((*spec[:4], levels))
+    key = (config.get("dialect"), config.get("max_parse_depth"))
+    parser = _APPLY_PARSERS.get(key)
+    if parser is None:
+        from sqlfluffrs import RsParser
+
+        parser = _APPLY_PARSERS[key] = RsParser(dialect=key[0], max_parse_depth=key[1])
+    started = time.perf_counter()
+    try:
+        out = parser.apply_leaf_fixes(  # type: ignore[union-attr]
+            arena,
+            specs,
+            {type(tree).__name__, "BaseFileSegment", "UnparsableSegment"},
+            ("WhitespaceSegment", "whitespace", list(WhitespaceSegment._class_types)),
+            ("NewlineSegment", "newline", list(NewlineSegment._class_types)),
+        )
+    except (KeyboardInterrupt, SystemExit):  # pragma: no cover
+        raise
+    except BaseException:  # noqa: BLE001  # a Rust panic isn't an Exception
+        out = None
+    APPLY_STATS["rust total"] += time.perf_counter() - started
+    if out is None:
+        APPLY_STATS["declined"] += 1
+        return None
+    new_arena, ops, texts, slices, raw, validate_ns, validations, rust_ns = out
+    APPLY_STATS["validate"] += validate_ns / 1e9
+    APPLY_STATS["apply"] += (rust_ns - validate_ns) / 1e9
+    APPLY_STATS["validations"] += validations
+
+    def build() -> Optional[BaseSegment]:
+        started = time.perf_counter()
+        # The old tree in pre-order, which is how the arena numbers its nodes.
+        segs: list[BaseSegment] = []
+        todo = [tree]
+        while todo:
+            seg = todo.pop()
+            segs.append(seg)
+            if seg.segments:
+                todo.extend(reversed(seg.segments))
+        if len(segs) != len(arena):
+            APPLY_STATS["declined"] += 1
+            return None
+        # Markers in one tree must all share one templated file object.
+        marker_file = tree.pos_marker.templated_file  # type: ignore[union-attr]
+        # Open containers: [old segment, line, position, children, still to come].
+        stack: list[list[Any]] = []
+        result: Optional[BaseSegment] = None
+        text_idx = slice_idx = 0
+        for i in range(0, len(ops), 5):
+            kind, a, b, line_no, line_pos = ops[i : i + 5]
+            if kind == 0:
+                new = segs[a]
+            elif kind == 5:
+                stack.append([segs[a], line_no, line_pos, [], b])
+                continue
+            elif kind == 1:
+                old = segs[a]
+                assert old.pos_marker
+                new = old.copy()
+                new.pos_marker = old.pos_marker.with_working_position(line_no, line_pos)
+            else:
+                s0, s1, t0, t1 = slices[slice_idx : slice_idx + 4]
+                slice_idx += 4
+                pos = PositionMarker(
+                    slice(s0, s1), slice(t0, t1), marker_file, line_no, line_pos
+                )
+                if kind == 3:
+                    new = WhitespaceSegment(texts[text_idx], pos_marker=pos)
+                    text_idx += 1
+                elif kind == 4:
+                    new = NewlineSegment(pos_marker=pos)
+                elif kind == 2:
+                    new = segs[a].edit(texts[text_idx])
+                    text_idx += 1
+                    new.pos_marker = pos
+                else:
+                    new = segs[a].copy()
+                    new.pos_marker = pos
+            # Add it to its parent, closing every container it completes.
+            while stack:
+                top = stack[-1]
+                top[3].append(new)
+                top[4] -= 1
+                if top[4]:
+                    break
+                stack.pop()
+                old = top[0]
+                new = old.__class__(
+                    segments=tuple(top[3]),
+                    pos_marker=old.pos_marker.with_working_position(top[1], top[2]),
+                    **{k: getattr(old, k) for k in old.additional_kwargs},
+                )
+            else:
+                result = new
+        if result is not None:
+            setattr(result, "_rs_tree_rebuilt", new_arena)
+        APPLY_STATS["materialise"] += time.perf_counter() - started
+        APPLY_STATS["applied"] += 1
+        return result
+
+    return raw, build
 
 
 # --- Sub-stage parse profiling -------------------------------------------------

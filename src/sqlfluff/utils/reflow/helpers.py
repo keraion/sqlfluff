@@ -99,6 +99,8 @@ def results_from_rust(raws: list[RawSegment], found: list[Any]) -> list[LintResu
                 if text:
                     new_segs.append(WhitespaceSegment(text))
                 fixes.append(LintFix.create_before(target, new_segs))
+            # Lets the linter apply this fix on the arena.
+            setattr(fixes[-1], "_rs_spec", (kind, target_idx, text, extra_idx, target))
         results.append(
             LintResult(
                 raws[anchor_idx],

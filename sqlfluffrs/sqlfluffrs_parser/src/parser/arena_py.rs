@@ -69,7 +69,6 @@ impl PyTree {
 #[allow(clippy::too_many_arguments)]
 fn node_from_flat(
     cursor: &mut usize,
-    leaf: &mut usize,
     text: &mut usize,
     kinds: &[u8],
     a: &[u32],
@@ -85,34 +84,48 @@ fn node_from_flat(
     let i = *cursor;
     *cursor += 1;
     let kind = *kinds.get(i)?;
-    if kind == 0 {
-        let (name, class_type, class_types) = classes.get(a[i] as usize)?;
-        let mut children = Vec::with_capacity(b[i] as usize);
-        for _ in 0..b[i] {
-            children.push(node_from_flat(
-                cursor, leaf, text, kinds, a, b, classes, instance_types, texts, positions, templated_file,
-            )?);
-        }
-        return Some(Node::Segment {
-            segment_class: std::borrow::Cow::Owned(name.clone()),
-            segment_type: Some(std::borrow::Cow::Owned(class_type.clone())),
-            pos_marker: None,
-            class_types: class_types.clone(),
-            children,
-        });
-    }
-    // A leaf: six position values, all -1 when it has no marker.
-    let p = positions.get(*leaf * 6..*leaf * 6 + 6)?;
-    *leaf += 1;
+    // Six position values per node, all -1 when it has no marker.
+    let p = positions.get(i * 6..i * 6 + 6)?;
     let pos_marker = (p[0] >= 0).then(|| {
         PositionMarker::new(
-            Slice { start: p[0] as usize, stop: p[1] as usize },
-            Slice { start: p[2] as usize, stop: p[3] as usize },
+            Slice {
+                start: p[0] as usize,
+                stop: p[1] as usize,
+            },
+            Slice {
+                start: p[2] as usize,
+                stop: p[3] as usize,
+            },
             templated_file,
             Some(p[4] as usize),
             Some(p[5] as usize),
         )
     });
+    if kind == 0 {
+        let (name, class_type, class_types) = classes.get(a[i] as usize)?;
+        let mut children = Vec::with_capacity(b[i] as usize);
+        for _ in 0..b[i] {
+            children.push(node_from_flat(
+                cursor,
+                text,
+                kinds,
+                a,
+                b,
+                classes,
+                instance_types,
+                texts,
+                positions,
+                templated_file,
+            )?);
+        }
+        return Some(Node::Segment {
+            segment_class: std::borrow::Cow::Owned(name.clone()),
+            segment_type: Some(std::borrow::Cow::Owned(class_type.clone())),
+            pos_marker,
+            class_types: class_types.clone(),
+            children,
+        });
+    }
     let mut next_text = || {
         let t = texts.get(*text).cloned();
         *text += 1;
@@ -185,10 +198,9 @@ impl PyTree {
         positions: Vec<i64>,
     ) -> Option<PyTree> {
         let templated_file: Arc<sqlfluffrs_types::TemplatedFile> = templated_file.into();
-        let (mut cursor, mut leaf, mut text) = (0, 0, 0);
+        let (mut cursor, mut text) = (0, 0);
         let node = node_from_flat(
             &mut cursor,
-            &mut leaf,
             &mut text,
             &kinds,
             &a,

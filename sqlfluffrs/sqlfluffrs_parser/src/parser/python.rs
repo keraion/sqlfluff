@@ -623,6 +623,83 @@ impl PyParser {
         }
     }
 
+    /// SPIKE: apply fixes anchored on leaves to the arena, validating each
+    /// rebuilt segment as Python's `apply_fixes` does. `fixes` are `(kind,
+    /// target leaf, text, extra leaf)` with leaves indexed as Python's
+    /// `raw_segments`. Returns the new arena and the plan for building the
+    /// Python tree (see `arena_fix::Plan`), or `None` if Python should apply
+    /// the fixes itself.
+    #[allow(clippy::type_complexity)]
+    pub fn apply_leaf_fixes(
+        &self,
+        tree: &super::arena_py::PyTree,
+        fixes: Vec<(String, usize, String, Option<usize>, usize)>,
+        loose_ends: std::collections::HashSet<String>,
+        whitespace: (String, String, Vec<String>),
+        newline: (String, String, Vec<String>),
+    ) -> Option<(super::arena_py::PyTree, Vec<i64>, Vec<String>, Vec<usize>, String, u64, usize, u64)> {
+        use super::arena_fix::{Fix, FixKind, Fixer, Plan};
+        let started = std::time::Instant::now();
+        let (node, plan) = tree.with_arena(|arena| {
+            let root = arena.root();
+            let leaves = arena.raw_segments(root);
+            let mut by_anchor: std::collections::HashMap<_, Vec<Fix>> = std::collections::HashMap::new();
+            let mut marked = std::collections::HashSet::new();
+            for (kind, target, text, extra, levels) in fixes {
+                let mut target = *leaves.get(target)?;
+                for _ in 0..levels {
+                    target = arena.parent(target)?;
+                }
+                let extra = match extra {
+                    Some(e) => Some(*leaves.get(e)?),
+                    None => None,
+                };
+                by_anchor.entry(target).or_default().push(Fix {
+                    kind: FixKind::parse(&kind)?,
+                    text,
+                    extra,
+                });
+                let mut up = arena.parent(target);
+                while let Some(p) = up {
+                    if !marked.insert(p) {
+                        break;
+                    }
+                    up = arena.parent(p);
+                }
+            }
+            let templated_file = arena.pos_marker(root)?.templated_file;
+            let mut validate = |name: &str, tokens: Vec<Token>| {
+                let n = tokens.len();
+                let (matched, unparsable) = self.run_rematch(name, tokens).ok()??;
+                Some(matched == n && unparsable == 0)
+            };
+            Fixer {
+                arena,
+                fixes: by_anchor,
+                marked,
+                loose_ends: &loose_ends,
+                whitespace: &whitespace,
+                newline: &newline,
+                templated_file,
+                validate: &mut validate,
+                plan: Plan::default(),
+            }
+            .run()
+        })?;
+        let new_tree = super::arena_py::PyTree::new(super::arena::Arena::from_node(&node));
+        let total = started.elapsed().as_nanos() as u64;
+        Some((
+            new_tree,
+            plan.ops,
+            plan.texts,
+            plan.slices,
+            plan.raw,
+            plan.validate_ns,
+            plan.validations,
+            total,
+        ))
+    }
+
     /// Parse SQL from tokens and return MatchResult (deferred AST construction)
     ///
     /// This returns a MatchResult that Python can apply using its own apply() logic,

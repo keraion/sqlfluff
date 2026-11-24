@@ -17,6 +17,14 @@ except ImportError:  # pragma: no cover
     _HAS_RUST_RESPACE = False
 
 
+_RS_SPEC_KINDS = {
+    "delete": "delete",
+    "replace": "replace_whitespace",
+    "create_before": "create_space_before",
+    "create_after": "create_space_after",
+}
+
+
 class Rule_LT01(BaseRule):
     """Inappropriate Spacing.
 
@@ -108,6 +116,10 @@ class Rule_LT01(BaseRule):
                 fix = LintFix("replace", anchor=target, edit=[target.edit(edit)])
             else:
                 fix = LintFix(kind, anchor=target, edit=[WhitespaceSegment()])
+            # SPIKE: lets the linter apply this fix on the arena.
+            setattr(
+                fix, "_rs_spec", (_RS_SPEC_KINDS[kind], fix_idx, edit, None, target)
+            )
             results.append(LintResult(raws[anchor_idx], [fix], description=description))
         return results
 
