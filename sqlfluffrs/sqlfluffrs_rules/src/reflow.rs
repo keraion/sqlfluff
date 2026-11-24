@@ -122,6 +122,7 @@ pub struct DepthInfo {
     pub positions: Vec<StackPosition>,
 }
 
+#[derive(Clone)]
 pub struct Block {
     pub segment: NodeId,
     pub config: BlockConfig,
@@ -133,6 +134,7 @@ pub struct Block {
     pub keyword_line_position_exclusions_configs: Vec<(u32, Vec<String>)>,
 }
 
+#[derive(Clone)]
 pub struct Point {
     pub segments: Vec<NodeId>,
     pub impulse: i32,
@@ -140,6 +142,7 @@ pub struct Point {
     pub implicit_indents: Vec<i32>,
 }
 
+#[derive(Clone)]
 pub enum Element {
     Block(Box<Block>),
     Point(Point),
@@ -1474,6 +1477,12 @@ impl<'a> Reindenter<'a> {
             {
                 continue;
             }
+            // Block tags sit in odd places in the tree: no newline before one.
+            if placeholder_type(self.arena, self.elements.get(ip.idx + 1))
+                .is_some_and(|t| t.starts_with("block"))
+            {
+                continue;
+            }
             let desired = self.indent(
                 ip.closing_balance() - ip.untaken_indents.len() as i32 + forced.len() as i32,
             );
@@ -1721,21 +1730,469 @@ fn is_literal(arena: &Arena, seg: NodeId) -> bool {
     arena.pos_marker(seg).is_none_or(|pm| pm.is_literal())
 }
 
-/// The templating `reindent` covers: none, or only tags which aren't blocks
-/// (expressions, comments, `set`). Blocks, loops, skipped source and tags
-/// which consume whitespace are left to Python.
+/// The templating the reindent, long line and rebreak ports cover:
+/// everything but tags which consume whitespace (literal placeholders, which
+/// sit in points).
 fn templating_covered(arena: &Arena, seq: &ReflowSequence) -> bool {
     seq.elements.iter().all(|e| match e {
-        Element::Block(b) => {
-            !arena.is_type(b.segment, "template_loop")
-                && (!arena.is_type(b.segment, "placeholder")
-                    || matches!(
-                        arena.block_type(b.segment).as_deref(),
-                        Some("templated") | Some("comment")
-                    ))
-        }
+        Element::Block(_) => true,
         Element::Point(p) => !p.segments.iter().any(|s| arena.is_type(*s, "placeholder")),
     })
+}
+
+const UNRENDERED: [&str; 5] = [
+    "whitespace",
+    "placeholder",
+    "newline",
+    "indent",
+    "template_loop",
+];
+
+/// `ReflowElement.is_all_unrendered`.
+fn is_unrendered(arena: &Arena, e: &Element) -> bool {
+    let unrendered = |s: NodeId| UNRENDERED.iter().any(|t| arena.is_type(s, t));
+    match e {
+        Element::Block(b) => unrendered(b.segment),
+        Element::Point(p) => p.segments.iter().all(|s| unrendered(*s)),
+    }
+}
+
+/// The block type of a block which is a placeholder.
+fn placeholder_type(arena: &Arena, e: Option<&Element>) -> Option<String> {
+    match e {
+        Some(Element::Block(b)) if arena.is_type(b.segment, "placeholder") => {
+            arena.block_type(b.segment)
+        }
+        _ => None,
+    }
+}
+
+/// `ReflowPoint.get_indent_segment_vals(exclude_block_indents=True)`.
+fn plain_indent_vals(arena: &Arena, e: &Element) -> Vec<i32> {
+    let Element::Point(p) = e else {
+        return Vec::new();
+    };
+    p.segments
+        .iter()
+        .filter(|s| arena.is_implicit(**s).is_some() && arena.block_uuid(**s).is_none())
+        .map(|s| if arena.is_type(*s, "dedent") { -1 } else { 1 })
+        .collect()
+}
+
+/// `_IndentLine.is_all_templates`.
+fn is_all_templates(arena: &Arena, elements: &[Element], line: &IndentLine) -> bool {
+    elements[line.range()]
+        .iter()
+        .all(|e| matches!(e, Element::Point(_)) || is_unrendered(arena, e))
+}
+
+/// `_rebalance_unrendered_block_indents`: `None` if nothing moves.
+fn rebalance_unrendered(arena: &Arena, elements: &[Element]) -> Option<Vec<Element>> {
+    let n = elements.len();
+    let mut moved_to: HashMap<usize, Vec<NodeId>> = HashMap::new();
+    let segs_of = |moved_to: &HashMap<usize, Vec<NodeId>>, i: usize| -> Vec<NodeId> {
+        match (moved_to.get(&i), &elements[i]) {
+            (Some(segs), _) => segs.clone(),
+            (None, Element::Point(p)) => p.segments.clone(),
+            (None, Element::Block(b)) => vec![b.segment],
+        }
+    };
+    let mut i = 0;
+    while i < n {
+        let leads_unrendered = matches!(elements[i], Element::Point(_))
+            && matches!(elements.get(i + 1), Some(e @ Element::Block(_)) if is_unrendered(arena, e));
+        if !leads_unrendered {
+            i += 1;
+            continue;
+        }
+        let mut open: Vec<u128> = Vec::new();
+        let mut has_closed = false;
+        let mut last_end: Option<usize> = None;
+        let mut j = i + 1;
+        while j < n {
+            let Element::Block(b) = &elements[j] else {
+                j += 1;
+                continue;
+            };
+            if !is_unrendered(arena, &elements[j]) {
+                break;
+            }
+            if let (Some(block_type), Some(uuid)) = (
+                placeholder_type(arena, Some(&elements[j])),
+                arena.block_uuid(b.segment),
+            ) {
+                if block_type == "block_start" {
+                    if !open.contains(&uuid) {
+                        open.push(uuid);
+                    }
+                } else if block_type == "block_end" {
+                    let Some(at) = open.iter().position(|u| *u == uuid) else {
+                        open.push(uuid);
+                        break;
+                    };
+                    open.remove(at);
+                    has_closed = true;
+                    if open.is_empty() {
+                        last_end = Some(j + 1);
+                    }
+                }
+            }
+            j += 1;
+        }
+        match last_end {
+            Some(t) if has_closed && open.is_empty() && t < n => {
+                let trailing = segs_of(&moved_to, t);
+                let is_moved = |s: &NodeId| {
+                    arena.is_implicit(*s).is_some()
+                        && !arena.is_type(*s, "dedent")
+                        && arena.block_uuid(*s).is_none()
+                };
+                let mut lead: Vec<NodeId> = trailing.iter().copied().filter(is_moved).collect();
+                if !lead.is_empty() {
+                    lead.extend(segs_of(&moved_to, i));
+                    moved_to.insert(i, lead);
+                    moved_to.insert(t, trailing.into_iter().filter(|s| !is_moved(s)).collect());
+                }
+                i = t;
+            }
+            _ => i = j,
+        }
+    }
+    if moved_to.is_empty() {
+        return None;
+    }
+    let mut out = elements.to_vec();
+    for (i, segs) in moved_to {
+        out[i] = Element::Point(point(arena, segs));
+    }
+    Some(out)
+}
+
+/// The segments of the blocks on a line.
+fn line_blocks(elements: &[Element], line: &IndentLine) -> Vec<NodeId> {
+    elements[line.range()]
+        .iter()
+        .filter_map(|e| match e {
+            Element::Block(b) => Some(b.segment),
+            Element::Point(_) => None,
+        })
+        .collect()
+}
+
+/// `_revise_skipped_source_lines`.
+fn revise_skipped_source_lines(
+    arena: &Arena,
+    elements: &[Element],
+    lines: &mut Vec<IndentLine>,
+) -> Option<()> {
+    type Loc = (usize, usize);
+    let mut if_locs: HashMap<Loc, Vec<Loc>> = HashMap::new();
+    let mut skipped: Vec<(Loc, Loc)> = Vec::new();
+    for line in lines.iter() {
+        let mut has_skipped = false;
+        let mut locs: Option<(Loc, Loc)> = None;
+        for (k, seg) in line_blocks(elements, line).into_iter().enumerate() {
+            if !arena.is_type(seg, "placeholder") {
+                break;
+            }
+            let block_type = arena.block_type(seg)?;
+            if k == 0 {
+                if block_type != "block_start" {
+                    break;
+                }
+                let pm = arena.pos_marker(seg)?;
+                let (source, templated) = (pm.source_position(), pm.templated_position());
+                if_locs.entry(source).or_default().push(templated);
+                locs = Some((source, templated));
+            } else if block_type == "skipped_source" {
+                has_skipped = true;
+            } else if block_type == "block_end" && has_skipped {
+                skipped.push(locs?);
+            }
+        }
+    }
+    let mut ignore: Vec<Loc> = Vec::new();
+    for (source, templated) in &skipped {
+        for other in if_locs.get(source).into_iter().flatten() {
+            if !skipped.contains(&(*source, *other)) {
+                ignore.push(*templated);
+            }
+        }
+    }
+    if ignore.is_empty() {
+        return Some(());
+    }
+    lines.retain(|line| {
+        let Some(&seg) = line_blocks(elements, line).first() else {
+            return true;
+        };
+        if !arena.is_type(seg, "placeholder")
+            || arena.block_type(seg).as_deref() != Some("block_start")
+        {
+            return true;
+        }
+        arena
+            .pos_marker(seg)
+            .is_none_or(|pm| !ignore.contains(&pm.templated_position()))
+    });
+    Some(())
+}
+
+/// `_revise_templated_lines`: give the tags of one block the same indent.
+fn revise_templated_lines(
+    arena: &Arena,
+    elements: &[Element],
+    lines: &mut Vec<IndentLine>,
+) -> Option<()> {
+    use std::collections::BTreeSet;
+    // Block uuid -> the lines its tags are on, in the order first seen.
+    let mut grouped: Vec<(u128, Vec<usize>)> = Vec::new();
+    let mut depths: Vec<i32> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !is_all_templates(arena, elements, line) {
+            continue;
+        }
+        for seg in line_blocks(elements, line) {
+            let Some(uuid) = arena.block_uuid(seg) else {
+                continue;
+            };
+            match grouped.iter().position(|(u, _)| *u == uuid) {
+                Some(g) => {
+                    grouped[g].1.push(idx);
+                    depths[g] = depths[g].max(line.initial_balance);
+                }
+                None => {
+                    grouped.push((uuid, vec![idx]));
+                    depths.push(line.initial_balance);
+                }
+            }
+        }
+    }
+    // Most indented first; a stable sort keeps ties in the order first seen.
+    let mut order: Vec<usize> = (0..grouped.len()).collect();
+    order.sort_by_key(|g| std::cmp::Reverse(depths[*g]));
+    let sorted: Vec<&Vec<usize>> = order.iter().map(|g| &grouped[*g].1).collect();
+
+    for (group_idx, group_lines) in sorted.iter().enumerate() {
+        let first_balance = lines[group_lines[0]].initial_balance;
+        if group_lines
+            .iter()
+            .all(|i| lines[*i].initial_balance == first_balance)
+        {
+            continue; // Case 1: already the same.
+        }
+        // Case 2: where each tag could be hoisted to.
+        let mut options: Vec<BTreeSet<i32>> = Vec::new();
+        for &idx in group_lines.iter() {
+            let line = &lines[idx];
+            let mut steps = BTreeSet::from([line.initial_balance]);
+            let first_point_idx = line.points[0].idx;
+            let Some(Element::Block(first_block)) = elements.get(first_point_idx + 1) else {
+                return None;
+            };
+            if arena.is_type(first_block.segment, "template_loop") {
+                continue;
+            }
+            // Back through the point before.
+            let mut balance = line.initial_balance;
+            for i in (1..=first_point_idx).rev() {
+                match &elements[i] {
+                    e @ Element::Point(_) => {
+                        for val in plain_indent_vals(arena, e).into_iter().rev() {
+                            balance -= val;
+                            steps.insert(balance);
+                        }
+                    }
+                    e => match placeholder_type(arena, Some(e)).as_deref() {
+                        Some("block_start" | "block_end" | "skipped_source" | "block_mid") => {}
+                        _ => break,
+                    },
+                }
+            }
+            // Forward through the point after.
+            let mut balance = line.initial_balance;
+            for val in plain_indent_vals(arena, &elements[line.points.last()?.idx]) {
+                balance += val;
+                steps.insert(balance);
+            }
+            let case_type = placeholder_type(arena, elements.get(first_point_idx + 1));
+            if matches!(case_type.as_deref(), Some("block_start" | "block_mid")) {
+                // Up to the next thing rendered.
+                let mut balance = line.initial_balance;
+                for e in &elements[first_point_idx..] {
+                    if matches!(e, Element::Block(_)) {
+                        if !is_unrendered(arena, e) {
+                            break;
+                        }
+                        continue;
+                    }
+                    for val in plain_indent_vals(arena, e) {
+                        balance += val;
+                        steps.insert(balance);
+                    }
+                }
+            }
+            if matches!(case_type.as_deref(), Some("block_end" | "block_mid")) {
+                // Straight after another block's end? (Python's `lines[idx - 1]`
+                // wraps around on the first line.)
+                let prev = &lines[if idx == 0 { lines.len() - 1 } else { idx - 1 }];
+                if first_point_idx >= 2
+                    && first_point_idx - 1 == prev.points[0].idx + 1
+                    && placeholder_type(arena, elements.get(first_point_idx - 1)).as_deref()
+                        == Some("block_end")
+                {
+                    steps.extend(line.initial_balance..prev.initial_balance);
+                }
+            }
+            options.push(steps);
+        }
+
+        // The lowest the indent goes between the tags, outer blocks aside.
+        let truthy_line = |l: Option<usize>| matches!(l, Some(n) if n != 0);
+        let mut last_group_line: Option<usize> = Some(group_lines[0]);
+        let mut net_balance = 0;
+        let mut balance_trough: Option<i32> = None;
+        let mut temp_trough: Option<i32> = None;
+        let mut inner_lines: Vec<usize> = Vec::new();
+        for idx in group_lines[0] + 1..=*group_lines.last()? {
+            if sorted[group_idx + 1..].iter().any(|g| g.contains(&idx)) {
+                last_group_line = None;
+                net_balance = 0;
+                temp_trough = None;
+            }
+            if group_lines.contains(&idx) {
+                if truthy_line(last_group_line) {
+                    inner_lines.extend(last_group_line? + 1..idx);
+                }
+                if let Some(t) = temp_trough.take() {
+                    balance_trough = Some(balance_trough.map_or(t, |b| b.min(t)));
+                }
+                last_group_line = Some(idx);
+                net_balance = 0;
+            } else if truthy_line(last_group_line) {
+                let is_subgroup_line = sorted[..group_idx].iter().any(|g| g.contains(&idx));
+                let points = &lines[idx].points;
+                for ip in &points[..points.len() - 1] {
+                    if matches!(
+                        placeholder_type(arena, elements.get(ip.idx + 1)).as_deref(),
+                        Some("block_end" | "block_mid")
+                    ) {
+                        continue;
+                    }
+                    if ip.trough < 0 && !is_subgroup_line {
+                        let next_group_line =
+                            group_lines.iter().copied().filter(|n| *n > idx).min()?;
+                        let until = lines[next_group_line].points[0].idx;
+                        let rendered_between = (ip.idx..until).any(|i| {
+                            matches!(elements[i], Element::Block(_))
+                                && !is_unrendered(arena, &elements[i])
+                        });
+                        if !rendered_between {
+                            continue;
+                        }
+                        let this_trough = net_balance + ip.trough;
+                        // range(initial, closing, -1)
+                        let closes_untaken = ip.impulse < 0
+                            && (ip.closing_balance() + 1..=ip.initial_balance)
+                                .any(|b| ip.untaken_indents.contains(&b));
+                        if this_trough == 0 && closes_untaken {
+                            net_balance += ip.impulse;
+                            continue;
+                        }
+                        temp_trough = Some(temp_trough.map_or(this_trough, |t| t.min(this_trough)));
+                    }
+                    net_balance += ip.impulse;
+                }
+            }
+        }
+
+        // Python raises if every line of the group was a loop marker.
+        let mut overlap = options.first()?.clone();
+        for o in &options[1..] {
+            overlap = overlap.intersection(o).copied().collect();
+        }
+        let best = if overlap.is_empty() || balance_trough.is_some_and(|t| t <= 0) {
+            // Case 3: the tags cut across the tree. Take the lowest indent,
+            // and stop the tags indenting what is between them.
+            for &idx in &inner_lines {
+                lines[idx].initial_balance -= 1;
+            }
+            group_lines
+                .iter()
+                .map(|i| lines[*i].initial_balance)
+                .min()?
+        } else {
+            let mut fallback = None;
+            if overlap.len() > 1 {
+                let inside = [group_lines[0] + 1, group_lines.last()?.checked_sub(1)?];
+                let balances = [
+                    lines.get(inside[0])?.initial_balance,
+                    lines.get(inside[1])?.initial_balance,
+                ];
+                fallback = balances.iter().copied().max();
+                for b in balances {
+                    overlap.remove(&b);
+                }
+            }
+            match overlap.iter().next_back() {
+                Some(best) => *best,
+                None => fallback?,
+            }
+        };
+        for &idx in group_lines.iter() {
+            lines[idx].initial_balance = best;
+        }
+    }
+
+    // A line starting with a tag which spans lines isn't linted.
+    lines.retain(|line| {
+        let Some(Element::Block(b)) = elements.get(line.points[0].idx + 1) else {
+            return true;
+        };
+        let Some(pm) = arena.pos_marker(b.segment) else {
+            return true;
+        };
+        let src = pm.source_str();
+        !(src != arena.raw(b.segment) && src.contains('\n'))
+    });
+    Some(())
+}
+
+/// `_revise_loop_repeated_lines`: a loop iteration which rendered nothing
+/// takes the indent of the ones which did.
+fn revise_loop_repeated_lines(arena: &Arena, elements: &[Element], lines: &mut [IndentLine]) {
+    let mut groups: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(&first) = line_blocks(elements, line).first() else {
+            continue;
+        };
+        if let Some(pm) = arena.pos_marker(first) {
+            groups
+                .entry((pm.source_slice.start, pm.source_slice.stop))
+                .or_default()
+                .push(idx);
+        }
+    }
+    for group in groups.values().filter(|g| g.len() > 1) {
+        let (unrendered, rendered): (Vec<usize>, Vec<usize>) = group
+            .iter()
+            .partition(|i| is_all_templates(arena, elements, &lines[**i]));
+        if rendered.is_empty() || unrendered.is_empty() {
+            continue;
+        }
+        let balances: Vec<i32> = rendered.iter().map(|i| lines[*i].initial_balance).collect();
+        // The most common balance; the larger on a tie.
+        let Some(target) = balances
+            .iter()
+            .copied()
+            .max_by_key(|b| (balances.iter().filter(|x| *x == b).count(), *b))
+        else {
+            continue;
+        };
+        for idx in unrendered {
+            lines[idx].initial_balance = target;
+        }
+    }
 }
 
 /// `ReflowSequence.reindent()`. `None` = a case this doesn't cover.
@@ -1768,20 +2225,14 @@ pub fn reindent(
     }
 
     let elements = &seq.elements[..];
-    let (mut lines, imbalanced) = map_line_buffers(arena, elements, &options.implicit_indents)?;
-
-    // The end of `_revise_templated_lines`: a line starting with a tag which
-    // spans lines isn't linted.
-    lines.retain(|line| {
-        let Some(Element::Block(b)) = elements.get(line.points[0].idx + 1) else {
-            return true;
-        };
-        let Some(pm) = arena.pos_marker(b.segment) else {
-            return true;
-        };
-        let src = pm.source_str();
-        !(src != arena.raw(b.segment) && src.contains('\n'))
-    });
+    // The lines are mapped and revised over the rebalanced elements, then
+    // linted against the originals, as in Python.
+    let rebalanced = rebalance_unrendered(arena, elements);
+    let mapped = rebalanced.as_deref().unwrap_or(elements);
+    let (mut lines, imbalanced) = map_line_buffers(arena, mapped, &options.implicit_indents)?;
+    revise_skipped_source_lines(arena, mapped, &mut lines)?;
+    revise_templated_lines(arena, mapped, &mut lines)?;
+    revise_loop_repeated_lines(arena, mapped, &mut lines);
 
     // `_revise_comment_lines`.
     let all_comments = |line: &IndentLine| {

@@ -67,6 +67,9 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
     instance_idx: dict[tuple[str, ...], int] = {(): 0}
     texts: list[str] = []
     positions: list[int] = []
+    # A meta's block uuid, as an index from one into this (zero for none).
+    block_uuids: list[int] = []
+    block_idx: dict[int, int] = {}
     stack = [tree]
     while stack:
         seg = stack.pop()
@@ -110,7 +113,15 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
                     texts.append(seg.block_type)  # type: ignore[attr-defined]
             else:
                 return None
-            b.append(0)
+            block_uuid = getattr(seg, "block_uuid", None)
+            if block_uuid is None:
+                b.append(0)
+            else:
+                uuid_int = block_uuid.int
+                if uuid_int not in block_idx:
+                    block_uuids.append(uuid_int)
+                    block_idx[uuid_int] = len(block_uuids)
+                b.append(block_idx[uuid_int])
         elif not seg.is_type("raw"):
             # A container with no children isn't in `raw_segments`, so the
             # arena's leaves would no longer line up with it.
@@ -131,7 +142,15 @@ def rebuild_rs_tree(tree: BaseSegment, templated_file: Any) -> Any:
             texts.append(seg.raw)
     try:
         return RsTree.from_segments(
-            templated_file, kinds, a, b, classes, instance_types, texts, positions
+            templated_file,
+            kinds,
+            a,
+            b,
+            classes,
+            instance_types,
+            texts,
+            positions,
+            block_uuids,
         )
     except Exception:  # pragma: no cover
         return None

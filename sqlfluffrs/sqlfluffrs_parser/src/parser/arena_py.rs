@@ -77,6 +77,7 @@ fn node_from_flat(
     instance_types: &[Vec<String>],
     texts: &[String],
     positions: &[i64],
+    block_uuids: &[u128],
     templated_file: &Arc<sqlfluffrs_types::TemplatedFile>,
 ) -> Option<super::types::Node> {
     use super::types::{MetaType, Node, RawSegmentKwargs};
@@ -115,6 +116,7 @@ fn node_from_flat(
                 instance_types,
                 texts,
                 positions,
+                block_uuids,
                 templated_file,
             )?);
         }
@@ -130,6 +132,11 @@ fn node_from_flat(
         let t = texts.get(*text).cloned();
         *text += 1;
         t
+    };
+    // A meta's `b` is its block uuid: an index from one, zero for none.
+    let block_uuid = match b[i] {
+        k if kind >= 2 && k > 0 => Some(*block_uuids.get(k as usize - 1)?),
+        _ => None,
     };
     Some(match kind {
         1 => {
@@ -152,14 +159,14 @@ fn node_from_flat(
                 is_implicit: a[i] != 0,
             },
             pos_marker,
-            block_uuid: None,
+            block_uuid,
         },
         3 => Node::Meta {
             meta_type: MetaType::Dedent {
                 is_implicit: a[i] != 0,
             },
             pos_marker,
-            block_uuid: None,
+            block_uuid,
         },
         4 => Node::Meta {
             meta_type: MetaType::Template {
@@ -167,12 +174,12 @@ fn node_from_flat(
                 block_type: next_text()?,
             },
             pos_marker,
-            block_uuid: None,
+            block_uuid,
         },
         5 => Node::Meta {
             meta_type: MetaType::TemplateLoop,
             pos_marker,
-            block_uuid: None,
+            block_uuid,
         },
         6 => Node::Meta {
             meta_type: MetaType::EndOfFile,
@@ -200,6 +207,7 @@ impl PyTree {
         instance_types: Vec<Vec<String>>,
         texts: Vec<String>,
         positions: Vec<i64>,
+        block_uuids: Vec<u128>,
     ) -> Option<PyTree> {
         let templated_file: Arc<sqlfluffrs_types::TemplatedFile> = templated_file.into();
         let (mut cursor, mut text) = (0, 0);
@@ -213,6 +221,7 @@ impl PyTree {
             &instance_types,
             &texts,
             &positions,
+            &block_uuids,
             &templated_file,
         )?;
         (cursor == kinds.len()).then(|| PyTree::new(Arena::from_node(&node)))
