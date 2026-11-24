@@ -917,6 +917,9 @@ pub enum IndentFixKind {
     CreateSpaceAfter,
     /// Create a single space before the target.
     CreateSpaceBefore,
+    /// Replace the target placeholder (a tag's consumed whitespace) with one
+    /// whose source is `text`, through the fix's `source_fix`.
+    EditSource,
 }
 
 impl IndentFixKind {
@@ -931,6 +934,7 @@ impl IndentFixKind {
             IndentFixKind::CreateAfter => "create_after",
             IndentFixKind::CreateSpaceAfter => "create_space_after",
             IndentFixKind::CreateSpaceBefore => "create_space_before",
+            IndentFixKind::EditSource => "edit_source",
         }
     }
 }
@@ -941,6 +945,9 @@ pub struct IndentFix {
     pub text: String,
     /// The comment being moved, for `MoveCommentBefore`.
     pub extra: Option<NodeId>,
+    /// For `EditSource`: the new text, and the source and templated slices
+    /// it replaces.
+    pub source_fix: Option<(String, usize, usize, usize, usize)>,
 }
 
 pub struct IndentResult {
@@ -958,6 +965,8 @@ enum PSeg {
     NewWhitespace(String),
     /// An original whitespace edited to a new raw.
     Edited(NodeId, String),
+    /// A tag's consumed whitespace (a literal placeholder) with new source.
+    Source(NodeId, String),
 }
 
 /// Python's `_IndentPoint`.
@@ -1108,7 +1117,7 @@ impl<'a> Reindenter<'a> {
     fn is_whitespace(&self, s: &PSeg) -> bool {
         match s {
             PSeg::Orig(id) => self.arena.is_type(*id, "whitespace"),
-            PSeg::NewNewline => false,
+            PSeg::NewNewline | PSeg::Source(..) => false,
             _ => true,
         }
     }
@@ -1118,6 +1127,36 @@ impl<'a> Reindenter<'a> {
             PSeg::Orig(id) => self.arena.raw(*id),
             PSeg::NewNewline => "\n".to_string(),
             PSeg::NewWhitespace(r) | PSeg::Edited(_, r) => r.clone(),
+            PSeg::Source(..) => String::new(),
+        }
+    }
+
+    /// `get_consumed_whitespace`: the source of a literal placeholder.
+    fn consumed(&self, s: &PSeg) -> Option<String> {
+        match s {
+            PSeg::Orig(id) if self.arena.block_type(*id).as_deref() == Some("literal") => {
+                self.arena.source_str(*id).map(str::to_string)
+            }
+            PSeg::Source(_, src) => Some(src.clone()),
+            _ => None,
+        }
+    }
+
+    /// `ReflowPoint.num_newlines`: newlines, and those a tag consumed.
+    fn count_newlines(&self, segs: &[PSeg]) -> usize {
+        segs.iter()
+            .map(|s| {
+                usize::from(self.is_newline(s))
+                    + self.consumed(s).map_or(0, |c| c.matches('\n').count())
+            })
+            .sum()
+    }
+
+    /// The indent an indent segment holds.
+    fn indent_text(&self, s: &PSeg) -> String {
+        match self.consumed(s) {
+            Some(c) => c.rsplit('\n').next().unwrap_or("").to_string(),
+            None => self.raw(s),
         }
     }
 
@@ -1132,6 +1171,9 @@ impl<'a> Reindenter<'a> {
                 return indent;
             } else if self.is_whitespace(s) {
                 indent = Some(i);
+            } else if self.consumed(s).is_some_and(|c| c.contains('\n')) {
+                // A consumed newline carries its indent with it.
+                return Some(i);
             }
         }
         None
@@ -1151,7 +1193,7 @@ impl<'a> Reindenter<'a> {
         if truthy(last_line_break_idx) {
             let segs = self.segs(last_line_break_idx?)?;
             return Some(match self.indent_segment(&segs) {
-                Some(i) => self.raw(&segs[i]),
+                Some(i) => self.indent_text(&segs[i]),
                 None => String::new(),
             });
         }
@@ -1160,6 +1202,15 @@ impl<'a> Reindenter<'a> {
                 return None;
             };
             if self.arena.pos_marker(*first)?.working_loc() == (1, 1) {
+                if self.arena.is_type(*first, "placeholder") {
+                    // A leading tag which consumed an indent.
+                    let src = self.arena.source_str(*first)?;
+                    return Some(if src.starts_with([' ', '\t']) {
+                        src.rsplit('\n').next().unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    });
+                }
                 // The last whitespace, else whatever the scan ended on.
                 let literal =
                     |s: &&PSeg| !matches!(s, PSeg::Orig(id) if !is_literal(self.arena, *id));
@@ -1215,8 +1266,40 @@ impl<'a> Reindenter<'a> {
     ) -> Option<()> {
         let mut segs = self.segs(idx)?;
         let indent = self.indent_segment(&segs);
-        let has_newline = segs.iter().any(|s| self.is_newline(s));
+        let has_newline = self.count_newlines(&segs) > 0;
         let expected = || Some(format!("Expected {}.", indent_description(desired)?));
+
+        // The indent sits in whitespace a tag consumed: edit the source.
+        if let Some((i, src)) = indent.and_then(|i| Some((i, self.consumed(&segs[i])?))) {
+            let PSeg::Orig(placeholder) = segs[i] else {
+                return None;
+            };
+            let current = src.rsplit('\n').next().unwrap_or("");
+            let pm = self.arena.pos_marker(placeholder)?;
+            let stop = pm.source_slice.stop;
+            let new_src = format!("{}{desired}", &src[..src.len() - current.len()]);
+            self.push(
+                placeholder,
+                expected()?,
+                source,
+                vec![IndentFix {
+                    kind: IndentFixKind::EditSource,
+                    target: placeholder,
+                    text: new_src.clone(),
+                    extra: None,
+                    source_fix: Some((
+                        desired.to_string(),
+                        stop.checked_sub(current.chars().count())?,
+                        stop,
+                        pm.templated_slice.start,
+                        pm.templated_slice.stop,
+                    )),
+                }],
+            );
+            segs[i] = PSeg::Source(placeholder, new_src);
+            self.edited.insert(idx, segs);
+            return Some(());
+        }
 
         if has_newline {
             if let Some(i) = indent {
@@ -1236,6 +1319,7 @@ impl<'a> Reindenter<'a> {
                             target: ws,
                             text: String::new(),
                             extra: None,
+                            source_fix: None,
                         }],
                     );
                     segs.remove(i);
@@ -1249,6 +1333,7 @@ impl<'a> Reindenter<'a> {
                             target: ws,
                             text: desired.to_string(),
                             extra: None,
+                            source_fix: None,
                         }],
                     );
                     segs[i] = PSeg::Edited(ws, desired.to_string());
@@ -1273,6 +1358,7 @@ impl<'a> Reindenter<'a> {
                         target: newline,
                         text: desired.to_string(),
                         extra: None,
+                        source_fix: None,
                     }],
                 );
                 segs.insert(i + 1, PSeg::NewWhitespace(desired.to_string()));
@@ -1286,6 +1372,15 @@ impl<'a> Reindenter<'a> {
             // The scan runs backwards without stopping: the first whitespace.
             match segs.iter().position(|s| self.is_whitespace(s)) {
                 None => {
+                    // With no whitespace, a tag is named by its source.
+                    let description = match self.arena.source_str(before) {
+                        Some(src) if self.arena.is_type(before, "placeholder") => format!(
+                            "Expected line break and {} before {}.",
+                            indent_description(desired)?,
+                            py_repr(src)
+                        ),
+                        _ => description,
+                    };
                     self.push(
                         before,
                         description,
@@ -1299,6 +1394,7 @@ impl<'a> Reindenter<'a> {
                             target: before,
                             text: desired.to_string(),
                             extra: None,
+                            source_fix: None,
                         }],
                     );
                     segs = vec![PSeg::NewNewline];
@@ -1319,6 +1415,7 @@ impl<'a> Reindenter<'a> {
                             target: ws,
                             text: desired.to_string(),
                             extra: None,
+                            source_fix: None,
                         }],
                     );
                     let mut new = vec![PSeg::NewNewline];
@@ -1365,6 +1462,26 @@ impl<'a> Reindenter<'a> {
         if idx == 0 && !first.is_line_break {
             let segs = self.segs(0)?;
             let mut fixes = Vec::new();
+            if let Some(PSeg::Orig(init)) = segs.first() {
+                if self.arena.is_type(*init, "placeholder") {
+                    // A tag consumed the indent: take it out of the source.
+                    fixes.push(IndentFix {
+                        kind: IndentFixKind::EditSource,
+                        target: *init,
+                        text: String::new(),
+                        extra: None,
+                        source_fix: Some((String::new(), 0, current.chars().count() + 1, 0, 0)),
+                    });
+                    self.push(
+                        *init,
+                        "First line should not be indented.".to_string(),
+                        "reflow.indent.existing",
+                        fixes,
+                    );
+                    self.edited.insert(0, Vec::new());
+                    return Some(());
+                }
+            }
             for s in &segs {
                 let PSeg::Orig(id) = s else {
                     return None;
@@ -1374,6 +1491,7 @@ impl<'a> Reindenter<'a> {
                     target: *id,
                     text: String::new(),
                     extra: None,
+                    source_fix: None,
                 });
             }
             let anchor = fixes.first()?.target;
@@ -1527,12 +1645,7 @@ fn crawl_indent_points(
         Some(Element::Block(b)) => arena.is_type(b.segment, t),
         _ => false,
     };
-    // `has_untemplated_newline`: a newline a template rendered is no line break.
-    let point_has_newline = |p: &Point| {
-        p.segments
-            .iter()
-            .any(|s| arena.is_type(*s, "newline") && is_literal(arena, *s))
-    };
+    let point_has_newline = |p: &Point| has_untemplated_newline(arena, p);
 
     let mut out = Vec::new();
     let mut last_line_break_idx: Option<usize> = None;
@@ -1726,18 +1839,18 @@ fn map_line_buffers(
     Some((lines, imbalanced))
 }
 
-fn is_literal(arena: &Arena, seg: NodeId) -> bool {
-    arena.pos_marker(seg).is_none_or(|pm| pm.is_literal())
+/// `has_untemplated_newline`: a literal newline, or one a tag consumed. A
+/// newline a tag rendered is no line break.
+fn has_untemplated_newline(arena: &Arena, p: &Point) -> bool {
+    p.segments.iter().any(|s| {
+        (arena.is_type(*s, "newline") && is_literal(arena, *s))
+            || (arena.is_type(*s, "placeholder")
+                && arena.source_str(*s).is_some_and(|src| src.contains('\n')))
+    })
 }
 
-/// The templating the reindent, long line and rebreak ports cover:
-/// everything but tags which consume whitespace (literal placeholders, which
-/// sit in points).
-fn templating_covered(arena: &Arena, seq: &ReflowSequence) -> bool {
-    seq.elements.iter().all(|e| match e {
-        Element::Block(_) => true,
-        Element::Point(p) => !p.segments.iter().any(|s| arena.is_type(*s, "placeholder")),
-    })
+fn is_literal(arena: &Arena, seg: NodeId) -> bool {
+    arena.pos_marker(seg).is_none_or(|pm| pm.is_literal())
 }
 
 const UNRENDERED: [&str; 5] = [
@@ -2220,9 +2333,6 @@ pub fn reindent(
             return None;
         }
     }
-    if !templating_covered(arena, seq) {
-        return None;
-    }
 
     let elements = &seq.elements[..];
     // The lines are mapped and revised over the rebalanced elements, then
@@ -2574,6 +2684,7 @@ impl<'a> Reindenter<'a> {
                     target: comment,
                     text: String::new(),
                     extra: None,
+                    source_fix: None,
                 }];
                 for s in self.segs(point_idx)? {
                     if self.is_whitespace(&s) {
@@ -2585,6 +2696,7 @@ impl<'a> Reindenter<'a> {
                             target: ws,
                             text: String::new(),
                             extra: None,
+                            source_fix: None,
                         });
                     }
                 }
@@ -2597,6 +2709,7 @@ impl<'a> Reindenter<'a> {
                     target: anchor,
                     text,
                     extra: Some(comment),
+                    source_fix: None,
                 });
                 Some(fixes)
             }
@@ -2695,10 +2808,7 @@ impl<'a> Reindenter<'a> {
                     let Some(Element::Block(next)) = elements.get(i + 1) else {
                         return None;
                     };
-                    arena.is_type(next.segment, "end_of_file")
-                        || p.segments
-                            .iter()
-                            .any(|s| arena.is_type(*s, "newline") && is_literal(arena, *s))
+                    arena.is_type(next.segment, "end_of_file") || has_untemplated_newline(arena, p)
                 }
                 Element::Block(_) => false,
             };
@@ -2810,9 +2920,6 @@ pub fn break_long_lines(
         "space" => " ".repeat(options.tab_space_size),
         _ => return None,
     };
-    if !templating_covered(arena, seq) {
-        return None;
-    }
     let mut r = Reindenter {
         arena,
         elements: &seq.elements[..],
@@ -2967,23 +3074,18 @@ impl<'a> Reindenter<'a> {
     fn num_newlines(&self, idx: usize) -> Option<usize> {
         match self.elements.get(idx)? {
             Element::Block(b) => Some(usize::from(self.arena.is_type(b.segment, "newline"))),
-            Element::Point(_) => Some(
-                self.segs(idx)?
-                    .iter()
-                    .filter(|s| self.is_newline(s))
-                    .count(),
-            ),
+            Element::Point(_) => Some(self.count_newlines(&self.segs(idx)?)),
         }
     }
 
     /// `ReflowPoint.get_indent() or ""`.
     fn get_indent(&self, idx: usize) -> Option<String> {
         let segs = self.segs(idx)?;
-        if !segs.iter().any(|s| self.is_newline(s)) {
+        if self.count_newlines(&segs) == 0 {
             return Some(String::new());
         }
         Some(match self.indent_segment(&segs) {
-            Some(i) => self.raw(&segs[i]),
+            Some(i) => self.indent_text(&segs[i]),
             None => String::new(),
         })
     }
@@ -3016,6 +3118,7 @@ impl<'a> Reindenter<'a> {
             target: id,
             text: String::new(),
             extra: None,
+            source_fix: None,
         };
         let mut fixes = Vec::new();
 
@@ -3073,6 +3176,7 @@ impl<'a> Reindenter<'a> {
                         target: id,
                         text: " ".to_string(),
                         extra: None,
+                        source_fix: None,
                     });
                     segs[ws] = PSeg::Edited(id, " ".to_string());
                 }
@@ -3087,12 +3191,14 @@ impl<'a> Reindenter<'a> {
                         target: p.segment,
                         text: String::new(),
                         extra: None,
+                        source_fix: None,
                     }),
                     (None, Some(n)) => fixes.push(IndentFix {
                         kind: IndentFixKind::CreateSpaceBefore,
                         target: n.segment,
                         text: String::new(),
                         extra: None,
+                        source_fix: None,
                     }),
                     (None, None) => return None,
                 }
@@ -3133,9 +3239,6 @@ impl<'a> Reindenter<'a> {
 
 /// `ReflowSequence.rebreak("keywords")`. `None` = a case this doesn't cover.
 pub fn rebreak_keywords(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<IndentResult>> {
-    if !templating_covered(arena, seq) {
-        return None;
-    }
     let elements = &seq.elements[..];
     let mut r = Reindenter {
         arena,

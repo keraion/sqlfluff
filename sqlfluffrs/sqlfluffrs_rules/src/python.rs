@@ -183,7 +183,13 @@ type PyIndentResults = Vec<(
     usize,
     String,
     &'static str,
-    Vec<(&'static str, usize, String, Option<usize>)>,
+    Vec<(
+        &'static str,
+        usize,
+        String,
+        Option<usize>,
+        Option<(String, usize, usize, usize, usize)>,
+    )>,
 )>;
 
 fn indent_results_to_py(
@@ -211,6 +217,7 @@ fn indent_results_to_py(
                             leaf[&f.target],
                             f.text,
                             f.extra.map(|e| leaf[&e]),
+                            f.source_fix,
                         )
                     })
                     .collect(),

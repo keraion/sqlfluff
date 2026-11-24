@@ -11,6 +11,7 @@ from sqlfluff.core.parser import (
     RawSegment,
     WhitespaceSegment,
 )
+from sqlfluff.core.parser.segments import SourceFix
 from sqlfluff.core.rules import LintFix, LintResult
 
 # We're in the utils module, but users will expect reflow
@@ -67,10 +68,22 @@ def results_from_rust(raws: list[RawSegment], found: list[Any]) -> list[LintResu
     results = []
     for anchor_idx, description, source, fix_specs in found:
         fixes = []
-        for kind, target_idx, text, extra_idx in fix_specs:
+        for kind, target_idx, text, extra_idx, source_fix in fix_specs:
             target = raws[target_idx]
             if kind == "delete":
                 fixes.append(LintFix.delete(target))
+            elif kind == "edit_source":
+                # A tag's consumed whitespace: the edit is to the source.
+                edit, src_start, src_stop, tmpl_start, tmpl_stop = source_fix
+                src_fix = SourceFix(
+                    edit, slice(src_start, src_stop), slice(tmpl_start, tmpl_stop)
+                )
+                fixes.append(
+                    LintFix.replace(
+                        target,
+                        [target.edit(source_fixes=[src_fix], source_str=text)],
+                    )
+                )
             elif kind == "replace_whitespace":
                 fixes.append(LintFix.replace(target, [target.edit(text)]))
             elif kind == "indent_after_newline":
