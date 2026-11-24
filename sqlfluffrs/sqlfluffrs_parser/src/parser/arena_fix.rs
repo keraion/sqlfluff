@@ -15,6 +15,16 @@ use sqlfluffrs_types::{PositionMarker, Slice, TemplatedFile, Token};
 use super::arena::{Arena, NodeId};
 use super::types::{Node, RawSegmentKwargs};
 
+thread_local! {
+    /// Why the last `Fixer::run` on this thread returned `None`, for measuring.
+    pub(crate) static DECLINED: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn decline<T>(why: &'static str) -> Option<T> {
+    DECLINED.with(|d| d.set(why));
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum FixKind {
     Delete,
@@ -138,6 +148,20 @@ pub(crate) struct Fixer<'a> {
     /// that can't be answered here.
     pub validate: &'a mut dyn FnMut(&str, Vec<Token>) -> Option<bool>,
     pub plan: Plan,
+    /// Whether Python may reuse unchanged subtrees. Off only to measure the
+    /// cost of building every segment anew.
+    pub reuse: bool,
+}
+
+/// `PositionMarker.infer_next_position`: move `loc` past `raw`.
+fn advance(loc: &mut (usize, usize), raw: &str) {
+    match raw.rfind('\n') {
+        Some(i) => {
+            loc.0 += raw.matches('\n').count();
+            loc.1 = raw[i + 1..].chars().count() + 1;
+        }
+        None => loc.1 += raw.chars().count(),
+    }
 }
 
 enum LeafRef<'w> {
@@ -183,7 +207,17 @@ impl<'a> Fixer<'a> {
     /// The part of `_position_segments` which gives new segments a source
     /// and templated position: between the previous sibling's end and the
     /// next positioned sibling's start.
-    fn position_new(&self, parent: NodeId, buf: &mut [W]) -> Option<()> {
+    ///
+    /// Python compares the two ends by working position, as it stands when
+    /// this level is reached: `parent_loc` for the parent, `child_loc` for
+    /// its original children.
+    fn position_new(
+        &self,
+        parent: NodeId,
+        parent_loc: (usize, usize),
+        child_loc: &HashMap<NodeId, (usize, usize)>,
+        buf: &mut [W],
+    ) -> Option<()> {
         if !buf.iter().any(|w| matches!(w, W::New { pos: None, .. })) {
             return Some(());
         }
@@ -216,29 +250,24 @@ impl<'a> Fixer<'a> {
                 )
             } else {
                 let p = self.arena.pos_ref(parent)?;
-                (
-                    p.source_slice.start,
-                    p.templated_slice.start,
-                    p.working_loc(),
-                )
+                (p.source_slice.start, p.templated_slice.start, parent_loc)
             };
             let mut end = None;
             for fwd in idx + 1..buf.len() {
                 if flags[fwd] {
                     continue;
                 }
-                let p = match &buf[fwd] {
-                    W::Old(id) => self.arena.pos_ref(self.first_leaf(*id))?,
+                let (p, loc) = match &buf[fwd] {
+                    W::Old(id) => (
+                        self.arena.pos_ref(self.first_leaf(*id))?,
+                        *child_loc.get(id)?,
+                    ),
                     // Not positioned yet, or (a replace keeping its anchor's
                     // position) a leaf this never has to look past.
                     W::New { pos: None, .. } => continue,
                     _ => return None,
                 };
-                end = Some((
-                    p.source_slice.start,
-                    p.templated_slice.start,
-                    p.working_loc(),
-                ));
+                end = Some((p.source_slice.start, p.templated_slice.start, loc));
                 break;
             }
             if let Some(e) = end {
@@ -362,7 +391,10 @@ impl<'a> Fixer<'a> {
 
     /// `apply_fixes` for the container `id`. Returns the rebuilt node, any
     /// non-code pushed out before and after it, and whether it's validated.
-    fn apply(&mut self, id: NodeId) -> Option<(W, Vec<W>, Vec<W>, bool)> {
+    ///
+    /// `at` is the working position `id` starts at by now: an ancestor's
+    /// fixes may already have moved it.
+    fn apply(&mut self, id: NodeId, at: (usize, usize)) -> Option<(W, Vec<W>, Vec<W>, bool)> {
         let arena = self.arena;
         let mut buf: Vec<W> = Vec::with_capacity(arena.children(id).len() + 2);
         let mut requires_validate = false;
@@ -435,21 +467,39 @@ impl<'a> Fixer<'a> {
             }
         }
         if applied {
-            self.position_new(id, &mut buf)?;
+            let mut child_loc = HashMap::new();
+            let mut loc = at;
+            for &child in arena.children(id) {
+                child_loc.insert(child, loc);
+                advance(&mut loc, &arena.raw(child));
+            }
+            self.position_new(id, at, &child_loc, &mut buf)?;
         }
 
         // Recurse into the children which have fixes beneath them.
         let queue = std::mem::take(&mut buf);
+        let mut loc = at;
         for w in queue {
             match w {
-                W::Old(child) if self.marked.contains(&child) => {
-                    let (new_child, before, after, validated) = self.apply(child)?;
-                    buf.extend(before);
-                    buf.push(new_child);
-                    buf.extend(after);
-                    requires_validate |= !validated;
+                W::Old(child) => {
+                    let child_at = loc;
+                    advance(&mut loc, &arena.raw(child));
+                    if self.marked.contains(&child) {
+                        let (new_child, before, after, validated) = self.apply(child, child_at)?;
+                        buf.extend(before);
+                        buf.push(new_child);
+                        buf.extend(after);
+                        requires_validate |= !validated;
+                    } else {
+                        buf.push(W::Old(child));
+                    }
                 }
-                other => buf.push(other),
+                other => {
+                    if let W::New { text, .. } = &other {
+                        advance(&mut loc, text);
+                    }
+                    buf.push(other);
+                }
             }
         }
 
@@ -481,9 +531,12 @@ impl<'a> Fixer<'a> {
             if arena.descendant_type_set(id).contains("unparsable")
                 || arena.is_type(id, "unparsable")
             {
-                return None;
+                return decline("fix inside an unparsable section");
             }
-            validated = self.validate_cont(&rebuilt)?;
+            validated = match self.validate_cont(&rebuilt) {
+                Some(valid) => valid,
+                None => return decline("segment could not be re-matched in Rust"),
+            };
         }
         Some((rebuilt, before, after, validated))
     }
@@ -493,13 +546,6 @@ impl<'a> Fixer<'a> {
     fn build(&mut self, w: &W, loc: &mut (usize, usize)) -> Option<Node> {
         let arena = self.arena;
         let at = *loc;
-        let advance = |loc: &mut (usize, usize), raw: &str| match raw.rfind('\n') {
-            Some(i) => {
-                loc.0 += raw.matches('\n').count();
-                loc.1 = raw[i + 1..].chars().count() + 1;
-            }
-            None => loc.1 += raw.chars().count(),
-        };
         let op = |plan: &mut Plan, kind: i64, a: usize, b: usize| {
             plan.ops
                 .extend([kind, a as i64, b as i64, at.0 as i64, at.1 as i64]);
@@ -507,7 +553,7 @@ impl<'a> Fixer<'a> {
         Some(match w {
             W::Old(id) => {
                 let pos = arena.pos_ref(*id)?;
-                if pos.working_loc() == at {
+                if self.reuse && pos.working_loc() == at {
                     op(&mut self.plan, 0, id.index(), 0);
                     let raw = arena.raw(*id);
                     advance(loc, &raw);
@@ -598,9 +644,14 @@ impl<'a> Fixer<'a> {
 
     /// Apply every fix. `None` if Python should do it instead.
     pub(crate) fn run(mut self) -> Option<(Node, Plan)> {
+        DECLINED.with(|d| d.set("other"));
         let root = self.arena.root();
-        let (rebuilt, before, after, validated) = self.apply(root)?;
-        if !validated || !before.is_empty() || !after.is_empty() || !self.fixes.is_empty() {
+        let at = self.arena.pos_ref(root)?.working_loc();
+        let (rebuilt, before, after, validated) = self.apply(root, at)?;
+        if !validated {
+            return decline("validation failed");
+        }
+        if !before.is_empty() || !after.is_empty() || !self.fixes.is_empty() {
             return None;
         }
         let mut loc = self.arena.pos_ref(root)?.working_loc();

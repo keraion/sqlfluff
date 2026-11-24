@@ -200,6 +200,7 @@ def apply_fixes_rust(
     APPLY_STATS["rust total"] += time.perf_counter() - started
     if out is None:
         APPLY_STATS["declined"] += 1
+        APPLY_STATS["declined: " + parser.last_apply_decline()] += 1  # type: ignore[union-attr]
         return None
     new_arena, ops, texts, slices, raw, validate_ns, validations, rust_ns = out
     APPLY_STATS["validate"] += validate_ns / 1e9

@@ -466,7 +466,11 @@ pub struct PyParser {
 impl PyParser {
     /// Match the named segment's grammar against `tokens`; see
     /// `rematch_segment`.
-    fn run_rematch(&self, name: &str, mut rust_tokens: Vec<Token>) -> PyResult<Option<(usize, usize)>> {
+    fn run_rematch(
+        &self,
+        name: &str,
+        mut rust_tokens: Vec<Token>,
+    ) -> PyResult<Option<(usize, usize)>> {
         fn count_unparsable(node: &Node) -> usize {
             match node {
                 Node::Unparsable { children, .. } => {
@@ -496,8 +500,17 @@ impl PyParser {
                     .as_ref()
                     .map(|c| format!("{} ({:?})", c.class_name, c.segment_type))
                     .unwrap_or_else(|| "-".to_string());
-                let raws: Vec<&str> = tokens[m.matched_slice.clone()].iter().map(|t| t.raw()).collect();
-                eprintln!("{}{:?} {} {:?}", "  ".repeat(depth), m.matched_slice, class, raws);
+                let raws: Vec<&str> = tokens[m.matched_slice.clone()]
+                    .iter()
+                    .map(|t| t.raw())
+                    .collect();
+                eprintln!(
+                    "{}{:?} {} {:?}",
+                    "  ".repeat(depth),
+                    m.matched_slice,
+                    class,
+                    raws
+                );
                 for c in &m.child_matches {
                     dump(c, depth + 1, tokens);
                 }
@@ -508,7 +521,10 @@ impl PyParser {
         // The match tree marks unparsable sections by class; the applied
         // nodes are checked too in case they're only made on apply.
         let unparsable = usize::from(m.contains_unparsable())
-            + m.apply(&rust_tokens).iter().map(count_unparsable).sum::<usize>();
+            + m.apply(&rust_tokens)
+                .iter()
+                .map(count_unparsable)
+                .sum::<usize>();
         Ok(Some((matched, unparsable)))
     }
 }
@@ -623,6 +639,12 @@ impl PyParser {
         }
     }
 
+    /// SPIKE: why the last `apply_leaf_fixes` on this thread returned `None`.
+    #[staticmethod]
+    pub fn last_apply_decline() -> &'static str {
+        super::arena_fix::DECLINED.with(|d| d.get())
+    }
+
     /// SPIKE: apply fixes anchored on leaves to the arena, validating each
     /// rebuilt segment as Python's `apply_fixes` does. `fixes` are `(kind,
     /// target leaf, text, extra leaf)` with leaves indexed as Python's
@@ -637,13 +659,23 @@ impl PyParser {
         loose_ends: std::collections::HashSet<String>,
         whitespace: (String, String, Vec<String>),
         newline: (String, String, Vec<String>),
-    ) -> Option<(super::arena_py::PyTree, Vec<i64>, Vec<String>, Vec<usize>, String, u64, usize, u64)> {
+    ) -> Option<(
+        super::arena_py::PyTree,
+        Vec<i64>,
+        Vec<String>,
+        Vec<usize>,
+        String,
+        u64,
+        usize,
+        u64,
+    )> {
         use super::arena_fix::{Fix, FixKind, Fixer, Plan};
         let started = std::time::Instant::now();
         let (node, plan) = tree.with_arena(|arena| {
             let root = arena.root();
             let leaves = arena.raw_segments(root);
-            let mut by_anchor: std::collections::HashMap<_, Vec<Fix>> = std::collections::HashMap::new();
+            let mut by_anchor: std::collections::HashMap<_, Vec<Fix>> =
+                std::collections::HashMap::new();
             let mut marked = std::collections::HashSet::new();
             for (kind, target, text, extra, levels) in fixes {
                 let mut target = *leaves.get(target)?;
@@ -683,6 +715,7 @@ impl PyParser {
                 templated_file,
                 validate: &mut validate,
                 plan: Plan::default(),
+                reuse: std::env::var_os("SQLFLUFF_RUST_APPLY_NO_REUSE").is_none(),
             }
             .run()
         })?;
