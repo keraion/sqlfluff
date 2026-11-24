@@ -643,14 +643,27 @@ class Linter:
                                 )
 
                                 applied = apply_fixes_rust(
-                                    tree, fixes, templated_file, config
+                                    tree,
+                                    # As grouped above: source edits to one
+                                    # anchor are condensed into one fix.
+                                    [
+                                        fix
+                                        for info in anchor_info.values()
+                                        for fix in info.fixes
+                                    ],
+                                    templated_file,
+                                    config,
                                 )
+                                candidate = applied[1]() if applied else None
                                 if (
-                                    applied
-                                    and applied[0] != tree.raw
-                                    and (applied[0], ()) not in previous_versions
+                                    candidate is not None
+                                    and (
+                                        candidate.raw,
+                                        tuple(candidate.source_fixes),
+                                    )
+                                    not in previous_versions
                                 ):
-                                    rs_tree = applied[1]()
+                                    rs_tree = candidate
                             if rs_tree is not None:
                                 new_tree, _valid = rs_tree, True
                             else:

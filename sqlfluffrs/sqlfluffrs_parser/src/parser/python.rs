@@ -703,6 +703,7 @@ impl PyParser {
                 marked,
                 loose_ends: &loose_ends,
                 new_leaves: &new_leaves,
+                visit_all: templated_file.source_str != templated_file.templated_str,
                 templated_file,
                 validate: &mut validate,
                 plan: Plan::default(),

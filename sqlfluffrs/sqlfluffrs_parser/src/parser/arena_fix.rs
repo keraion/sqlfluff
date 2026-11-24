@@ -13,7 +13,7 @@ use std::sync::Arc;
 use sqlfluffrs_types::{PositionMarker, Slice, TemplatedFile, Token};
 
 use super::arena::{Arena, NodeId};
-use super::types::{Node, RawSegmentKwargs};
+use super::types::{MetaType, Node, RawSegmentKwargs};
 
 thread_local! {
     /// Why the last `Fixer::run` on this thread returned `None`, for measuring.
@@ -66,6 +66,9 @@ enum W {
         leaf: usize,
         pos: Option<(Slice, Slice)>,
     },
+    /// An old template placeholder with a new source: edit `leaf`, in the
+    /// old one's place.
+    Swap { old: NodeId, leaf: usize },
     /// A container made by a fix, with nothing in it positioned before.
     NewCont {
         node: usize,
@@ -100,6 +103,10 @@ pub(crate) struct Fixer<'a> {
     pub fixes: HashMap<NodeId, Vec<Fix>>,
     /// Containers with a fix somewhere beneath them.
     pub marked: HashSet<NodeId>,
+    /// Python rebuilds every segment it walks through while fixes are left
+    /// to apply, not only those above a fix. That shows only where positions
+    /// aren't already what a rebuild gives: in a templated file.
+    pub visit_all: bool,
     /// Classes with `can_start_end_non_code`.
     pub loose_ends: &'a HashSet<String>,
     pub new_leaves: &'a [NewLeaf],
@@ -148,7 +155,7 @@ impl<'a> Fixer<'a> {
 
     fn slices(&self, w: &W) -> Option<(Slice, Slice)> {
         match w {
-            W::Old(id) | W::Cont { from: id, .. } => self
+            W::Old(id) | W::Cont { from: id, .. } | W::Swap { old: id, .. } => self
                 .arena
                 .pos_ref(*id)
                 .map(|p| (p.source_slice, p.templated_slice)),
@@ -211,6 +218,7 @@ impl<'a> Fixer<'a> {
     fn is_code(&self, w: &W) -> bool {
         match w {
             W::Old(id) => self.arena.is_code(*id),
+            W::Swap { .. } => false,
             // ponytail: builds a node per call; cache per leaf if it shows up.
             W::New { leaf, .. } => self.new_node(*leaf, None).is_code(),
             W::Cont { children, .. } | W::NewCont { children, .. } => {
@@ -221,7 +229,9 @@ impl<'a> Fixer<'a> {
 
     /// `BaseSegment._is_code_or_meta`.
     fn is_code_or_meta(&self, w: &W) -> bool {
-        self.is_code(w) || matches!(w, W::Old(id) if self.arena.is_meta(*id))
+        self.is_code(w)
+            || matches!(w, W::Old(id) if self.arena.is_meta(*id))
+            || matches!(w, W::Swap { .. })
     }
 
     /// The part of `_position_segments` which gives new segments a source
@@ -279,10 +289,22 @@ impl<'a> Fixer<'a> {
                     continue;
                 }
                 let (p, loc) = match &buf[fwd] {
-                    W::Old(id) => (
-                        self.arena.pos_ref(self.first_leaf(*id))?,
-                        *child_loc.get(id)?,
-                    ),
+                    W::Old(id) | W::Swap { old: id, .. } => {
+                        // An expression which rendered nothing may sit before
+                        // a sibling at an earlier templated position: its
+                        // position is no end point.
+                        let arena = self.arena;
+                        if arena.is_type(*id, "placeholder")
+                            && arena.block_type(*id).as_deref() == Some("templated")
+                            && arena.pos_ref(*id).is_some_and(|p| {
+                                p.templated_slice.start == p.templated_slice.stop
+                                    && p.source_slice.start != p.source_slice.stop
+                            })
+                        {
+                            continue;
+                        }
+                        (arena.pos_ref(self.first_leaf(*id))?, *child_loc.get(id)?)
+                    }
                     // Not positioned yet, or (a replace keeping its anchor's
                     // position) a leaf this never has to look past.
                     w if unplaced(w) => continue,
@@ -326,6 +348,8 @@ impl<'a> Fixer<'a> {
     fn leaves<'w>(&self, w: &'w W, out: &mut Vec<LeafRef<'w>>) {
         match w {
             W::Old(id) => out.extend(self.arena.raw_segments(*id).into_iter().map(LeafRef::Old)),
+            // A placeholder either way: a meta, which validation leaves out.
+            W::Swap { old, .. } => out.push(LeafRef::Old(*old)),
             W::Cont { children, .. } | W::NewCont { children, .. } => {
                 children.iter().for_each(|c| self.leaves(c, out))
             }
@@ -431,6 +455,18 @@ impl<'a> Fixer<'a> {
                 let mut consumed_pos = false;
                 for &leaf in &fix.edits {
                     let new = &self.new_leaves[leaf];
+                    if new.1 == "placeholder" {
+                        // A placeholder's source edited: the same segment
+                        // with a source fix.
+                        if fix.edit_type != EditType::Replace
+                            || fix.edits.len() != 1
+                            || !arena.is_type(child, "placeholder")
+                        {
+                            return decline("placeholder edit which isn't a replace of one");
+                        }
+                        buf.push(W::Swap { old: child, leaf });
+                        continue;
+                    }
                     if new.5 != 0 {
                         let Some(w) = self.new_w(&mut { leaf }) else {
                             return decline("malformed edit");
@@ -469,6 +505,9 @@ impl<'a> Fixer<'a> {
                 // A like-for-like edit needs no validating; anything else does.
                 let same_types = || {
                     let old = arena.class_types(child);
+                    if self.new_leaves[fix.edits[0]].1 == "placeholder" {
+                        return true;
+                    }
                     if self.new_leaves[fix.edits[0]].5 != 0 {
                         return false;
                     }
@@ -504,7 +543,11 @@ impl<'a> Fixer<'a> {
                 W::Old(child) => {
                     let child_at = loc;
                     advance(&mut loc, &arena.raw(child));
-                    if self.marked.contains(&child) {
+                    if self.marked.contains(&child)
+                        || (self.visit_all
+                            && !self.fixes.is_empty()
+                            && !arena.children(child).is_empty())
+                    {
                         let (new_child, before, after, validated) = self.apply(child, child_at)?;
                         buf.extend(before);
                         buf.push(new_child);
@@ -625,6 +668,25 @@ impl<'a> Fixer<'a> {
                 self.plan.raw.push_str(text);
                 op(&mut self.plan, 7, *leaf, 0);
                 self.new_node(*leaf, Some(pos))
+            }
+            W::Swap { old, leaf } => {
+                let old_pos = arena.pos_ref(*old)?;
+                let (source, templated) = (old_pos.source_slice, old_pos.templated_slice);
+                op(&mut self.plan, 7, *leaf, 0);
+                self.plan.slices.extend([
+                    source.start,
+                    source.stop,
+                    templated.start,
+                    templated.stop,
+                ]);
+                Node::Meta {
+                    meta_type: MetaType::Template {
+                        source_str: self.new_leaves[*leaf].4.clone(),
+                        block_type: arena.block_type(*old)?,
+                    },
+                    pos_marker: Some(old_pos.with_working_position(at.0, at.1)),
+                    block_uuid: arena.block_uuid(*old),
+                }
             }
             W::NewCont {
                 node,

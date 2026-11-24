@@ -166,7 +166,8 @@ def apply_fixes_rust(
 ) -> Optional[tuple[str, Any]]:
     """SPIKE: apply fixes on the Rust arena instead of with `apply_fixes`.
 
-    For fixes on an untemplated file whose edits are all plain raw segments.
+    For fixes whose edits are plain new segments, or a template placeholder
+    with its source edited.
     Rust applies them to the arena, validates each rebuilt segment by
     re-matching it, and returns a new arena plus a plan for building the
     Python tree. Returns `(new raw, build)`, where `build()` makes the new
@@ -174,11 +175,7 @@ def apply_fixes_rust(
     """
     from sqlfluff.core.parser.markers import PositionMarker
 
-    if (
-        templated_file is None
-        or templated_file.source_str != templated_file.templated_str
-        or tree.source_fixes
-    ):
+    if templated_file is None:
         return None
     arena = getattr(tree, "_rs_tree", None) or getattr(tree, "_rs_tree_rebuilt", None)
     if not arena:
@@ -199,7 +196,7 @@ def apply_fixes_rust(
     index = {seg.uuid: i for i, seg in enumerate(segs)}
     specs = []
     leaves: list[BaseSegment] = []
-    new_leaves = []
+    new_leaves: list[tuple[str, str, list[str], list[str], str, int]] = []
     for fix in fixes:
         anchor = index.get(fix.anchor.uuid)
         if anchor is None:
@@ -212,6 +209,20 @@ def apply_fixes_rust(
             while todo:
                 seg = todo.pop()
                 children = seg.segments
+                if seg is edit and seg.is_type("placeholder") and not children:
+                    # A placeholder with its source edited (a source fix).
+                    leaves.append(seg)
+                    new_leaves.append(
+                        (
+                            type(seg).__name__,
+                            "placeholder",
+                            [],
+                            [],
+                            seg.source_str,  # type: ignore[attr-defined]
+                            0,
+                        )
+                    )
+                    continue
                 if (
                     seg.is_meta
                     or seg.source_fixes
