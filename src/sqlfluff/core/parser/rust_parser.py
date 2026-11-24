@@ -147,37 +147,78 @@ def apply_fixes_rust(
 ) -> Optional[tuple[str, Any]]:
     """SPIKE: apply fixes on the Rust arena instead of with `apply_fixes`.
 
-    Only for fixes the Rust reflow rules made (each carries `_rs_spec`) on an
-    untemplated file. Rust applies them to the arena, validates each rebuilt
-    segment by re-matching it, and returns a new arena plus a plan for
-    building the Python tree. Returns `(new raw, build)`, where `build()`
-    makes the new tree, or `None` if Python should apply the fixes.
+    For fixes on an untemplated file whose edits are all plain raw segments.
+    Rust applies them to the arena, validates each rebuilt segment by
+    re-matching it, and returns a new arena plus a plan for building the
+    Python tree. Returns `(new raw, build)`, where `build()` makes the new
+    tree, or `None` if Python should apply the fixes.
     """
     from sqlfluff.core.parser.markers import PositionMarker
-    from sqlfluff.core.parser.segments import NewlineSegment, WhitespaceSegment
 
-    arena = getattr(tree, "_rs_tree", None) or getattr(tree, "_rs_tree_rebuilt", None)
     if (
-        not arena
-        or templated_file is None
+        templated_file is None
         or templated_file.source_str != templated_file.templated_str
         or tree.source_fixes
     ):
         return None
-    specs = []
-    for fix in fixes:
-        spec = getattr(fix, "_rs_spec", None)
-        if spec is None:
+    arena = getattr(tree, "_rs_tree", None) or getattr(tree, "_rs_tree_rebuilt", None)
+    if not arena:
+        arena = rebuild_rs_tree(tree, templated_file)
+        if not arena:
             return None
-        # The rule may have hoisted the anchor from the leaf to an ancestor
-        # (`_choose_anchor_segment`): count how far up it went.
-        seg, levels = spec[4], 0
-        while seg is not fix.anchor:
-            parent = seg.get_parent()
-            if parent is None:
-                return None
-            seg, levels = parent[0], levels + 1
-        specs.append((*spec[:4], levels))
+        setattr(tree, "_rs_tree_rebuilt", arena)
+    # The tree in pre-order, which is how the arena numbers its nodes.
+    segs: list[BaseSegment] = []
+    todo = [tree]
+    while todo:
+        seg = todo.pop()
+        segs.append(seg)
+        if seg.segments:
+            todo.extend(reversed(seg.segments))
+    if len(segs) != len(arena):
+        return None
+    index = {seg.uuid: i for i, seg in enumerate(segs)}
+    specs = []
+    leaves: list[BaseSegment] = []
+    new_leaves = []
+    for fix in fixes:
+        anchor = index.get(fix.anchor.uuid)
+        if anchor is None:
+            return None
+        edits = []
+        for edit in fix.edit or ():
+            edits.append(len(leaves))
+            # The edit in pre-order: a container is followed by its children.
+            todo = [edit]
+            while todo:
+                seg = todo.pop()
+                children = seg.segments
+                if (
+                    seg.is_meta
+                    or seg.source_fixes
+                    or (seg.pos_marker and seg is not edit)
+                    or not (children or seg.is_type("raw"))
+                    # Non-code at either end of a new segment may be moved out
+                    # of it: leave that to Python.
+                    or (children and not (children[0].is_code and children[-1].is_code))
+                ):
+                    APPLY_STATS["declined"] += 1
+                    APPLY_STATS["declined: edit is not a plain new segment"] += 1
+                    return None
+                cls = type(seg)
+                leaves.append(seg)
+                new_leaves.append(
+                    (
+                        cls.__name__,
+                        cls.type,
+                        list(cls._class_types),
+                        [] if children else list(seg.instance_types),  # type: ignore[attr-defined]
+                        "" if children else seg.raw,
+                        len(children),
+                    )
+                )
+                todo.extend(reversed(children))
+        specs.append((fix.edit_type, anchor, edits))
     key = (config.get("dialect"), config.get("max_parse_depth"))
     parser = _APPLY_PARSERS.get(key)
     if parser is None:
@@ -189,10 +230,9 @@ def apply_fixes_rust(
         out = parser.apply_leaf_fixes(  # type: ignore[union-attr]
             arena,
             specs,
+            new_leaves,
             # "Root" is what the parser's own arena calls the file segment.
             {type(tree).__name__, "Root", "UnparsableSegment"},
-            ("WhitespaceSegment", "whitespace", list(WhitespaceSegment._class_types)),
-            ("NewlineSegment", "newline", list(NewlineSegment._class_types)),
         )
     except (KeyboardInterrupt, SystemExit):  # pragma: no cover
         raise
@@ -203,36 +243,34 @@ def apply_fixes_rust(
         APPLY_STATS["declined"] += 1
         APPLY_STATS["declined: " + parser.last_apply_decline()] += 1  # type: ignore[union-attr]
         return None
-    new_arena, ops, texts, slices, raw, validate_ns, validations, rust_ns = out
+    new_arena, ops, slices, raw, validate_ns, validations, rust_ns = out
     APPLY_STATS["validate"] += validate_ns / 1e9
     APPLY_STATS["apply"] += (rust_ns - validate_ns) / 1e9
     APPLY_STATS["validations"] += validations
 
     def build() -> Optional[BaseSegment]:
         started = time.perf_counter()
-        # The old tree in pre-order, which is how the arena numbers its nodes.
-        segs: list[BaseSegment] = []
-        todo = [tree]
-        while todo:
-            seg = todo.pop()
-            segs.append(seg)
-            if seg.segments:
-                todo.extend(reversed(seg.segments))
-        if len(segs) != len(arena):
-            APPLY_STATS["declined"] += 1
-            return None
         # Markers in one tree must all share one templated file object.
         marker_file = tree.pos_marker.templated_file  # type: ignore[union-attr]
-        # Open containers: [old segment, line, position, children, still to come].
+        # Open containers: [segment it's made like, marker, children, still to come].
         stack: list[list[Any]] = []
         result: Optional[BaseSegment] = None
-        text_idx = slice_idx = 0
+        slice_idx = 0
         for i in range(0, len(ops), 5):
             kind, a, b, line_no, line_pos = ops[i : i + 5]
             if kind == 0:
                 new = segs[a]
             elif kind == 5:
-                stack.append([segs[a], line_no, line_pos, [], b])
+                old = segs[a]
+                assert old.pos_marker
+                stack.append(
+                    [
+                        old,
+                        old.pos_marker.with_working_position(line_no, line_pos),
+                        [],
+                        b,
+                    ]
+                )
                 continue
             elif kind == 1:
                 old = segs[a]
@@ -245,30 +283,23 @@ def apply_fixes_rust(
                 pos = PositionMarker(
                     slice(s0, s1), slice(t0, t1), marker_file, line_no, line_pos
                 )
-                if kind == 3:
-                    new = WhitespaceSegment(texts[text_idx], pos_marker=pos)
-                    text_idx += 1
-                elif kind == 4:
-                    new = NewlineSegment(pos_marker=pos)
-                elif kind == 2:
-                    new = segs[a].edit(texts[text_idx])
-                    text_idx += 1
-                    new.pos_marker = pos
-                else:
-                    new = segs[a].copy()
-                    new.pos_marker = pos
+                if kind == 8:
+                    stack.append([leaves[a], pos, [], b])
+                    continue
+                new = leaves[a].copy()
+                new.pos_marker = pos
             # Add it to its parent, closing every container it completes.
             while stack:
                 top = stack[-1]
-                top[3].append(new)
-                top[4] -= 1
-                if top[4]:
+                top[2].append(new)
+                top[3] -= 1
+                if top[3]:
                     break
                 stack.pop()
                 old = top[0]
                 new = old.__class__(
-                    segments=tuple(top[3]),
-                    pos_marker=old.pos_marker.with_working_position(top[1], top[2]),
+                    segments=tuple(top[2]),
+                    pos_marker=top[1],
                     **{k: getattr(old, k) for k in old.additional_kwargs},
                 )
             else:

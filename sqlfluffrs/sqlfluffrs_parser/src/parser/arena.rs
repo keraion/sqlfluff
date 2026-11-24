@@ -797,6 +797,10 @@ impl NodeId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    pub(crate) fn from_index(index: usize) -> Self {
+        NodeId(index as u32)
+    }
 }
 
 impl Arena {

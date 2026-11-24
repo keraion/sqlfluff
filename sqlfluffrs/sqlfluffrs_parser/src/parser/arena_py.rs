@@ -148,12 +148,16 @@ fn node_from_flat(
             )
         }
         2 => Node::Meta {
-            meta_type: MetaType::Indent { is_implicit: a[i] != 0 },
+            meta_type: MetaType::Indent {
+                is_implicit: a[i] != 0,
+            },
             pos_marker,
             block_uuid: None,
         },
         3 => Node::Meta {
-            meta_type: MetaType::Dedent { is_implicit: a[i] != 0 },
+            meta_type: MetaType::Dedent {
+                is_implicit: a[i] != 0,
+            },
             pos_marker,
             block_uuid: None,
         },

@@ -645,51 +645,43 @@ impl PyParser {
         super::arena_fix::DECLINED.with(|d| d.get())
     }
 
-    /// SPIKE: apply fixes anchored on leaves to the arena, validating each
-    /// rebuilt segment as Python's `apply_fixes` does. `fixes` are `(kind,
-    /// target leaf, text, extra leaf)` with leaves indexed as Python's
-    /// `raw_segments`. Returns the new arena and the plan for building the
+    /// SPIKE: apply fixes to the arena, validating each rebuilt segment as
+    /// Python's `apply_fixes` does. `fixes` are `(edit type, anchor, edits)`:
+    /// the anchor is its pre-order position in the tree and the edits index
+    /// `new_leaves`. Returns the new arena and the plan for building the
     /// Python tree (see `arena_fix::Plan`), or `None` if Python should apply
     /// the fixes itself.
     #[allow(clippy::type_complexity)]
     pub fn apply_leaf_fixes(
         &self,
         tree: &super::arena_py::PyTree,
-        fixes: Vec<(String, usize, String, Option<usize>, usize)>,
+        fixes: Vec<(String, usize, Vec<usize>)>,
+        new_leaves: Vec<(String, String, Vec<String>, Vec<String>, String, usize)>,
         loose_ends: std::collections::HashSet<String>,
-        whitespace: (String, String, Vec<String>),
-        newline: (String, String, Vec<String>),
     ) -> Option<(
         super::arena_py::PyTree,
         Vec<i64>,
-        Vec<String>,
         Vec<usize>,
         String,
         u64,
         usize,
         u64,
     )> {
-        use super::arena_fix::{Fix, FixKind, Fixer, Plan};
+        use super::arena_fix::{EditType, Fix, Fixer, Plan};
         let started = std::time::Instant::now();
         let (node, plan) = tree.with_arena(|arena| {
             let root = arena.root();
-            let leaves = arena.raw_segments(root);
             let mut by_anchor: std::collections::HashMap<_, Vec<Fix>> =
                 std::collections::HashMap::new();
             let mut marked = std::collections::HashSet::new();
-            for (kind, target, text, extra, levels) in fixes {
-                let mut target = *leaves.get(target)?;
-                for _ in 0..levels {
-                    target = arena.parent(target)?;
+            for (edit_type, anchor, edits) in fixes {
+                if anchor >= arena.len() || edits.iter().any(|&e| e >= new_leaves.len()) {
+                    return None;
                 }
-                let extra = match extra {
-                    Some(e) => Some(*leaves.get(e)?),
-                    None => None,
-                };
+                let target = super::arena::NodeId::from_index(anchor);
                 by_anchor.entry(target).or_default().push(Fix {
-                    kind: FixKind::parse(&kind)?,
-                    text,
-                    extra,
+                    edit_type: EditType::parse(&edit_type)?,
+                    edits,
                 });
                 let mut up = arena.parent(target);
                 while let Some(p) = up {
@@ -710,8 +702,7 @@ impl PyParser {
                 fixes: by_anchor,
                 marked,
                 loose_ends: &loose_ends,
-                whitespace: &whitespace,
-                newline: &newline,
+                new_leaves: &new_leaves,
                 templated_file,
                 validate: &mut validate,
                 plan: Plan::default(),
@@ -724,7 +715,6 @@ impl PyParser {
         Some((
             new_tree,
             plan.ops,
-            plan.texts,
             plan.slices,
             plan.raw,
             plan.validate_ns,

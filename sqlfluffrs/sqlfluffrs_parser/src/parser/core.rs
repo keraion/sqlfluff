@@ -335,7 +335,12 @@ impl<'a> Parser<'a> {
     /// from the start. This is what Python's
     /// `BaseSegment.validate_segment_with_reparse` does after a fix.
     pub fn rematch_segment(&mut self, name: &str) -> Result<Option<MatchResult>, ParseError> {
-        let Some(root) = self.dialect.get_segment_grammar(name) else {
+        // "Root" is what the parser's own arena calls the file segment.
+        let root = if name == "Root" {
+            self.dialect.get_root_grammar().clone()
+        } else if let Some(root) = self.dialect.get_segment_grammar(name) {
+            root
+        } else {
             return Ok(None);
         };
         self.grammar_ctx = GrammarContext::new(root.tables);
