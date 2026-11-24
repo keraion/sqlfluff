@@ -189,7 +189,8 @@ def apply_fixes_rust(
         out = parser.apply_leaf_fixes(  # type: ignore[union-attr]
             arena,
             specs,
-            {type(tree).__name__, "BaseFileSegment", "UnparsableSegment"},
+            # "Root" is what the parser's own arena calls the file segment.
+            {type(tree).__name__, "Root", "UnparsableSegment"},
             ("WhitespaceSegment", "whitespace", list(WhitespaceSegment._class_types)),
             ("NewlineSegment", "newline", list(NewlineSegment._class_types)),
         )

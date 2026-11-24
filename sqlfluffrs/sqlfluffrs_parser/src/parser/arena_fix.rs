@@ -473,7 +473,9 @@ impl<'a> Fixer<'a> {
                 child_loc.insert(child, loc);
                 advance(&mut loc, &arena.raw(child));
             }
-            self.position_new(id, at, &child_loc, &mut buf)?;
+            if self.position_new(id, at, &child_loc, &mut buf).is_none() {
+                return decline("could not position a new segment");
+            }
         }
 
         // Recurse into the children which have fixes beneath them.
@@ -505,7 +507,9 @@ impl<'a> Fixer<'a> {
 
         // Non-code left at either end moves up to the parent.
         let (mut before, mut after) = (Vec::new(), Vec::new());
-        let class = arena.segment_class(id)?;
+        let Some(class) = arena.segment_class(id) else {
+            return decline("fix inside an unparsable section");
+        };
         if !self.loose_ends.contains(&class) {
             let start = buf
                 .iter()
@@ -519,7 +523,7 @@ impl<'a> Fixer<'a> {
             after = buf.drain(end..).collect();
         }
         if buf.is_empty() {
-            return None;
+            return decline("segment left empty");
         }
         let rebuilt = W::Cont {
             from: id,
@@ -651,8 +655,12 @@ impl<'a> Fixer<'a> {
         if !validated {
             return decline("validation failed");
         }
-        if !before.is_empty() || !after.is_empty() || !self.fixes.is_empty() {
-            return None;
+        if !before.is_empty() || !after.is_empty() {
+            return decline("non-code pushed out of the root");
+        }
+        if !self.fixes.is_empty() {
+            // Python drops these silently too, but they are worth a look.
+            return decline("anchor not found in the tree");
         }
         let mut loc = self.arena.pos_ref(root)?.working_loc();
         let node = self.build(&rebuilt, &mut loc)?;
