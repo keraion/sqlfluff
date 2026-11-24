@@ -78,7 +78,8 @@ fixtures and 1,765 files:
 | parse + lint | 1.21× | 1.36× | 1.34× |
 | fix (arena rebuilt between passes) | 1.13× | 1.16× | 1.20× |
 
-Fix mode is held back by `apply_fixes`, which is 41–53% of fix time.
+Fix mode was held back by `apply_fixes`, 41–53% of fix time at this point.
+Section 6 moves it to Rust.
 
 ### 3. Arena rebuild between fix passes
 
@@ -108,6 +109,81 @@ applied on this branch:
 - `a921118f8` fix(rust): don't require whitespace before a keyword
   terminator (`helpers.rs`). Origin: #7566.
 
+### 6. Applying fixes on the arena
+
+`arena_fix.rs` mirrors Python's `apply_fixes` on the arena: anchor lookup,
+create-before/after pairing, positioning of new segments, pushing non-code
+out of segments, and per-segment validation through the Rust re-match. The
+old arena is left alone; Rust returns a new arena plus a pre-order plan, and
+`rust_parser.py::apply_fixes_rust` builds the Python tree from it, reusing
+unchanged subtrees. Toggle: `SQLFLUFF_NO_RUST_APPLY`
+(`SQLFLUFF_RUST_APPLY_NO_REUSE` is for measuring only).
+
+It started as reflow-only (fixes described by the Rust reflow's own spec) and
+was then generalised to any rule: Python describes each `LintFix` as edit
+type, the anchor's pre-order position, and its new segments. New leaves and
+fresh containers (AL01's `AS` operator) are supported, and fixes at the file
+root validate on the parser's own arena.
+
+Fix mode, in process, min of 3, measured alone:
+
+| | Python rules | Rust reflow, Python apply | Rust apply, reflow fixes only | Rust apply, all rules |
+|---|---|---|---|---|
+| testbed (191 files) | 7.67s | 6.50s (1.18×) | 1.14× | 3.95s (1.94×) |
+| snowflake (280) | 24.23s | 21.16s (1.15×) | 1.69× | 8.91s (2.72×) |
+| postgres (227) | 21.25s | 18.27s (1.16×) | 1.77× | 7.81s (2.72×) |
+
+The reflow-only column is from the run before generalising, against that
+run's own baseline.
+
+Per-stage cost of the Rust apply, all rules:
+
+| | Passes | Apply | Validate | Build Python tree | Python `apply_fixes` left |
+|---|---|---|---|---|---|
+| testbed | 527 | 135ms | 41ms | 112ms | 302ms (templated files) |
+| snowflake | 621 | 525ms | 360ms | 756ms | 351ms |
+| postgres | 411 | 454ms | 277ms | 783ms | 292ms |
+
+Python `apply_fixes` was 36–43% of fix time before this and is 3–7% after.
+
+Parity: with the Rust apply on and off, the fixed output is identical on all
+2,944 rule fixture cases (every rule) and 1,765 corpus files (testbed, ansi,
+postgres, bigquery, tsql, snowflake, mysql, sparksql, oracle). Each of the
+4,507 Rust passes was also compared with Python's `apply_fixes` on the same
+tree, node by node (class, raw, source slice, templated slice, working
+position), with no mismatch.
+
+Handed back to Python (378 passes in the parity run):
+
+- fixes that move an existing subtree (ST06, ST09, CV11, some LT09): 358;
+- anchor not in the tree: 10; validation failed (Python rejects these too): 10;
+- templated files, unparsable sections and source fixes never reach it.
+
+Not ported: `max_parse_nodes` in validation, `fix_even_unparsable`. Rebuilt
+containers get new uuids where Python sometimes keeps them; no parity
+difference showed up.
+
+### Where time goes now
+
+All Rust paths on, in process, min of 3.
+
+| Fix mode | testbed (4.02s) | snowflake (8.88s) | postgres (7.63s) |
+|---|---|---|---|
+| Rule crawls | 47.4% | 39.3% | 39.7% |
+| Parse (lex, parse, build Python tree) | 22.7% | 22.3% | 23.2% |
+| Other (noqa, loop overhead, result assembly) | 15.4% | 21.2% | 20.8% |
+| Rust apply + validate + build tree | 6.4% | 12.9% | 12.7% |
+| Python `apply_fixes` | 6.8% | 3.7% | 3.1% |
+
+| Lint mode | testbed (2.38s) | snowflake (3.83s) | postgres (3.47s) |
+|---|---|---|---|
+| Parse (lex, parse, build Python tree) | 37.7% | 46.0% | 50.7% |
+| Rule crawls | 44.8% | 36.6% | 33.9% |
+| Other (noqa, loop overhead, result assembly) | 15.7% | 17.1% | 15.1% |
+
+The crawls are a flat tail: no rule is above about 6% of lint. "Other" has
+not been profiled.
+
 ## Roadmap: Python out of the lint/fix cycle
 
 Goal: no Python in lint/fix except legacy plugin rules.
@@ -115,8 +191,8 @@ Goal: no Python in lint/fix except legacy plugin rules.
 1. Rules in Rust: reflow first (done here for untemplated files), then
    templated reflow, then the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
-3. Fix loop on a mutable arena, with Rust validation (shown feasible above),
-   which removes `apply_fixes` and the per-pass rebuild.
+3. Fix loop on the arena, with Rust validation: done for untemplated files
+   (section 6). Left: moved subtrees, templated files, unparsable sections.
 4. Reporting straight from Rust results.
 5. Plugin bridge: build the Python tree on demand, only when a Python rule
    is loaded.
