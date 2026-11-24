@@ -110,6 +110,10 @@ pub(crate) struct Fixer<'a> {
     /// Classes with `can_start_end_non_code`.
     pub loose_ends: &'a HashSet<String>,
     pub new_leaves: &'a [NewLeaf],
+    /// Six per new segment: its source and templated slices and working
+    /// location if it had a position (a segment moved from the old tree),
+    /// else -1s.
+    pub new_pos: &'a [i64],
     pub templated_file: Arc<TemplatedFile>,
     /// Re-match a class's grammar over tokens: `Some(valid)`, or `None` if
     /// that can't be answered here.
@@ -118,6 +122,10 @@ pub(crate) struct Fixer<'a> {
     /// Whether Python may reuse unchanged subtrees. Off only to measure the
     /// cost of building every segment anew.
     pub reuse: bool,
+    /// Above zero while building under a moved segment whose working
+    /// location didn't change: Python then leaves what is inside it alone,
+    /// old working locations and all.
+    pub stale: usize,
 }
 
 /// `PositionMarker.infer_next_position`: move `loc` past `raw`.
@@ -138,8 +146,41 @@ enum LeafRef<'w> {
 
 impl<'a> Fixer<'a> {
     /// The arena node for a new leaf, built as `RsTree.from_segments` would.
+    /// Is this new segment an indent or dedent?
+    fn is_meta_leaf(&self, leaf: usize) -> bool {
+        matches!(self.new_leaves[leaf].1.as_str(), "indent" | "dedent")
+    }
+
+    /// The position a new segment came with: its slices and working location.
+    fn preset(&self, node: usize) -> Option<((Slice, Slice), (usize, usize))> {
+        let p = self.new_pos.get(node * 6..node * 6 + 6)?;
+        if p[0] < 0 {
+            return None;
+        }
+        let slice = |a: i64, b: i64| Slice {
+            start: a as usize,
+            stop: b as usize,
+        };
+        Some((
+            (slice(p[0], p[1]), slice(p[2], p[3])),
+            (p[4] as usize, p[5] as usize),
+        ))
+    }
+
     fn new_node(&self, leaf: usize, pos: Option<PositionMarker>) -> Node {
         let (name, class_type, class_types, inst, raw, _) = &self.new_leaves[leaf];
+        if self.is_meta_leaf(leaf) {
+            let is_implicit = inst.iter().any(|t| t == "implicit");
+            return Node::Meta {
+                meta_type: if class_type == "dedent" {
+                    MetaType::Dedent { is_implicit }
+                } else {
+                    MetaType::Indent { is_implicit }
+                },
+                pos_marker: pos,
+                block_uuid: None,
+            };
+        }
         let segment_type = inst.first().cloned().unwrap_or_else(|| class_type.clone());
         Node::new_raw_with_class_types(
             name.clone(),
@@ -167,44 +208,52 @@ impl<'a> Fixer<'a> {
     fn new_w(&self, next: &mut usize) -> Option<W> {
         let node = *next;
         let count = self.new_leaves.get(node)?.5;
+        let pos = self.preset(node).map(|p| p.0);
         *next += 1;
         if count == 0 {
-            return Some(W::New {
-                leaf: node,
-                pos: None,
-            });
+            return Some(W::New { leaf: node, pos });
         }
         let children: Option<Vec<W>> = (0..count).map(|_| self.new_w(next)).collect();
         Some(W::NewCont {
             node,
             children: children?,
-            pos: None,
+            pos,
         })
     }
 
-    /// Everything in a new container sits at the point the container starts.
-    fn place(w: &mut W, at: (Slice, Slice)) {
-        let point = |s: Slice| Slice {
-            start: s.start,
-            stop: s.start,
-        };
+    /// The text under a node of the tree being built.
+    fn new_raw(&self, w: &W, out: &mut String) {
         match w {
-            W::New { pos, .. } => *pos = Some(at),
-            W::NewCont { pos, children, .. } => {
-                *pos = Some(at);
-                for c in children {
-                    Self::place(c, (point(at.0), point(at.1)));
-                }
+            W::Old(id) => out.push_str(&self.arena.raw(*id)),
+            W::Swap { .. } => {}
+            W::New { leaf, .. } => out.push_str(&self.new_leaves[*leaf].4),
+            W::NewCont { children, .. } | W::Cont { children, .. } => {
+                children.iter().for_each(|c| self.new_raw(c, out))
             }
-            _ => {}
         }
     }
 
-    fn new_raw(&self, w: &W, out: &mut String) {
+    /// Where the first leaf of a segment a fix brought with a position
+    /// starts, and its working location in the old tree.
+    fn first_preset_leaf(&self, w: &W) -> Option<(usize, usize, (usize, usize))> {
         match w {
-            W::New { leaf, .. } => out.push_str(&self.new_leaves[*leaf].4),
-            W::NewCont { children, .. } => children.iter().for_each(|c| self.new_raw(c, out)),
-            _ => {}
+            W::New { leaf, .. } => {
+                let ((source, templated), loc) = self.preset(*leaf)?;
+                Some((source.start, templated.start, loc))
+            }
+            W::NewCont { children, .. } => self.first_preset_leaf(children.first()?),
+            _ => None,
+        }
+    }
+
+    /// Is there anything without a position at or under this node?
+    fn needs_placing(w: &W) -> bool {
+        match w {
+            W::New { pos, .. } => pos.is_none(),
+            W::NewCont { pos, children, .. } => {
+                pos.is_none() || children.iter().any(Self::needs_placing)
+            }
+            _ => false,
         }
     }
 
@@ -232,6 +281,7 @@ impl<'a> Fixer<'a> {
         self.is_code(w)
             || matches!(w, W::Old(id) if self.arena.is_meta(*id))
             || matches!(w, W::Swap { .. })
+            || matches!(w, W::New { leaf, .. } if self.is_meta_leaf(*leaf))
     }
 
     /// The part of `_position_segments` which gives new segments a source
@@ -243,13 +293,13 @@ impl<'a> Fixer<'a> {
     /// its original children.
     fn position_new(
         &self,
-        parent: NodeId,
+        parent_start: (usize, usize),
         parent_loc: (usize, usize),
         child_loc: &HashMap<NodeId, (usize, usize)>,
         buf: &mut [W],
     ) -> Option<()> {
         let unplaced = |w: &W| matches!(w, W::New { pos: None, .. } | W::NewCont { pos: None, .. });
-        if !buf.iter().any(unplaced) {
+        if !buf.iter().any(Self::needs_placing) {
             return Some(());
         }
         // `inside_next_segment_flags`.
@@ -265,82 +315,103 @@ impl<'a> Fixer<'a> {
                 flags[idx] = next < templated.start;
             }
         }
+        // The working location each sibling starts at, as the text runs.
+        let mut loc = parent_loc;
         for idx in 0..buf.len() {
-            if !unplaced(&buf[idx]) {
-                continue;
-            }
-            // Points are (source, templated, working location). The working
-            // location is only used to compare the two, as Python does.
-            let mut start = if idx > 0 {
-                let (source, templated) = self.slices(&buf[idx - 1])?;
-                (
-                    source.stop,
-                    templated.stop,
-                    self.templated_file
-                        .get_line_pos_of_char_pos(templated.stop, false),
-                )
-            } else {
-                let p = self.arena.pos_ref(parent)?;
-                (p.source_slice.start, p.templated_slice.start, parent_loc)
-            };
-            let mut end = None;
-            for fwd in idx + 1..buf.len() {
-                if flags[fwd] {
-                    continue;
-                }
-                let (p, loc) = match &buf[fwd] {
-                    W::Old(id) | W::Swap { old: id, .. } => {
-                        // An expression which rendered nothing may sit before
-                        // a sibling at an earlier templated position: its
-                        // position is no end point.
-                        let arena = self.arena;
-                        if arena.is_type(*id, "placeholder")
-                            && arena.block_type(*id).as_deref() == Some("templated")
-                            && arena.pos_ref(*id).is_some_and(|p| {
-                                p.templated_slice.start == p.templated_slice.stop
-                                    && p.source_slice.start != p.source_slice.stop
-                            })
-                        {
-                            continue;
-                        }
-                        (arena.pos_ref(self.first_leaf(*id))?, *child_loc.get(id)?)
-                    }
-                    // Not positioned yet, or (a replace keeping its anchor's
-                    // position) a leaf this never has to look past.
-                    w if unplaced(w) => continue,
-                    _ => return None,
+            let here = loc;
+            let mut raw = String::new();
+            self.new_raw(&buf[idx], &mut raw);
+            advance(&mut loc, &raw);
+            if unplaced(&buf[idx]) {
+                // Points are (source, templated, working location). The
+                // working location is only used to compare the two, as
+                // Python does.
+                let mut start = if idx > 0 {
+                    let (source, templated) = self.slices(&buf[idx - 1])?;
+                    (
+                        source.stop,
+                        templated.stop,
+                        self.templated_file
+                            .get_line_pos_of_char_pos(templated.stop, false),
+                    )
+                } else {
+                    (parent_start.0, parent_start.1, parent_loc)
                 };
-                end = Some((p.source_slice.start, p.templated_slice.start, loc));
-                break;
-            }
-            if let Some(e) = end {
-                if idx > 0 && flags[idx - 1] {
-                    start = e;
+                let mut end = None;
+                for fwd in idx + 1..buf.len() {
+                    if flags[fwd] {
+                        continue;
+                    }
+                    end = Some(match &buf[fwd] {
+                        W::Old(id) | W::Swap { old: id, .. } => {
+                            // An expression which rendered nothing may sit
+                            // before a sibling at an earlier templated
+                            // position: its position is no end point.
+                            let arena = self.arena;
+                            if arena.is_type(*id, "placeholder")
+                                && arena.block_type(*id).as_deref() == Some("templated")
+                                && arena.pos_ref(*id).is_some_and(|p| {
+                                    p.templated_slice.start == p.templated_slice.stop
+                                        && p.source_slice.start != p.source_slice.stop
+                                })
+                            {
+                                continue;
+                            }
+                            let p = arena.pos_ref(self.first_leaf(*id))?;
+                            (
+                                p.source_slice.start,
+                                p.templated_slice.start,
+                                *child_loc.get(id)?,
+                            )
+                        }
+                        // Not positioned yet.
+                        w if unplaced(w) => continue,
+                        // Moved here with its position.
+                        w => self.first_preset_leaf(w)?,
+                    });
+                    break;
+                }
+                if let Some(e) = end {
+                    if idx > 0 && flags[idx - 1] {
+                        start = e;
+                    }
+                }
+                let new_pos = match end {
+                    Some(e) if start.2 != e.2 => (
+                        Slice {
+                            start: start.0,
+                            stop: e.0,
+                        },
+                        Slice {
+                            start: start.1,
+                            stop: e.1,
+                        },
+                    ),
+                    _ => (
+                        Slice {
+                            start: start.0,
+                            stop: start.0,
+                        },
+                        Slice {
+                            start: start.1,
+                            stop: start.1,
+                        },
+                    ),
+                };
+                if let W::New { pos, .. } | W::NewCont { pos, .. } = &mut buf[idx] {
+                    *pos = Some(new_pos);
                 }
             }
-            let new_pos = match end {
-                Some(e) if start.2 != e.2 => (
-                    Slice {
-                        start: start.0,
-                        stop: e.0,
-                    },
-                    Slice {
-                        start: start.1,
-                        stop: e.1,
-                    },
-                ),
-                _ => (
-                    Slice {
-                        start: start.0,
-                        stop: start.0,
-                    },
-                    Slice {
-                        start: start.1,
-                        stop: start.1,
-                    },
-                ),
-            };
-            Self::place(&mut buf[idx], new_pos);
+            // Then whatever is inside it, from where it now starts.
+            if let W::NewCont {
+                pos: Some(p),
+                children,
+                ..
+            } = &mut buf[idx]
+            {
+                let start = (p.0.start, p.1.start);
+                self.position_new(start, here, &HashMap::new(), children)?;
+            }
         }
         Some(())
     }
@@ -401,7 +472,11 @@ impl<'a> Fixer<'a> {
         let name = self.arena.segment_class(*from)?;
         let mut leaves = Vec::new();
         self.leaves(w, &mut leaves);
-        let is_meta = |l: &LeafRef| matches!(l, LeafRef::Old(id) if self.arena.is_meta(*id));
+        let is_meta = |l: &LeafRef| match l {
+            LeafRef::Old(id) => self.arena.is_meta(*id),
+            LeafRef::New(W::New { leaf, .. }) => self.is_meta_leaf(*leaf),
+            LeafRef::New(_) => false,
+        };
         let is_code = |l: &LeafRef| match l {
             LeafRef::Old(id) => self.arena.is_code(*id),
             LeafRef::New(w) => self.is_code(w),
@@ -530,7 +605,14 @@ impl<'a> Fixer<'a> {
                 child_loc.insert(child, loc);
                 advance(&mut loc, &arena.raw(child));
             }
-            if self.position_new(id, at, &child_loc, &mut buf).is_none() {
+            let Some(parent) = arena.pos_ref(id) else {
+                return decline("could not position a new segment");
+            };
+            let parent_start = (parent.source_slice.start, parent.templated_slice.start);
+            if self
+                .position_new(parent_start, at, &child_loc, &mut buf)
+                .is_none()
+            {
                 return decline("could not position a new segment");
             }
         }
@@ -610,7 +692,12 @@ impl<'a> Fixer<'a> {
     /// text, as a full `_position_segments` pass leaves them.
     fn build(&mut self, w: &W, loc: &mut (usize, usize)) -> Option<Node> {
         let arena = self.arena;
-        let at = *loc;
+        let at = match w {
+            W::New { leaf: n, .. } | W::NewCont { node: n, .. } if self.stale > 0 => {
+                self.preset(*n).map_or(*loc, |p| p.1)
+            }
+            _ => *loc,
+        };
         let op = |plan: &mut Plan, kind: i64, a: usize, b: usize| {
             plan.ops
                 .extend([kind, a as i64, b as i64, at.0 as i64, at.1 as i64]);
@@ -709,7 +796,10 @@ impl<'a> Fixer<'a> {
                     Some(at.1),
                 );
                 let (name, class_type, class_types, ..) = &self.new_leaves[*node];
+                let keeps = self.stale > 0 || self.preset(*node).is_some_and(|p| p.1 == at);
+                self.stale += usize::from(keeps);
                 let kids: Option<Vec<Node>> = children.iter().map(|c| self.build(c, loc)).collect();
+                self.stale -= usize::from(keeps);
                 Node::Segment {
                     segment_class: std::borrow::Cow::Owned(name.clone()),
                     segment_type: Some(std::borrow::Cow::Owned(class_type.clone())),

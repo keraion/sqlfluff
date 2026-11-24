@@ -657,6 +657,7 @@ impl PyParser {
         tree: &super::arena_py::PyTree,
         fixes: Vec<(String, usize, Vec<usize>)>,
         new_leaves: Vec<(String, String, Vec<String>, Vec<String>, String, usize)>,
+        new_positions: Vec<i64>,
         loose_ends: std::collections::HashSet<String>,
     ) -> Option<(
         super::arena_py::PyTree,
@@ -669,6 +670,9 @@ impl PyParser {
     )> {
         use super::arena_fix::{EditType, Fix, Fixer, Plan};
         let started = std::time::Instant::now();
+        if new_positions.len() != new_leaves.len() * 6 {
+            return None;
+        }
         let (node, plan) = tree.with_arena(|arena| {
             let root = arena.root();
             let mut by_anchor: std::collections::HashMap<_, Vec<Fix>> =
@@ -703,11 +707,13 @@ impl PyParser {
                 marked,
                 loose_ends: &loose_ends,
                 new_leaves: &new_leaves,
+                new_pos: &new_positions,
                 visit_all: templated_file.source_str != templated_file.templated_str,
                 templated_file,
                 validate: &mut validate,
                 plan: Plan::default(),
                 reuse: std::env::var_os("SQLFLUFF_RUST_APPLY_NO_REUSE").is_none(),
+                stale: 0,
             }
             .run()
         })?;
