@@ -189,7 +189,7 @@ not been profiled.
 Goal: no Python in lint/fix except legacy plugin rules.
 
 1. Rules in Rust: reflow first (done here, templated files included), then
-   templated reflow, then the remaining rule bodies.
+   the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
    (section 6). Left: moved subtrees, templated files, unparsable sections.
