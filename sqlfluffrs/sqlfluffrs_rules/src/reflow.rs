@@ -84,7 +84,8 @@ impl BlockConfig {
             self.line_position.clone_from(&c.line_position);
         }
         if c.keyword_line_position.is_some() {
-            self.keyword_line_position.clone_from(&c.keyword_line_position);
+            self.keyword_line_position
+                .clone_from(&c.keyword_line_position);
         }
         if let Some(v) = &c.keyword_line_position_exclusions {
             self.keyword_line_position_exclusions = v
@@ -278,8 +279,11 @@ impl<'a> Builder<'a> {
                     },
                 ));
             } else {
-                let child_stack: Rc<[NodeId]> =
-                    stack.iter().copied().chain(std::iter::once(child)).collect();
+                let child_stack: Rc<[NodeId]> = stack
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(child))
+                    .collect();
                 let child_ct: Rc<[Arc<Vec<String>>]> = class_types
                     .iter()
                     .cloned()
@@ -1081,7 +1085,13 @@ impl<'a> Reindenter<'a> {
         if let Some(s) = self.edited.get(&idx) {
             return Some(s.clone());
         }
-        Some(self.point(idx)?.segments.iter().map(|s| PSeg::Orig(*s)).collect())
+        Some(
+            self.point(idx)?
+                .segments
+                .iter()
+                .map(|s| PSeg::Orig(*s))
+                .collect(),
+        )
     }
 
     fn is_newline(&self, s: &PSeg) -> bool {
@@ -1112,7 +1122,10 @@ impl<'a> Reindenter<'a> {
     fn indent_segment(&self, segs: &[PSeg]) -> Option<usize> {
         let mut indent = None;
         for (i, s) in segs.iter().enumerate().rev() {
-            if self.is_newline(s) {
+            if matches!(s, PSeg::Orig(id) if !is_literal(self.arena, *id)) {
+                // Templated newlines and whitespace are no indent.
+                continue;
+            } else if self.is_newline(s) {
                 return indent;
             } else if self.is_whitespace(s) {
                 indent = Some(i);
@@ -1124,7 +1137,11 @@ impl<'a> Reindenter<'a> {
     /// `_deduce_line_current_indent`.
     fn current_indent(&self, last_line_break_idx: Option<usize>) -> Option<String> {
         let first_is_point = self.point(0).is_some();
-        let first_segs = if first_is_point { self.segs(0)? } else { Vec::new() };
+        let first_segs = if first_is_point {
+            self.segs(0)?
+        } else {
+            Vec::new()
+        };
         if first_is_point && first_segs.is_empty() {
             return Some(String::new());
         }
@@ -1141,14 +1158,29 @@ impl<'a> Reindenter<'a> {
             };
             if self.arena.pos_marker(*first)?.working_loc() == (1, 1) {
                 // The last whitespace, else whatever the scan ended on.
-                let found = first_segs.iter().rev().find(|s| self.is_whitespace(s));
+                let literal =
+                    |s: &&PSeg| !matches!(s, PSeg::Orig(id) if !is_literal(self.arena, *id));
+                let found = first_segs
+                    .iter()
+                    .rev()
+                    .find(|s| self.is_whitespace(s) && literal(s));
+                if found.is_none() && self.is_whitespace(&first_segs[0]) {
+                    // Python raises on a templated indent here.
+                    return None;
+                }
                 return Some(found.map_or_else(String::new, |s| self.raw(s)));
             }
         }
         Some(String::new())
     }
 
-    fn push(&mut self, anchor: NodeId, description: String, source: &'static str, fixes: Vec<IndentFix>) {
+    fn push(
+        &mut self,
+        anchor: NodeId,
+        description: String,
+        source: &'static str,
+        fixes: Vec<IndentFix>,
+    ) {
         self.results.push(IndentResult {
             anchor,
             description,
@@ -1158,7 +1190,13 @@ impl<'a> Reindenter<'a> {
     }
 
     /// `ReflowPoint.indent_to(desired, before=..., source=...)`.
-    fn indent_to(&mut self, idx: usize, desired: &str, before: NodeId, source: &'static str) -> Option<()> {
+    fn indent_to(
+        &mut self,
+        idx: usize,
+        desired: &str,
+        before: NodeId,
+        source: &'static str,
+    ) -> Option<()> {
         self.indent_to_anchor(idx, desired, before, false, source)
     }
 
@@ -1216,7 +1254,10 @@ impl<'a> Reindenter<'a> {
                 if desired.is_empty() {
                     return Some(());
                 }
-                let i = segs.iter().rposition(|s| self.is_newline(s))?;
+                let i = segs.iter().rposition(|s| {
+                    self.is_newline(s)
+                        && !matches!(s, PSeg::Orig(id) if !is_literal(self.arena, *id))
+                })?;
                 let PSeg::Orig(newline) = segs[i] else {
                     return None;
                 };
@@ -1346,7 +1387,11 @@ impl<'a> Reindenter<'a> {
     }
 
     /// `_lint_line_untaken_positive_indents`: the indents it forced.
-    fn lint_untaken_positive(&mut self, line: &IndentLine, imbalanced: &[usize]) -> Option<Vec<i32>> {
+    fn lint_untaken_positive(
+        &mut self,
+        line: &IndentLine,
+        imbalanced: &[usize],
+    ) -> Option<Vec<i32>> {
         let mut forced: Vec<i32> = Vec::new();
         for ip in &line.points {
             if imbalanced.contains(&ip.idx) {
@@ -1369,7 +1414,12 @@ impl<'a> Reindenter<'a> {
         if last.initial_balance + last.trough <= starting_balance {
             return Some(forced);
         }
-        let mut closing_trough = last.initial_balance + if last.trough != 0 { last.trough } else { last.impulse };
+        let mut closing_trough = last.initial_balance
+            + if last.trough != 0 {
+                last.trough
+            } else {
+                last.impulse
+            };
         let mut bal = 0;
         for i in last.idx + 1..self.elements.len() {
             match &self.elements[i] {
@@ -1419,7 +1469,9 @@ impl<'a> Reindenter<'a> {
             if all_untaken {
                 continue;
             }
-            if self.block_is(ip.idx + 1, "statement_terminator") || self.block_is(ip.idx + 1, "comma") {
+            if self.block_is(ip.idx + 1, "statement_terminator")
+                || self.block_is(ip.idx + 1, "comma")
+            {
                 continue;
             }
             let desired = self.indent(
@@ -1433,7 +1485,12 @@ impl<'a> Reindenter<'a> {
 }
 
 /// `_prune_untaken_indents` + `_update_crawl_balances`.
-fn update_crawl_balances(untaken: &mut Vec<i32>, balance: &mut i32, stats: &Stats, has_newline: bool) {
+fn update_crawl_balances(
+    untaken: &mut Vec<i32>,
+    balance: &mut i32,
+    stats: &Stats,
+    has_newline: bool,
+) {
     let (impulse, trough, implicit) = stats;
     let limit = if trough < impulse {
         *balance + impulse + trough
@@ -1452,12 +1509,21 @@ fn update_crawl_balances(untaken: &mut Vec<i32>, balance: &mut i32, stats: &Stat
 }
 
 /// `_crawl_indent_points`.
-fn crawl_indent_points(arena: &Arena, elements: &[Element], implicit_indents: &str) -> Option<Vec<IndentPoint>> {
+fn crawl_indent_points(
+    arena: &Arena,
+    elements: &[Element],
+    implicit_indents: &str,
+) -> Option<Vec<IndentPoint>> {
     let is_block_type = |i: usize, t: &str| match elements.get(i) {
         Some(Element::Block(b)) => arena.is_type(b.segment, t),
         _ => false,
     };
-    let point_has_newline = |p: &Point| p.segments.iter().any(|s| arena.is_type(*s, "newline"));
+    // `has_untemplated_newline`: a newline a template rendered is no line break.
+    let point_has_newline = |p: &Point| {
+        p.segments
+            .iter()
+            .any(|s| arena.is_type(*s, "newline") && is_literal(arena, *s))
+    };
 
     let mut out = Vec::new();
     let mut last_line_break_idx: Option<usize> = None;
@@ -1496,7 +1562,9 @@ fn crawl_indent_points(arena: &Arena, elements: &[Element], implicit_indents: &s
                             }
                         }
                         Element::Block(b) => {
-                            if arena.is_type(b.segment, "end_bracket") && b.depth_info.stack.len() == depth {
+                            if arena.is_type(b.segment, "end_bracket")
+                                && b.depth_info.stack.len() == depth
+                            {
                                 unclosed = false;
                                 break;
                             }
@@ -1552,7 +1620,13 @@ fn crawl_indent_points(arena: &Arena, elements: &[Element], implicit_indents: &s
             last_line_break_idx = Some(idx);
         }
 
-        if is_block_type(idx + 1, "comment") {
+        // An empty placeholder, or an expression on the same line, can't take
+        // an indent either.
+        let placeholder_defers = is_block_type(idx + 1, "placeholder")
+            && (arena.source_str(next.segment) == Some("")
+                || (!has_newline
+                    && arena.block_type(next.segment).as_deref() == Some("templated")));
+        if is_block_type(idx + 1, "comment") || placeholder_defers {
             cached_stats = Some(stats);
             cached_point = Some(indent_point);
             continue;
@@ -1570,7 +1644,11 @@ fn crawl_indent_points(arena: &Arena, elements: &[Element], implicit_indents: &s
 }
 
 /// `_map_line_buffers`: the lines, and the imbalanced indent locations.
-fn map_line_buffers(arena: &Arena, elements: &[Element], implicit_indents: &str) -> Option<(Vec<IndentLine>, Vec<usize>)> {
+fn map_line_buffers(
+    arena: &Arena,
+    elements: &[Element],
+    implicit_indents: &str,
+) -> Option<(Vec<IndentLine>, Vec<usize>)> {
     let is_block_type = |i: usize, t: &str| match elements.get(i) {
         Some(Element::Block(b)) => arena.is_type(b.segment, t),
         _ => false,
@@ -1588,7 +1666,9 @@ fn map_line_buffers(arena: &Arena, elements: &[Element], implicit_indents: &str)
             return None;
         };
         if !ip.is_line_break {
-            if ip.impulse > ip.trough && !(implicit_indents != "forbid" && !point.implicit_indents.is_empty()) {
+            if ip.impulse > ip.trough
+                && !(implicit_indents != "forbid" && !point.implicit_indents.is_empty())
+            {
                 untaken_locs.insert(ip.initial_balance + ip.impulse, ip.idx);
             }
             continue;
@@ -1619,7 +1699,10 @@ fn map_line_buffers(arena: &Arena, elements: &[Element], implicit_indents: &str)
                     }
                 }
                 let pt = pt?;
-                if (pt.idx + 1..ip.idx).step_by(2).all(|k| is_block_type(k, "comment")) {
+                if (pt.idx + 1..ip.idx)
+                    .step_by(2)
+                    .all(|k| is_block_type(k, "comment"))
+                {
                     continue;
                 }
                 imbalanced.push(loc);
@@ -1634,16 +1717,25 @@ fn map_line_buffers(arena: &Arena, elements: &[Element], implicit_indents: &str)
     Some((lines, imbalanced))
 }
 
-/// Is the rendered file the source file, character for character? Only then
-/// is every position literal and every segment's source text its raw.
-fn is_untemplated(arena: &Arena, seq: &ReflowSequence) -> bool {
-    let Some(pm) = seq.depth_map.iter().find_map(|(seg, _)| arena.pos_marker(*seg)) else {
-        return false;
-    };
-    pm.templated_file.source_str == pm.templated_file.templated_str
-        && !seq.depth_map.iter().any(|(seg, _)| {
-            arena.is_type(*seg, "placeholder") || arena.is_type(*seg, "template_loop")
-        })
+fn is_literal(arena: &Arena, seg: NodeId) -> bool {
+    arena.pos_marker(seg).is_none_or(|pm| pm.is_literal())
+}
+
+/// The templating `reindent` covers: none, or only tags which aren't blocks
+/// (expressions, comments, `set`). Blocks, loops, skipped source and tags
+/// which consume whitespace are left to Python.
+fn templating_covered(arena: &Arena, seq: &ReflowSequence) -> bool {
+    seq.elements.iter().all(|e| match e {
+        Element::Block(b) => {
+            !arena.is_type(b.segment, "template_loop")
+                && (!arena.is_type(b.segment, "placeholder")
+                    || matches!(
+                        arena.block_type(b.segment).as_deref(),
+                        Some("templated") | Some("comment")
+                    ))
+        }
+        Element::Point(p) => !p.segments.iter().any(|s| arena.is_type(*s, "placeholder")),
+    })
 }
 
 /// `ReflowSequence.reindent()`. `None` = a case this doesn't cover.
@@ -1671,12 +1763,25 @@ pub fn reindent(
             return None;
         }
     }
-    if !is_untemplated(arena, seq) {
+    if !templating_covered(arena, seq) {
         return None;
     }
 
     let elements = &seq.elements[..];
     let (mut lines, imbalanced) = map_line_buffers(arena, elements, &options.implicit_indents)?;
+
+    // The end of `_revise_templated_lines`: a line starting with a tag which
+    // spans lines isn't linted.
+    lines.retain(|line| {
+        let Some(Element::Block(b)) = elements.get(line.points[0].idx + 1) else {
+            return true;
+        };
+        let Some(pm) = arena.pos_marker(b.segment) else {
+            return true;
+        };
+        let src = pm.source_str();
+        !(src != arena.raw(b.segment) && src.contains('\n'))
+    });
 
     // `_revise_comment_lines`.
     let all_comments = |line: &IndentLine| {
@@ -1719,10 +1824,11 @@ pub fn reindent(
                 Element::Block(b) => *skip_cache
                     .entry(b.depth_info.stack.as_ptr())
                     .or_insert_with(|| {
-                        b.depth_info
-                            .stack_class_types
-                            .iter()
-                            .any(|types| types.iter().any(|t| options.skip_indentation_in.contains(t)))
+                        b.depth_info.stack_class_types.iter().any(|types| {
+                            types
+                                .iter()
+                                .any(|t| options.skip_indentation_in.contains(t))
+                        })
                     }),
                 Element::Point(_) => false,
             })
@@ -1766,7 +1872,7 @@ pub struct LongLineOptions {
     pub max_line_length: i64,
 }
 
-/// `_source_char_len`, where a segment's source text is its raw.
+/// `_source_char_len`.
 fn source_char_len(arena: &Arena, elements: &[Element]) -> Option<usize> {
     let mut char_len = 0usize;
     let mut last_slice: Option<(usize, usize)> = None;
@@ -1781,18 +1887,24 @@ fn source_char_len(arena: &Arena, elements: &[Element]) -> Option<usize> {
             }
             let pm = arena.pos_marker(seg)?;
             let slice = (pm.source_slice.start, pm.source_slice.stop);
-            let raw = arena.raw(seg);
-            if let Some(pos) = raw.find('\n') {
-                return Some(char_len + raw[..pos].chars().count());
+            // A tag which spans lines: stop at its first newline.
+            let source = pm.source_str();
+            if let Some(pos) = source.find('\n') {
+                return Some(char_len + source[..pos].chars().count());
             }
             let slice_len = slice.1.saturating_sub(slice.0);
             if Some(slice) != last_slice {
+                let raw = arena.raw(seg);
                 if !raw.is_empty() && slice_len == 0 {
                     char_len += raw.chars().count();
                 } else if slice_len == 0 {
                     continue;
-                } else {
+                } else if pm.is_literal() {
                     char_len += raw.chars().count();
+                    last_slice = Some(slice);
+                } else {
+                    // Templated code is as long as its source.
+                    char_len += slice_len;
                     last_slice = Some(slice);
                 }
             }
@@ -1844,7 +1956,16 @@ fn rebreak_priorities(arena: &Arena, line: &[Element]) -> Option<HashMap<usize, 
         let Element::Block(elem) = &line[idx] else {
             continue;
         };
-        if let Some(lp) = elem.config.line_position.as_deref().filter(|lp| !lp.is_empty()) {
+        if let Some(lp) = elem
+            .config
+            .line_position
+            .as_deref()
+            .filter(|lp| !lp.is_empty())
+        {
+            // No breaking inside what a tag rendered.
+            if !is_literal(arena, elem.segment) {
+                continue;
+            }
             add(elem.segment, idx, idx, lp)?;
         }
         for (key, config) in &elem.line_position_configs {
@@ -1936,7 +2057,10 @@ fn match_indents(
             matched.entry(key).or_default().push(e_idx);
         }
         if let Some(priority) = priorities.get(&idx) {
-            matched.entry(balance * 100 + 50 + priority).or_default().push(e_idx);
+            matched
+                .entry(balance * 100 + 50 + priority)
+                .or_default()
+                .push(e_idx);
         }
     }
     matched.retain(|_, v| v.as_slice() != [newline_idx]);
@@ -1948,7 +2072,12 @@ fn match_indents(
 
 impl<'a> Reindenter<'a> {
     /// `indent_to`, returning the fixes instead of recording a result.
-    fn indent_to_fixes(&mut self, idx: usize, desired: &str, before: NodeId) -> Option<Vec<IndentFix>> {
+    fn indent_to_fixes(
+        &mut self,
+        idx: usize,
+        desired: &str,
+        before: NodeId,
+    ) -> Option<Vec<IndentFix>> {
         let mark = self.results.len();
         self.indent_to(idx, desired, before, "")?;
         Some(self.results.drain(mark..).flat_map(|r| r.fixes).collect())
@@ -1978,6 +2107,10 @@ impl<'a> Reindenter<'a> {
             return Some(Vec::new());
         }
         if (raw.chars().count() + current_indent.chars().count()) as i64 > options.max_line_length {
+            return Some(Vec::new());
+        }
+        // A comment with a tag in its source can't be moved.
+        if !is_literal(self.arena, comment) {
             return Some(Vec::new());
         }
         let point_idx = line.end - 2;
@@ -2041,7 +2174,11 @@ impl<'a> Reindenter<'a> {
             };
             let group = &breaks[idx..idx + group_len];
             idx += group_len;
-            let next = if idx < breaks.len() { breaks[idx] } else { line.end };
+            let next = if idx < breaks.len() {
+                breaks[idx]
+            } else {
+                line.end
+            };
             let len = source_char_len(self.arena, self.elements.get(start..next)?)?;
             if (indent_len + len) as i64 > limit {
                 chosen.extend_from_slice(group);
@@ -2053,7 +2190,13 @@ impl<'a> Reindenter<'a> {
     }
 
     /// `_fix_long_line_with_integer_targets`.
-    fn fix_integer_targets(&mut self, breaks: &[usize], limit: i64, inner: &str, outer: &str) -> Option<Vec<IndentFix>> {
+    fn fix_integer_targets(
+        &mut self,
+        breaks: &[usize],
+        limit: i64,
+        inner: &str,
+        outer: &str,
+    ) -> Option<Vec<IndentFix>> {
         let mut purge_before = 0;
         for &e_idx in breaks {
             let next = self.block(e_idx + 1)?.segment;
@@ -2070,7 +2213,9 @@ impl<'a> Reindenter<'a> {
             let point = self.point(e_idx)?;
             let (impulse, trough) = (point.impulse, point.trough);
             let new_indent = if impulse < 0 {
-                if self.block_is(e_idx + 1, "statement_terminator") || self.block_is(e_idx + 1, "comma") {
+                if self.block_is(e_idx + 1, "statement_terminator")
+                    || self.block_is(e_idx + 1, "comma")
+                {
                     break;
                 }
                 outer
@@ -2100,7 +2245,9 @@ impl<'a> Reindenter<'a> {
                         return None;
                     };
                     arena.is_type(next.segment, "end_of_file")
-                        || p.segments.iter().any(|s| arena.is_type(*s, "newline"))
+                        || p.segments
+                            .iter()
+                            .any(|s| arena.is_type(*s, "newline") && is_literal(arena, *s))
                 }
                 Element::Block(_) => false,
             };
@@ -2141,15 +2288,39 @@ impl<'a> Reindenter<'a> {
                     if let Some(pos) = breaks.iter().position(|b| *b == i) {
                         breaks.remove(pos);
                     }
+                    // `_is_templated_safe_break`: not between two segments a
+                    // tag rendered.
+                    breaks.retain(|&e| {
+                        let before = match e.checked_sub(1).and_then(|i| elements.get(i)) {
+                            Some(Element::Block(b)) => Some(b.segment),
+                            Some(Element::Point(p)) => p.segments.last().copied(),
+                            None => None,
+                        };
+                        let after = match elements.get(e + 1) {
+                            Some(Element::Block(b)) => Some(b.segment),
+                            Some(Element::Point(p)) => p.segments.first().copied(),
+                            None => None,
+                        };
+                        before.is_none_or(|s| is_literal(arena, s))
+                            || after.is_none_or(|s| is_literal(arena, s))
+                    });
                     if breaks.is_empty() {
                         Vec::new()
                     } else if target % 100 == 0 {
                         self.fix_integer_targets(&breaks, limit, &desired, &current_indent)?
                     } else {
                         if options.list_wrapping == "fill"
-                            && breaks.iter().all(|e| self.block_is(e - 1, "comma") || self.block_is(e + 1, "comma"))
+                            && breaks.iter().all(|e| {
+                                self.block_is(e - 1, "comma") || self.block_is(e + 1, "comma")
+                            })
                         {
-                            breaks = self.fill_breaks(&breaks, start..i, &current_indent, &desired, limit)?;
+                            breaks = self.fill_breaks(
+                                &breaks,
+                                start..i,
+                                &current_indent,
+                                &desired,
+                                limit,
+                            )?;
                         }
                         let mut fixes = Vec::new();
                         for e_idx in breaks {
@@ -2175,7 +2346,11 @@ impl<'a> Reindenter<'a> {
 }
 
 /// `ReflowSequence.break_long_lines()`. `None` = a case this doesn't cover.
-pub fn break_long_lines(arena: &Arena, seq: &ReflowSequence, options: &LongLineOptions) -> Option<Vec<IndentResult>> {
+pub fn break_long_lines(
+    arena: &Arena,
+    seq: &ReflowSequence,
+    options: &LongLineOptions,
+) -> Option<Vec<IndentResult>> {
     if options.max_line_length <= 0 {
         return Some(Vec::new());
     }
@@ -2184,7 +2359,7 @@ pub fn break_long_lines(arena: &Arena, seq: &ReflowSequence, options: &LongLineO
         "space" => " ".repeat(options.tab_space_size),
         _ => return None,
     };
-    if !is_untemplated(arena, seq) {
+    if !templating_covered(arena, seq) {
         return None;
     }
     let mut r = Reindenter {
@@ -2206,7 +2381,12 @@ pub fn break_long_lines(arena: &Arena, seq: &ReflowSequence, options: &LongLineO
 /// `_RebreakIndices.from_elements(...).newline_pt_idx`. `Ok(None)` is
 /// Python's `UnboundLocalError` (the location is skipped); `Err` is a case
 /// where Python would index out of range.
-fn newline_point_idx(arena: &Arena, elements: &[Element], start_idx: usize, forward: bool) -> Result<Option<usize>, ()> {
+fn newline_point_idx(
+    arena: &Arena,
+    elements: &[Element],
+    start_idx: usize,
+    forward: bool,
+) -> Result<Option<usize>, ()> {
     let len = elements.len() as i64;
     let dir: i64 = if forward { 1 } else { -1 };
     let mut i = start_idx as i64 + dir;
@@ -2336,7 +2516,12 @@ impl<'a> Reindenter<'a> {
     fn num_newlines(&self, idx: usize) -> Option<usize> {
         match self.elements.get(idx)? {
             Element::Block(b) => Some(usize::from(self.arena.is_type(b.segment, "newline"))),
-            Element::Point(_) => Some(self.segs(idx)?.iter().filter(|s| self.is_newline(s)).count()),
+            Element::Point(_) => Some(
+                self.segs(idx)?
+                    .iter()
+                    .filter(|s| self.is_newline(s))
+                    .count(),
+            ),
         }
     }
 
@@ -2352,7 +2537,12 @@ impl<'a> Reindenter<'a> {
         })
     }
 
-    fn indent_to_fixes_after(&mut self, idx: usize, desired: &str, after: NodeId) -> Option<Vec<IndentFix>> {
+    fn indent_to_fixes_after(
+        &mut self,
+        idx: usize,
+        desired: &str,
+        after: NodeId,
+    ) -> Option<Vec<IndentFix>> {
         let mark = self.results.len();
         self.indent_to_anchor(idx, desired, after, true, "")?;
         Some(self.results.drain(mark..).flat_map(|r| r.fixes).collect())
@@ -2464,7 +2654,8 @@ impl<'a> Reindenter<'a> {
                 let mut prev_i = ws - 1;
                 for i in (0..ws).rev() {
                     prev_i = i;
-                    let is_indent = matches!(&segs[i], PSeg::Orig(id) if arena.is_type(*id, "indent"));
+                    let is_indent =
+                        matches!(&segs[i], PSeg::Orig(id) if arena.is_type(*id, "indent"));
                     if !is_indent {
                         break;
                     }
@@ -2491,7 +2682,7 @@ impl<'a> Reindenter<'a> {
 
 /// `ReflowSequence.rebreak("keywords")`. `None` = a case this doesn't cover.
 pub fn rebreak_keywords(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<IndentResult>> {
-    if !is_untemplated(arena, seq) {
+    if !templating_covered(arena, seq) {
         return None;
     }
     let elements = &seq.elements[..];
@@ -2503,9 +2694,33 @@ pub fn rebreak_keywords(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<Inden
         single_indent: String::new(),
     };
     for loc in keyword_locations(arena, elements)? {
-        let (n_prev, n_next) = (r.num_newlines(loc.prev_newline)?, r.num_newlines(loc.next_newline)?);
+        let (n_prev, n_next) = (
+            r.num_newlines(loc.prev_newline)?,
+            r.num_newlines(loc.next_newline)?,
+        );
         // `has_inappropriate_newlines(strict=True)`.
         if n_prev > 0 && n_next > 0 && !loc.attached {
+            continue;
+        }
+        // `has_templated_newline`: the last newline before, or the first
+        // after, came from a tag.
+        let newlines = |idx: usize| -> Vec<NodeId> {
+            let segs: &[NodeId] = match &elements[idx] {
+                Element::Point(p) => &p.segments,
+                Element::Block(b) => std::slice::from_ref(&b.segment),
+            };
+            segs.iter()
+                .copied()
+                .filter(|s| arena.is_type(*s, "newline"))
+                .collect()
+        };
+        if newlines(loc.prev_newline)
+            .last()
+            .is_some_and(|s| !is_literal(arena, *s))
+            || newlines(loc.next_newline)
+                .first()
+                .is_some_and(|s| !is_literal(arena, *s))
+        {
             continue;
         }
         let name = pretty_segment_name(arena, loc.target);
@@ -2528,7 +2743,10 @@ pub fn rebreak_keywords(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<Inden
                 let after = r.block(loc.next_adj - 1)?.segment;
                 let mut fixes = r.indent_to_fixes_after(loc.next_adj, &indent, after)?;
                 fixes.extend(r.respace_stripping(loc.prev_adj)?);
-                (fixes, format!("The {name} should always be at the end of a line."))
+                (
+                    fixes,
+                    format!("The {name} should always be at the end of a line."),
+                )
             }
             "alone" => {
                 // Python keeps only the fixes from the last of these to run.

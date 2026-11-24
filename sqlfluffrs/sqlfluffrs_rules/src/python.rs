@@ -73,7 +73,11 @@ thread_local! {
 fn with_sequence<R>(
     tree: &PyTree,
     layout: Layout,
-    f: impl FnOnce(&sqlfluffrs_parser::Arena, &crate::reflow::ReflowConfig, &crate::reflow::ReflowSequence) -> R,
+    f: impl FnOnce(
+        &sqlfluffrs_parser::Arena,
+        &crate::reflow::ReflowConfig,
+        &crate::reflow::ReflowSequence,
+    ) -> R,
 ) -> R {
     tree.with_arena(|arena| {
         let key = arena.uuid(arena.root());
@@ -175,7 +179,12 @@ fn reflow_reindent(
     })
 }
 
-type PyIndentResults = Vec<(usize, String, &'static str, Vec<(&'static str, usize, String, Option<usize>)>)>;
+type PyIndentResults = Vec<(
+    usize,
+    String,
+    &'static str,
+    Vec<(&'static str, usize, String, Option<usize>)>,
+)>;
 
 fn indent_results_to_py(
     seq: &crate::reflow::ReflowSequence,
@@ -196,7 +205,14 @@ fn indent_results_to_py(
                 r.source,
                 r.fixes
                     .into_iter()
-                    .map(|f| (f.kind.as_str(), leaf[&f.target], f.text, f.extra.map(|e| leaf[&e])))
+                    .map(|f| {
+                        (
+                            f.kind.as_str(),
+                            leaf[&f.target],
+                            f.text,
+                            f.extra.map(|e| leaf[&e]),
+                        )
+                    })
                     .collect(),
             )
         })
