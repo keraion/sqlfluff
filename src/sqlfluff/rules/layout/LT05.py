@@ -41,13 +41,10 @@ class Rule_LT05(BaseRule):
     def _eval_rust(self, context: RuleContext) -> Optional[list[LintResult]]:
         """SPIKE: long lines in Rust over the arena. See ``BaseRule._eval_rust``.
 
-        Returns ``None`` (Python path) when the extension has no support, when
-        either comment-ignoring option is on (they filter the results after
-        the fact), or when Rust reports a case it doesn't cover.
+        Returns ``None`` (Python path) when the extension has no support, or
+        when Rust reports a case it doesn't cover.
         """
         if not _HAS_RUST_LONG_LINE or os.environ.get("SQLFLUFF_NO_RUST_LT05"):
-            return None
-        if self.ignore_comment_lines or self.ignore_comment_clauses:
             return None
         rs_tree = getattr(context.segment, "_rs_tree", None) or getattr(
             context.segment, "_rs_tree_rebuilt", None
@@ -79,19 +76,14 @@ class Rule_LT05(BaseRule):
         )
         if found is None:
             return None
-        return results_from_rust(context.segment.raw_segments, found)
-
-    def _eval(self, context: RuleContext) -> list[LintResult]:
-        """Line is too long."""
-        self.ignore_comment_lines: bool
-        self.ignore_comment_clauses: bool
-        # Reflow and generate fixes.
-        results = (
-            ReflowSequence.from_root(context.segment, context.config)
-            .break_long_lines()
-            .get_results()
+        return self._purge_comment_results(
+            context, results_from_rust(context.segment.raw_segments, found)
         )
 
+    def _purge_comment_results(
+        self, context: RuleContext, results: list[LintResult]
+    ) -> list[LintResult]:
+        """Drop the results the comment-ignoring options excuse."""
         # Ignore any comment line if appropriate.
         if self.ignore_comment_lines:
             raw_segments = context.segment.raw_segments
@@ -200,3 +192,16 @@ class Rule_LT05(BaseRule):
                     break
 
         return results
+
+    def _eval(self, context: RuleContext) -> list[LintResult]:
+        """Line is too long."""
+        self.ignore_comment_lines: bool
+        self.ignore_comment_clauses: bool
+        # Reflow and generate fixes.
+        results = (
+            ReflowSequence.from_root(context.segment, context.config)
+            .break_long_lines()
+            .get_results()
+        )
+
+        return self._purge_comment_results(context, results)

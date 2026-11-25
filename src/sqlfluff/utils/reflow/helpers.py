@@ -72,6 +72,16 @@ def results_from_rust(raws: list[RawSegment], found: list[Any]) -> list[LintResu
             target = raws[target_idx]
             if kind == "delete":
                 fixes.append(LintFix.delete(target))
+            elif kind == "collapse_newline":
+                # A line break after an implicit indent: keep the point's
+                # implicit indents (the targets of this result's fixes are
+                # the point's segments) and put a single space.
+                kept: list[BaseSegment] = [
+                    seg
+                    for seg in (raws[spec[1]] for spec in fix_specs)
+                    if seg.is_type("indent") and getattr(seg, "is_implicit", False)
+                ]
+                fixes.append(LintFix.replace(target, [*kept, WhitespaceSegment(" ")]))
             elif kind == "edit_source":
                 # A tag's consumed whitespace: the edit is to the source.
                 edit, src_start, src_stop, tmpl_start, tmpl_stop = source_fix

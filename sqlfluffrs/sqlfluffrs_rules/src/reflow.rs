@@ -893,6 +893,7 @@ pub struct ReindentOptions {
     pub implicit_indents: String,
     pub ignore_comment_lines: bool,
     pub skip_indentation_in: Vec<String>,
+    pub skip_implicit_indents_in: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -917,6 +918,9 @@ pub enum IndentFixKind {
     CreateSpaceAfter,
     /// Create a single space before the target.
     CreateSpaceBefore,
+    /// Replace the target with the implicit indents of its point and a single
+    /// space. The result's other fixes delete the rest of that point.
+    CollapseNewline,
     /// Replace the target placeholder (a tag's consumed whitespace) with one
     /// whose source is `text`, through the fix's `source_fix`.
     EditSource,
@@ -935,6 +939,7 @@ impl IndentFixKind {
             IndentFixKind::CreateSpaceAfter => "create_space_after",
             IndentFixKind::CreateSpaceBefore => "create_space_before",
             IndentFixKind::EditSource => "edit_source",
+            IndentFixKind::CollapseNewline => "collapse_newline",
         }
     }
 }
@@ -1436,12 +1441,23 @@ impl<'a> Reindenter<'a> {
     }
 
     /// `_lint_line_starting_indent`.
-    fn lint_starting_indent(&mut self, line: &IndentLine, forced: &[i32]) -> Option<()> {
+    fn lint_starting_indent(
+        &mut self,
+        line: &IndentLine,
+        forced: &[i32],
+        compensation: usize,
+    ) -> Option<()> {
         let first = &line.points[0];
         let idx = first.idx;
         let before = self.block(idx + 1)?.segment;
         let current = self.current_indent(line.points.last()?.last_line_break_idx)?;
-        let desired = self.indent(line.desired_indent_units(forced));
+        let units = line.desired_indent_units(forced);
+        let mut desired = self.indent(units);
+        // `_calculate_desired_starting_indent`.
+        let width = desired.chars().count();
+        if compensation > 0 && units != 0 && width >= compensation {
+            desired = desired.chars().take(width - compensation).collect();
+        }
         if current == desired {
             return Some(());
         }
@@ -1770,7 +1786,7 @@ fn map_line_buffers(
     arena: &Arena,
     elements: &[Element],
     implicit_indents: &str,
-) -> Option<(Vec<IndentLine>, Vec<usize>)> {
+) -> Option<(Vec<IndentLine>, Vec<usize>, Vec<usize>)> {
     let is_block_type = |i: usize, t: &str| match elements.get(i) {
         Some(Element::Block(b)) => arena.is_type(b.segment, t),
         _ => false,
@@ -1780,6 +1796,7 @@ fn map_line_buffers(
     let mut previous: HashMap<usize, IndentPoint> = HashMap::new();
     let mut untaken_locs: HashMap<i32, usize> = HashMap::new();
     let mut imbalanced: Vec<usize> = Vec::new();
+    let mut implicit_locs: Vec<usize> = Vec::new();
 
     for ip in crawl_indent_points(arena, elements, implicit_indents)? {
         buffer.push(ip.clone());
@@ -1787,6 +1804,10 @@ fn map_line_buffers(
         let Some(Element::Point(point)) = elements.get(ip.idx) else {
             return None;
         };
+        // A line break straight after an implicit indent: one to collapse.
+        if implicit_indents == "require" && !point.implicit_indents.is_empty() && ip.is_line_break {
+            implicit_locs.push(ip.idx);
+        }
         if !ip.is_line_break {
             if ip.impulse > ip.trough
                 && !(implicit_indents != "forbid" && !point.implicit_indents.is_empty())
@@ -1836,7 +1857,7 @@ fn map_line_buffers(
     if buffer.len() > 1 {
         lines.push(IndentLine::from_points(buffer));
     }
-    Some((lines, imbalanced))
+    Some((lines, imbalanced, implicit_locs))
 }
 
 /// `has_untemplated_newline`: a literal newline, or one a tag consumed. A
@@ -2320,17 +2341,22 @@ pub fn reindent(
         "space" => " ".repeat(options.tab_space_size),
         _ => return None,
     };
-    if options.implicit_indents == "require" {
-        return None;
-    }
+    // A leading comma or operator may be set to line up what follows it:
+    // its type, and the spaces after it.
+    let mut align_following: Vec<(&str, usize)> = Vec::new();
     for t in ["comma", "binary_operator"] {
-        let aligned = config
-            .types
-            .get(t)
-            .and_then(|c| c.line_position.as_deref())
-            .is_some_and(|lp| lp == "leading:align-following");
-        if aligned {
-            return None;
+        let Some(c) = config.types.get(t) else {
+            continue;
+        };
+        if c.line_position.as_deref() == Some("leading:align-following") {
+            align_following.push((
+                t,
+                match c.spacing_after.as_deref() {
+                    None | Some("single") => 1,
+                    Some("touch") => 0,
+                    _ => return None,
+                },
+            ));
         }
     }
 
@@ -2339,7 +2365,9 @@ pub fn reindent(
     // linted against the originals, as in Python.
     let rebalanced = rebalance_unrendered(arena, elements);
     let mapped = rebalanced.as_deref().unwrap_or(elements);
-    let (mut lines, imbalanced) = map_line_buffers(arena, mapped, &options.implicit_indents)?;
+    let (mut lines, mut imbalanced, mut implicit_locs) =
+        map_line_buffers(arena, mapped, &options.implicit_indents)?;
+    imbalanced.retain(|i| !implicit_locs.contains(i));
     revise_skipped_source_lines(arena, mapped, &mut lines)?;
     revise_templated_lines(arena, mapped, &mut lines)?;
     revise_loop_repeated_lines(arena, mapped, &mut lines);
@@ -2405,8 +2433,17 @@ pub fn reindent(
     };
     let mut forced: Vec<i32> = Vec::new();
     for line in &lines {
+        // `_calculate_indent_compensation`: a line led by an aligning comma
+        // or operator gives up that much of its indent.
+        let compensation = line_blocks(elements, line).first().map_or(0, |seg| {
+            let seg_type = arena.get_type(*seg);
+            align_following
+                .iter()
+                .find(|(t, _)| *t == seg_type)
+                .map_or(0, |(_, after)| arena.raw(*seg).chars().count() + after)
+        });
         // `_lint_line_buffer_indents`.
-        r.lint_starting_indent(line, &forced)?;
+        r.lint_starting_indent(line, &forced, compensation)?;
         let new_indents = r.lint_untaken_positive(line, &imbalanced)?;
         if !new_indents.is_empty() {
             forced.extend(new_indents);
@@ -2416,7 +2453,67 @@ pub fn reindent(
         let closing = line.closing_balance();
         forced.retain(|i| *i <= closing);
     }
-    Some(r.results)
+
+    // `implicit_indents = require`: collapse the line breaks after implicit
+    // indents (`_convert_newlines_to_spaces`), unless configured not to.
+    let mut results = r.results;
+    if options.implicit_indents == "require" && !implicit_locs.is_empty() {
+        if !options.skip_implicit_indents_in.is_empty() {
+            implicit_locs.retain(|i| match elements.get(i + 1) {
+                Some(Element::Block(b)) => !b.depth_info.stack_class_types.iter().any(|types| {
+                    types
+                        .iter()
+                        .any(|t| options.skip_implicit_indents_in.contains(t))
+                }),
+                _ => true,
+            });
+        }
+        implicit_locs.sort_unstable();
+        implicit_locs.dedup();
+        let mut collapsed: Vec<IndentResult> = Vec::new();
+        for i in implicit_locs {
+            let Some(Element::Point(p)) = elements.get(i) else {
+                continue;
+            };
+            let has_newline = p.segments.iter().any(|s| {
+                arena.is_type(*s, "newline")
+                    || (arena.block_type(*s).as_deref() == Some("literal")
+                        && arena.source_str(*s).is_some_and(|src| src.contains('\n')))
+            });
+            let Some((&first, rest)) = p.segments.split_first() else {
+                continue;
+            };
+            if !has_newline {
+                continue;
+            }
+            let fix = |kind, target| IndentFix {
+                kind,
+                target,
+                text: String::new(),
+                extra: None,
+                source_fix: None,
+            };
+            let mut fixes = vec![fix(IndentFixKind::CollapseNewline, first)];
+            fixes.extend(rest.iter().map(|s| fix(IndentFixKind::Delete, *s)));
+            collapsed.push(IndentResult {
+                anchor: first,
+                description: "Removed line break in favor of implicit indentation.".to_string(),
+                source: "reflow.indent.require_implicit",
+                fixes,
+            });
+        }
+        if !collapsed.is_empty() {
+            // Anything else touching those points gives way.
+            let anchors: std::collections::HashSet<NodeId> = collapsed
+                .iter()
+                .flat_map(|res| res.fixes.iter().map(|f| f.target))
+                .collect();
+            results.retain(|res| !res.fixes.iter().any(|f| anchors.contains(&f.target)));
+            collapsed.extend(results);
+            results = collapsed;
+        }
+    }
+    Some(results)
 }
 
 // ---------------------------------------------------------------------------

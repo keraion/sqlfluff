@@ -96,6 +96,7 @@ class Rule_LT02(BaseRule):
             str(reflow_config.implicit_indents),
             bool(reflow_config.ignore_comment_lines),
             list(reflow_config.skip_indentation_in),
+            list(reflow_config.skip_implicit_indents_in),
         )
         if found is None:
             return None

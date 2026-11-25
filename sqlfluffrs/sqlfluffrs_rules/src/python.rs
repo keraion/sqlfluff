@@ -165,6 +165,7 @@ fn reflow_reindent(
     implicit_indents: String,
     ignore_comment_lines: bool,
     skip_indentation_in: Vec<String>,
+    skip_implicit_indents_in: Vec<String>,
 ) -> Option<PyIndentResults> {
     let options = crate::reflow::ReindentOptions {
         indent_unit,
@@ -172,6 +173,7 @@ fn reflow_reindent(
         implicit_indents,
         ignore_comment_lines,
         skip_indentation_in,
+        skip_implicit_indents_in,
     };
     with_sequence(tree, layout, |arena, config, seq| {
         let results = crate::reflow::reindent(arena, config, seq, &options)?;
