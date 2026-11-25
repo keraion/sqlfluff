@@ -675,8 +675,60 @@ rejected the fix (the new identifier isn't the `word` the grammar's
 (`NO_GRAMMAR` in `arena_fix.rs`) so the two agree, but such fixes go
 unchecked on main today. Worth its own issue.
 
-### Still untested
+### Still untested at this point
 
 The dbt, python and placeholder templaters; a real dbt project; the
 `test/dialects` and CLI tests; parallel runs; plugin rules alongside the
-Rust paths.
+Rust paths. The next section tests all but the real dbt project.
+
+## Testing what had not been tested
+
+Commit `a014087b8`. This found three bugs, all fixed, each with a test in
+`test/core/parser/rust_apply_fixes_test.py`.
+
+### Bugs found
+
+| Bug | Found by | Effect |
+|---|---|---|
+| Rust LT02 kept "forced" indents even when forcing them gave no result (Python keeps them only with a result) | Each rule's fixtures run together with the reflow rules | Flagged the join line of a MySQL `UPDATE ... INNER JOIN` |
+| The Rust apply took siblings' working locations to follow the text. In a templated file they needn't (two whitespace segments can share a rendered slice), and Python uses the stored location unless a fix further up moved the container | Same run, on a templated `for` loop | A line break before `{% endfor %}` was missing from the fixed source |
+| `_rs_tree_rebuilt` wasn't stripped in `BaseSegment.__getstate__` (main strips `_rs_tree`) | Parallel fix through the CLI | `sqlfluff fix --processes N` crashed with Rust rules on |
+
+The first two got past every earlier run because those used one rule at a
+time, or only the four reflow rules. The parity scripts now run each rule's
+fixtures together with the reflow rules.
+
+### Results
+
+| What | Result |
+|---|---|
+| Full suite with defaults (`test/api`, `cli`, `core`, `dialects`, `rules`, `utils`) | 16,218 passed, the same 4 unrelated failures |
+| Full suite with `use_rust_rules = True` as the default | 24 more failures, none from this work |
+| Python and placeholder templaters | 13 fixture cases, identical with Rust on and off |
+| Parallel lint, 1 and 6 processes, Rust and Python | identical: 10,985 violation lines, 414 files |
+| Parallel fix, the same four | identical files; 208 of 280 snowflake files changed |
+| A plugin rule alongside the Rust paths | 440 files identical, the plugin's violations present in both |
+| dbt templater (jaffle shop, dbt 1.9, duckdb) | identical; all four reflow rules answered in Rust on every file |
+
+The 24 failures with Rust rules on by default: 15 are tests which turn the
+Rust parser off (a contradiction with Rust rules on, by design) or assert
+that the default is off; 9 are the message of main's existing Rust CP01,
+"Keywords must be consistent." where Python says "consistently upper case"
+(see Known issues).
+
+Parity on the final build, with the widened scripts: 6,376 Rust apply passes
+match Python node by node (3 handed back, all validation failures Python
+rejects too); all 2,944 fixture cases identical with everything Rust on and
+off; reflow lint parity identical on the 629 fixture cases, the templated
+corpora and the 1,765 untemplated files.
+
+CLI fix on the snowflake fixtures plus the testbed: 14.6s with Rust against
+37.3s with Python at one process; 5.4s against 7.6s at six.
+
+### Still untested
+
+- **A real-sized dbt project.** The local ones have 7 and 2 models. Running
+  `dbt deps` / `dbt parse` on a project fetched for the purpose was not
+  permitted in this session.
+- **Fixes through the dbt templater.** jaffle shop is clean, so no fix pass
+  ran through it.
