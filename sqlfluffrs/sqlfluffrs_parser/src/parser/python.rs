@@ -658,6 +658,7 @@ impl PyParser {
         fixes: Vec<(String, usize, Vec<usize>)>,
         new_leaves: Vec<(String, String, Vec<String>, Vec<String>, String, usize)>,
         new_positions: Vec<i64>,
+        fix_even_unparsable: bool,
         loose_ends: std::collections::HashSet<String>,
     ) -> Option<(
         super::arena_py::PyTree,
@@ -679,15 +680,18 @@ impl PyParser {
                 std::collections::HashMap::new();
             let mut marked = std::collections::HashSet::new();
             for (edit_type, anchor, edits) in fixes {
-                if anchor >= arena.len() || edits.iter().any(|&e| e >= new_leaves.len()) {
+                if edits.iter().any(|&e| e >= new_leaves.len()) {
                     return None;
                 }
-                let target = super::arena::NodeId::from_index(anchor);
+                // An anchor which isn't in the tree is never reached.
+                let target = super::arena::NodeId::from_index(anchor.min(u32::MAX as usize));
                 by_anchor.entry(target).or_default().push(Fix {
                     edit_type: EditType::parse(&edit_type)?,
                     edits,
                 });
-                let mut up = arena.parent(target);
+                let mut up = (anchor < arena.len())
+                    .then(|| arena.parent(target))
+                    .flatten();
                 while let Some(p) = up {
                     if !marked.insert(p) {
                         break;
@@ -714,6 +718,8 @@ impl PyParser {
                 plan: Plan::default(),
                 reuse: std::env::var_os("SQLFLUFF_RUST_APPLY_NO_REUSE").is_none(),
                 stale: 0,
+                fix_even_unparsable,
+                takes_pos: std::collections::HashMap::new(),
             }
             .run()
         })?;

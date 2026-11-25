@@ -195,15 +195,15 @@ def apply_fixes_rust(
         return None
     index = {seg.uuid: i for i, seg in enumerate(segs)}
     specs = []
+    # The uuids of the segments inside edits: copies keep their uuid.
+    edit_uuids: set[int] = set()
     leaves: list[BaseSegment] = []
     new_leaves: list[tuple[str, str, list[str], list[str], str, int]] = []
     # Six per new segment: the position it came with (see `_NO_POSITION`).
     new_positions: list[int] = []
-    untemplated = templated_file.source_str == templated_file.templated_str
     for fix in fixes:
-        anchor = index.get(fix.anchor.uuid)
-        if anchor is None:
-            return None
+        # An anchor which isn't in the tree is never reached, as in Python.
+        anchor = index.get(fix.anchor.uuid, 0xFFFFFFFF)
         edits = []
         for edit in fix.edit or ():
             edits.append(len(leaves))
@@ -213,7 +213,10 @@ def apply_fixes_rust(
                 seg = todo.pop()
                 children = seg.segments
                 marker = seg.pos_marker if seg is not edit else None
-                if marker is None:
+                if seg is edit and seg.source_fixes and not children:
+                    # -2: a leaf with source fixes, to go in place of its like.
+                    new_positions.extend((-2, -1, -1, -1, -1, -1))
+                elif marker is None:
                     new_positions.extend(_NO_POSITION)
                 else:
                     # A segment moved from the old tree keeps its position.
@@ -244,10 +247,7 @@ def apply_fixes_rust(
                 is_indent = seg.is_meta and seg.is_type("indent")
                 if (
                     (seg.is_meta and not is_indent)
-                    or seg.source_fixes
-                    # ponytail: moved segments only where positions are
-                    # literal; a templated file needs Python's exact walk.
-                    or (marker is not None and not untemplated)
+                    or (seg.source_fixes and (seg is not edit or children))
                     or not (children or is_indent or seg.is_type("raw"))
                     # Non-code at either end of a new segment may be moved out
                     # of it: leave that to Python.
@@ -263,6 +263,8 @@ def apply_fixes_rust(
                     return None
                 cls = type(seg)
                 leaves.append(seg)
+                if seg is not edit:
+                    edit_uuids.add(seg.uuid)
                 if is_indent:
                     new_leaves.append(
                         (
@@ -287,6 +289,12 @@ def apply_fixes_rust(
                 )
                 todo.extend(reversed(children))
         specs.append((fix.edit_type, anchor, edits))
+    if any(fix.anchor.uuid in edit_uuids for fix in fixes):
+        # Another fix is anchored inside a segment this pass moves. Python
+        # applies it inside the moved copy: leave that to it.
+        APPLY_STATS["declined"] += 1
+        APPLY_STATS["declined: fix anchored inside a moved segment"] += 1
+        return None
     key = (config.get("dialect"), config.get("max_parse_depth"))
     parser = _APPLY_PARSERS.get(key)
     if parser is None:
@@ -300,6 +308,7 @@ def apply_fixes_rust(
             specs,
             new_leaves,
             new_positions,
+            bool(config.get("fix_even_unparsable")),
             # "Root" is what the parser's own arena calls the file segment.
             {type(tree).__name__, "Root", "UnparsableSegment"},
         )

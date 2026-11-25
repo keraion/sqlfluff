@@ -66,14 +66,18 @@ enum W {
         leaf: usize,
         pos: Option<(Slice, Slice)>,
     },
-    /// An old template placeholder with a new source: edit `leaf`, in the
-    /// old one's place.
+    /// An old leaf with a source fix on it: edit `leaf`, in the old one's
+    /// place. Either a template placeholder with a new source, or a raw
+    /// with the same text.
     Swap { old: NodeId, leaf: usize },
     /// A container made by a fix, with nothing in it positioned before.
     NewCont {
         node: usize,
         children: Vec<W>,
         pos: Option<(Slice, Slice)>,
+        /// Python walked back through it, fixes still being left to apply,
+        /// which re-positions everything inside.
+        revisited: bool,
     },
     /// An old container with new children.
     Cont { from: NodeId, children: Vec<W> },
@@ -126,6 +130,10 @@ pub(crate) struct Fixer<'a> {
     /// location didn't change: Python then leaves what is inside it alone,
     /// old working locations and all.
     pub stale: usize,
+    /// Keep going inside unparsable sections, unvalidated.
+    pub fix_even_unparsable: bool,
+    /// New leaves which took their anchor's position, and that anchor.
+    pub takes_pos: HashMap<usize, NodeId>,
 }
 
 /// `PositionMarker.infer_next_position`: move `loc` past `raw`.
@@ -149,6 +157,12 @@ impl<'a> Fixer<'a> {
     /// Is this new segment an indent or dedent?
     fn is_meta_leaf(&self, leaf: usize) -> bool {
         matches!(self.new_leaves[leaf].1.as_str(), "indent" | "dedent")
+    }
+
+    /// Does this new leaf carry source fixes? It then has to replace a leaf
+    /// just like it.
+    fn has_source_fixes(&self, node: usize) -> bool {
+        self.new_pos.get(node * 6) == Some(&-2)
     }
 
     /// The position a new segment came with: its slices and working location.
@@ -218,6 +232,7 @@ impl<'a> Fixer<'a> {
             node,
             children: children?,
             pos,
+            revisited: false,
         })
     }
 
@@ -225,7 +240,7 @@ impl<'a> Fixer<'a> {
     fn new_raw(&self, w: &W, out: &mut String) {
         match w {
             W::Old(id) => out.push_str(&self.arena.raw(*id)),
-            W::Swap { .. } => {}
+            W::Swap { old, .. } => out.push_str(self.arena.leaf_raw(*old)),
             W::New { leaf, .. } => out.push_str(&self.new_leaves[*leaf].4),
             W::NewCont { children, .. } | W::Cont { children, .. } => {
                 children.iter().for_each(|c| self.new_raw(c, out))
@@ -243,6 +258,18 @@ impl<'a> Fixer<'a> {
             }
             W::NewCont { children, .. } => self.first_preset_leaf(children.first()?),
             _ => None,
+        }
+    }
+
+    fn mark_revisited(w: &mut W) {
+        if let W::NewCont {
+            revisited,
+            children,
+            ..
+        } = w
+        {
+            *revisited = true;
+            children.iter_mut().for_each(Self::mark_revisited);
         }
     }
 
@@ -267,7 +294,7 @@ impl<'a> Fixer<'a> {
     fn is_code(&self, w: &W) -> bool {
         match w {
             W::Old(id) => self.arena.is_code(*id),
-            W::Swap { .. } => false,
+            W::Swap { old, .. } => self.arena.is_code(*old),
             // ponytail: builds a node per call; cache per leaf if it shows up.
             W::New { leaf, .. } => self.new_node(*leaf, None).is_code(),
             W::Cont { children, .. } | W::NewCont { children, .. } => {
@@ -280,7 +307,7 @@ impl<'a> Fixer<'a> {
     fn is_code_or_meta(&self, w: &W) -> bool {
         self.is_code(w)
             || matches!(w, W::Old(id) if self.arena.is_meta(*id))
-            || matches!(w, W::Swap { .. })
+            || matches!(w, W::Swap { old, .. } if self.arena.is_meta(*old))
             || matches!(w, W::New { leaf, .. } if self.is_meta_leaf(*leaf))
     }
 
@@ -366,6 +393,10 @@ impl<'a> Fixer<'a> {
                         }
                         // Not positioned yet.
                         w if unplaced(w) => continue,
+                        // In its anchor's place.
+                        W::New { leaf, pos: Some(p) } if self.takes_pos.contains_key(leaf) => {
+                            (p.0.start, p.1.start, *child_loc.get(&self.takes_pos[leaf])?)
+                        }
                         // Moved here with its position.
                         w => self.first_preset_leaf(w)?,
                     });
@@ -570,10 +601,29 @@ impl<'a> Fixer<'a> {
                             && arena.segment_class(child).as_deref() == Some(new.0.as_str())
                             && *arena.instance_types_arc(child) == new.3
                         {
-                            buf.push(W::Old(child));
+                            buf.push(if self.has_source_fixes(leaf) {
+                                W::Swap { old: child, leaf }
+                            } else {
+                                W::Old(child)
+                            });
                             continue;
                         }
-                        return decline("replacement keeps the anchor's position");
+                        if self.has_source_fixes(leaf) {
+                            return decline("source fix on another kind of segment");
+                        }
+                        // Another kind of leaf, in the anchor's place.
+                        let Some(p) = arena.pos_ref(child) else {
+                            return decline("replacement keeps the anchor's position");
+                        };
+                        self.takes_pos.insert(leaf, child);
+                        buf.push(W::New {
+                            leaf,
+                            pos: Some((p.source_slice, p.templated_slice)),
+                        });
+                        continue;
+                    }
+                    if self.has_source_fixes(leaf) {
+                        return decline("source fix on another kind of segment");
                     }
                     buf.push(W::New { leaf, pos: None });
                 }
@@ -639,10 +689,13 @@ impl<'a> Fixer<'a> {
                         buf.push(W::Old(child));
                     }
                 }
-                other => {
+                mut other => {
                     let mut raw = String::new();
                     self.new_raw(&other, &mut raw);
                     advance(&mut loc, &raw);
+                    if !self.fixes.is_empty() {
+                        Self::mark_revisited(&mut other);
+                    }
                     buf.push(other);
                 }
             }
@@ -650,9 +703,9 @@ impl<'a> Fixer<'a> {
 
         // Non-code left at either end moves up to the parent.
         let (mut before, mut after) = (Vec::new(), Vec::new());
-        let Some(class) = arena.segment_class(id) else {
-            return decline("fix inside an unparsable section");
-        };
+        let class = arena
+            .segment_class(id)
+            .unwrap_or_else(|| "UnparsableSegment".to_string());
         if !self.loose_ends.contains(&class) {
             let start = buf
                 .iter()
@@ -674,11 +727,16 @@ impl<'a> Fixer<'a> {
         };
         let mut validated = true;
         if requires_validate {
-            // Python handles unparsable sections its own way: leave it to it.
             if arena.descendant_type_set(id).contains("unparsable")
                 || arena.is_type(id, "unparsable")
             {
-                return decline("fix inside an unparsable section");
+                if !self.fix_even_unparsable {
+                    // It was unparsable already, so this can't be validated:
+                    // nothing within it is fixed.
+                    return Some((W::Old(id), Vec::new(), Vec::new(), true));
+                }
+                // Fixed regardless, and not for validating.
+                return Some((rebuilt, before, after, true));
             }
             validated = match self.validate_cont(&rebuilt) {
                 Some(valid) => valid,
@@ -766,19 +824,27 @@ impl<'a> Fixer<'a> {
                     templated.start,
                     templated.stop,
                 ]);
-                Node::Meta {
-                    meta_type: MetaType::Template {
-                        source_str: self.new_leaves[*leaf].4.clone(),
-                        block_type: arena.block_type(*old)?,
+                let raw = arena.leaf_raw(*old);
+                advance(loc, raw);
+                self.plan.raw.push_str(raw);
+                let pos = Some(old_pos.with_working_position(at.0, at.1));
+                match arena.block_type(*old) {
+                    Some(block_type) => Node::Meta {
+                        meta_type: MetaType::Template {
+                            source_str: self.new_leaves[*leaf].4.clone(),
+                            block_type,
+                        },
+                        pos_marker: pos,
+                        block_uuid: arena.block_uuid(*old),
                     },
-                    pos_marker: Some(old_pos.with_working_position(at.0, at.1)),
-                    block_uuid: arena.block_uuid(*old),
+                    None => arena.node_like(*old, pos, None, vec![]),
                 }
             }
             W::NewCont {
                 node,
                 children,
                 pos,
+                revisited,
             } => {
                 let (source, templated) = (*pos)?;
                 op(&mut self.plan, 8, *node, children.len());
@@ -796,7 +862,8 @@ impl<'a> Fixer<'a> {
                     Some(at.1),
                 );
                 let (name, class_type, class_types, ..) = &self.new_leaves[*node];
-                let keeps = self.stale > 0 || self.preset(*node).is_some_and(|p| p.1 == at);
+                let keeps = !*revisited
+                    && (self.stale > 0 || self.preset(*node).is_some_and(|p| p.1 == at));
                 self.stale += usize::from(keeps);
                 let kids: Option<Vec<Node>> = children.iter().map(|c| self.build(c, loc)).collect();
                 self.stale -= usize::from(keeps);
@@ -829,10 +896,8 @@ impl<'a> Fixer<'a> {
         if !before.is_empty() || !after.is_empty() {
             return decline("non-code pushed out of the root");
         }
-        if !self.fixes.is_empty() {
-            // Python drops these silently too, but they are worth a look.
-            return decline("anchor not found in the tree");
-        }
+        // A fix whose anchor was never reached (the root, or inside something
+        // another fix removed) is dropped, as in Python.
         let mut loc = self.arena.pos_ref(root)?.working_loc();
         let node = self.build(&rebuilt, &mut loc)?;
         Some((node, self.plan))
