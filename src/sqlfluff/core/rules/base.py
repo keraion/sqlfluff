@@ -17,6 +17,7 @@ missing.
 import bdb
 import copy
 import fnmatch
+import functools
 import logging
 import os
 import pathlib
@@ -65,6 +66,12 @@ RuleGhost = namedtuple("RuleGhost", ["code", "name", "description"])
 rules_logger = logging.getLogger("sqlfluff.rules")
 
 linter_logger: logging.Logger = logging.getLogger("sqlfluff.linter")
+
+
+@functools.lru_cache(maxsize=4)
+def _path(fname: str) -> pathlib.Path:
+    """The path for a file name: every rule asks for the same one per file."""
+    return pathlib.Path(fname)
 
 
 class RuleLoggingAdapter(_LoggerAdapter):
@@ -536,7 +543,7 @@ class BaseRule(metaclass=RuleMetaclass):
             dialect=dialect,
             fix=fix,
             templated_file=templated_file,
-            path=pathlib.Path(fname) if fname else None,
+            path=_path(fname) if fname else None,
             segment=tree,
             config=config,
         )
@@ -550,20 +557,23 @@ class BaseRule(metaclass=RuleMetaclass):
         # are post-processed identically to _eval results. Rules without a Rust
         # path — or parses with no arena (Python parser) — fall through to the
         # Python crawl below.
-        # SPIKE: a rule which sets `_rebuild_rust_arena` gets a fresh arena
-        # when a fix has replaced the tree the parser built one for. It's kept
-        # apart from `_rs_tree` so only the rules which asked for it use it.
+        # SPIKE: once a fix has replaced the tree the parser built an arena
+        # for, the new tree may carry one of its own (`_rs_tree_rebuilt`):
+        # applying the fix in Rust leaves one, which any rule can use. A rule
+        # which sets `_rebuild_rust_arena` has one built if there is none.
         rust_tree = None
         if self._rust_rules_enabled(config):
             rust_tree = getattr(tree, "_rs_tree", None)
             if (
                 rust_tree is None
-                and self._rebuild_rust_arena
-                and templated_file is not None
                 and os.environ.get("SQLFLUFF_NO_ARENA_REBUILD") is None
             ):
                 rust_tree = getattr(tree, "_rs_tree_rebuilt", None)
-                if rust_tree is None:
+                if (
+                    rust_tree is None
+                    and self._rebuild_rust_arena
+                    and templated_file is not None
+                ):
                     from sqlfluff.core.parser.rust_parser import rebuild_rs_tree
 
                     rust_tree = rebuild_rs_tree(tree, templated_file)

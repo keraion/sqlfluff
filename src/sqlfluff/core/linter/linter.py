@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator, Sequence
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import regex
 from tqdm import tqdm
@@ -99,15 +99,30 @@ class Linter:
         self.formatter = formatter
         # Store references to user rule classes
         self.user_rules = user_rules or []
+        # The last rule pack built, and what it was built from.
+        self._rulepack_cache: Optional[tuple[Any, RulePack]] = None
 
     def get_rulepack(self, config: Optional[FluffConfig] = None) -> RulePack:
         """Get hold of a set of rules."""
+        cfg = config or self.config
+        # The pack depends only on these parts of the config, so one built
+        # for the last file serves the next unless they differ.
+        key = (
+            repr(cfg.get_section("rules")),
+            repr(cfg.get("rule_allowlist")),
+            repr(cfg.get("rule_denylist")),
+            tuple(id(rule) for rule in self.user_rules),
+        )
+        cached = self._rulepack_cache
+        if cached and cached[0] == key:
+            return cached[1]
         rs = get_ruleset()
         # Register any user rules
         for rule in self.user_rules:
             rs.register(rule)
-        cfg = config or self.config
-        return rs.get_rulepack(config=cfg)
+        pack = rs.get_rulepack(config=cfg)
+        self._rulepack_cache = (key, pack)
+        return pack
 
     def rule_tuples(self) -> list[RuleTuple]:
         """A simple pass through to access the rule tuples of the rule set."""

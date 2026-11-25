@@ -116,7 +116,10 @@ class Rule_CP01(BaseRule):
         uses.
         """
         root = context.segment
-        rs_tree = getattr(root, "_rs_tree", None)
+        # The parser's arena, or the one left on a tree a fix produced.
+        rs_tree = getattr(root, "_rs_tree", None) or getattr(
+            root, "_rs_tree_rebuilt", None
+        )
         if rs_tree is None:
             # Unreachable via dispatch (crawl() only calls this when the root
             # has an arena), but guard in case _eval_rust is called directly.
