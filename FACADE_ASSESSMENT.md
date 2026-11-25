@@ -194,8 +194,8 @@ Goal: no Python in lint/fix except legacy plugin rules.
    the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
-   (section 6) and for the cases added since (last sections). Left: a fix
-   anchored inside a segment the same pass moves, and two rare edit shapes.
+   (section 6) and for the cases added since (last sections). Nothing is
+   handed back to Python now except fixes which fail validation.
 4. Reporting straight from Rust results.
 5. Plugin bridge: build the Python tree on demand, only when a Python rule
    is loaded.
@@ -605,7 +605,9 @@ snowflake 2.91×, postgres 2.75×, templated repo files 1.85×. Within noise of
 the previous step: this widened coverage, it did not speed up the common
 path.
 
-### Where Rust still steps aside
+### Where Rust still stepped aside at this point
+
+All of these are closed in the next section.
 
 - **A fix anchored inside a segment the same pass moves** (21 apply passes).
   Python applies it inside the moved copy. Letting Rust drop it gave the one
@@ -620,3 +622,61 @@ path.
 Still untested: the dbt, python and placeholder templaters; a real dbt
 project; `test/dialects` and the CLI tests; parallel runs; plugin rules
 alongside the Rust paths.
+
+## The last fall-backs
+
+Commit `0d398dd74` closes what the previous section listed.
+
+- **A fix anchored inside a segment the same pass moves.** A copy keeps its
+  uuid, so Python applies the fix to whichever of the original and the copy
+  it meets first. It can only meet the copy inside a new container, never as
+  a copied leaf put straight into the parent, so most of these were no
+  conflict at all. For the rest, fixes are now applied inside a segment a
+  fix brought, by the same code as for the old tree (`apply_at`, shared by
+  `apply` and `apply_new`).
+- **A container replacement which keeps its anchor's position** (CV03),
+  where what is inside came with positions.
+- **A fresh edit with non-code at its end** (TQ04). Python moves that out
+  only if it walks back through the new segment while fixes are left; that
+  is mirrored, and such a segment is kept as the rule built it rather than
+  constructed again.
+- **Detection on a tree which carries source fixes.** The guard on LT02,
+  LT05 and LT14 is gone. The one thing the arena lacked, not making the same
+  source fix twice, is checked in Python when the result is built.
+
+### Results
+
+| Where | Now | Before |
+|---|---|---|
+| Apply passes handed back to Python | 3 of 5,300 | 33 |
+| LT01, LT02, LT05, LT14 on reflow fixture runs | 0 of 645 each | 0 |
+
+The 3 are fixes which fail validation. Python's `apply_fixes`, run on the
+same trees, rejects all three.
+
+Parity on the final build: 5,297 Rust apply passes match Python node by
+node; final fixed output identical on 2,944 fixture cases and 1,892 files;
+reflow lint parity identical on the 629 fixture cases, the templated corpora
+and the 1,765 untemplated files. Fix mode against Python rules: testbed
+2.09×, snowflake 2.89×, postgres 2.92×, templated repo files 1.89× (within
+noise of the previous step).
+
+### A quirk in Python's `apply_fixes`
+
+A fix which sits directly inside a `BracketedSegment` is never validated.
+That class has no `match_grammar`, so the validation branch is skipped and
+`validated` keeps the value left over from the loop over the segment's
+children: what the last child reported, which is almost always `True`.
+
+It showed as 4 postgres passes where RF06 unquotes an option name such as
+`"host"` inside `OPTIONS (...)`. Rust validated the enclosing statement and
+rejected the fix (the new identifier isn't the `word` the grammar's
+`TypedParser` asks for); Python let it through. Rust now mirrors Python
+(`NO_GRAMMAR` in `arena_fix.rs`) so the two agree, but such fixes go
+unchecked on main today. Worth its own issue.
+
+### Still untested
+
+The dbt, python and placeholder templaters; a real dbt project; the
+`test/dialects` and CLI tests; parallel runs; plugin rules alongside the
+Rust paths.
