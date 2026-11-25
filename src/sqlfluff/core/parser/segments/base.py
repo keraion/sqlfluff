@@ -317,6 +317,8 @@ class BaseSegment(metaclass=SegmentMetaclass):
         # This is set on the root FileSegment by the Rust parser for efficient
         # rule evaluation, but isn't needed after pickling.
         s.pop("_rs_tree", None)
+        # Likewise the arena rebuilt for it after a fix.
+        s.pop("_rs_tree_rebuilt", None)
         return s
 
     def __setstate__(self, state: dict[str, Any]) -> None:

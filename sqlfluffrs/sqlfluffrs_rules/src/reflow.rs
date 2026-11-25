@@ -2678,8 +2678,10 @@ pub fn reindent(
         });
         // `_lint_line_buffer_indents`.
         r.lint_starting_indent(line, &forced, compensation)?;
+        // Indents count as forced only if forcing them gave a result.
+        let before = r.results.len();
         let new_indents = r.lint_untaken_positive(line, &imbalanced)?;
-        if !new_indents.is_empty() {
+        if r.results.len() > before {
             forced.extend(new_indents);
             continue;
         }

@@ -853,13 +853,19 @@ impl<'a> Fixer<'a> {
             let anchor = self.anchor_old(child);
             self.apply_at(&anchor, fixes, &mut buf, &mut requires_validate)?;
         }
+        // Where each child stands by now. If this segment was moved by a fix
+        // further up, Python re-positioned what is inside it to follow the
+        // text; if not, its children are where the tree has them, which in a
+        // templated file needn't follow the text.
+        let moved = arena.pos_ref(id).map(|p| p.working_loc()) != Some(at);
+        let mut child_loc = HashMap::new();
+        let mut loc = at;
+        for &child in arena.children(id) {
+            let stored = arena.pos_ref(child).map(|p| p.working_loc());
+            child_loc.insert(child, if moved { loc } else { stored.unwrap_or(loc) });
+            advance(&mut loc, &arena.raw(child));
+        }
         if applied {
-            let mut child_loc = HashMap::new();
-            let mut loc = at;
-            for &child in arena.children(id) {
-                child_loc.insert(child, loc);
-                advance(&mut loc, &arena.raw(child));
-            }
             let Some(parent) = arena.pos_ref(id) else {
                 return decline("could not position a new segment");
             };
@@ -880,7 +886,13 @@ impl<'a> Fixer<'a> {
             last_validated = true;
             match w {
                 W::Old(child) => {
-                    let child_at = loc;
+                    // Fixes at this level re-position its children to
+                    // follow the text; otherwise they stay where they were.
+                    let child_at = if applied {
+                        loc
+                    } else {
+                        child_loc.get(&child).copied().unwrap_or(loc)
+                    };
                     advance(&mut loc, &arena.raw(child));
                     if self.marked.contains(&child)
                         || (self.visit_all
