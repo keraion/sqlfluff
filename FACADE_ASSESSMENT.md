@@ -725,10 +725,24 @@ corpora and the 1,765 untemplated files.
 CLI fix on the snowflake fixtures plus the testbed: 14.6s with Rust against
 37.3s with Python at one process; 5.4s against 7.6s at six.
 
+### A real dbt project: datacoves/balboa
+
+`datacoves/balboa` (`transform/`): 42 models, 49 macros, six packages, its
+own `.sqlfluff` with the dbt templater and a Snowflake dialect. Compiled
+against a local duckdb profile with dbt 1.10 in a throwaway virtualenv; no
+model needed the warehouse at compile time.
+
+| Run | Result |
+|---|---|
+| Its own config | 42 files identical with Rust on and off; 0 violations (the project is clean), so no fix ran. LT01, LT02, LT05 answered in Rust on every file |
+| A contrary style (all rules, upper-case keywords, 2-space indent, 70 columns) | 1,892 violations; all 42 files changed by the fix; identical with Rust on and off; 150 Rust apply passes, none handed back; all four reflow rules answered in Rust on every pass |
+| The same through the CLI at 4 processes | 42 files fixed, identical with Rust on and off |
+
+With a duckdb *file* as the profile's database, parallel workers collide on
+its lock and each run skips a few models at random; that is duckdb, not
+sqlfluff, and goes away with `:memory:`.
+
 ### Still untested
 
-- **A real-sized dbt project.** The local ones have 7 and 2 models. Running
-  `dbt deps` / `dbt parse` on a project fetched for the purpose was not
-  permitted in this session.
-- **Fixes through the dbt templater.** jaffle shop is clean, so no fix pass
-  ran through it.
+- A dbt project against its real warehouse adapter (this used duckdb in
+  place of Snowflake), and one large enough to matter for timing.
