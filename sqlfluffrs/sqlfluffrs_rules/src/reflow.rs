@@ -686,6 +686,212 @@ fn determine_constraints<'a>(
     Some((pre, post, strip))
 }
 
+/// `PositionMarker.working_visual_column`: the column `pos` shows at in the
+/// rendered file, with tabs running to the next tab stop.
+// ponytail: walks the file from its start per call; index line starts if
+// tab-aligned files get large.
+fn visual_column(templated: &str, pos: usize, tab: usize) -> usize {
+    let mut col = 0;
+    for c in templated.chars().take(pos) {
+        match c {
+            '\n' => col = 0,
+            '\t' => col = (col / tab + 1) * tab,
+            _ => col += 1,
+        }
+    }
+    col
+}
+
+/// `_determine_aligned_inline_spacing`: the whitespace which lines `next`
+/// up with its siblings, for an `align:...` constraint. `tab` is the tab
+/// size when indenting with tabs.
+fn aligned_spacing(
+    arena: &Arena,
+    ws: NodeId,
+    next: NodeId,
+    constraint: &str,
+    tab: Option<usize>,
+) -> Option<String> {
+    let single = Some(" ".to_string());
+    let mut parts = constraint.split(':').skip(1);
+    let seg_type = parts.next()?;
+    let (within, scope, space) = (parts.next(), parts.next(), parts.next());
+
+    // The outermost `within` above `next`, short of a `scope` boundary.
+    let mut parent = None;
+    let mut up = arena.parent(next);
+    while let Some(id) = up {
+        if within.is_some_and(|w| arena.is_type(id, w)) {
+            parent = Some(id);
+        }
+        if scope.is_some_and(|sc| arena.is_type(id, sc)) {
+            break;
+        }
+        up = arena.parent(id);
+    }
+    let Some(parent) = parent else {
+        return single;
+    };
+
+    // `_find_alignment_siblings`: what to line up with, in tree order.
+    let mut siblings: Vec<NodeId> = Vec::new();
+    let mut stack = vec![(parent, false)];
+    while let Some((id, blocked)) = stack.pop() {
+        if arena.is_type(id, seg_type) && !blocked {
+            siblings.push(id);
+        }
+        if !arena.descendant_type_set(id).contains(seg_type) {
+            continue;
+        }
+        let child_blocked = blocked || scope.is_some_and(|sc| arena.is_type(id, sc));
+        stack.extend(arena.children(id).iter().rev().map(|c| (*c, child_blocked)));
+    }
+
+    let next_pos = arena.pos_marker(next)?;
+    let raws = arena.raw_segments(parent);
+    // Source positions where anything is templated, unless told which.
+    let use_source = match space {
+        Some("source") => true,
+        Some("templated") => false,
+        _ => {
+            !next_pos.is_literal()
+                || siblings.iter().any(|s| !is_literal(arena, *s))
+                || raws
+                    .iter()
+                    .any(|r| arena.is_code(*r) && !is_literal(arena, *r))
+        }
+    };
+    let loc = |id: NodeId| -> Option<(usize, usize)> {
+        let pm = arena.pos_marker(id)?;
+        Some(if use_source {
+            pm.source_position()
+        } else {
+            pm.working_loc()
+        })
+    };
+    // `_pos_col`: the column to compare by, visual when using tabs.
+    let col = |id: NodeId| -> Option<usize> {
+        let pm = arena.pos_marker(id)?;
+        Some(match tab {
+            _ if use_source => pm.source_position().1,
+            Some(tab) => visual_column(
+                &pm.templated_file.templated_str,
+                pm.templated_slice.start,
+                tab,
+            ),
+            None => pm.working_loc().1,
+        })
+    };
+    // The visual column a segment ends at.
+    let visual_end = |id: NodeId, tab: usize| -> Option<usize> {
+        let pm = arena.pos_marker(id)?;
+        Some(visual_column(
+            &pm.templated_file.templated_str,
+            pm.templated_slice.stop,
+            tab,
+        ))
+    };
+    // Where a segment ends, in the same coordinates.
+    let end_loc = |id: NodeId| -> Option<(usize, usize)> {
+        let pm = arena.pos_marker(id)?;
+        Some(if use_source {
+            pm.templated_file
+                .get_line_pos_of_char_pos(pm.source_slice.stop, true)
+        } else {
+            pm.working_loc_after(&arena.raw(id))
+        })
+    };
+
+    // `_group_siblings_by_line`: lines in the order first seen, each sorted
+    // by column.
+    let mut by_line: Vec<(usize, Vec<(usize, NodeId)>)> = Vec::new();
+    for &sibling in &siblings {
+        let (line, at) = (loc(sibling)?.0, col(sibling)?);
+        match by_line.iter_mut().find(|(l, _)| *l == line) {
+            Some((_, segs)) => segs.push((at, sibling)),
+            None => by_line.push((line, vec![(at, sibling)])),
+        }
+    }
+    for (_, segs) in &mut by_line {
+        segs.sort_by_key(|(col, _)| *col);
+    }
+    let (next_line, next_col) = (loc(next)?.0, col(next)?);
+    let Some(target_index) = by_line
+        .iter()
+        .find(|(l, _)| *l == next_line)
+        .and_then(|(_, segs)| segs.iter().position(|(col, _)| *col == next_col))
+    else {
+        return single;
+    };
+    // The sibling in that place on each line.
+    let column: Vec<NodeId> = by_line
+        .iter()
+        .filter_map(|(_, segs)| segs.get(target_index).map(|(_, id)| *id))
+        .collect();
+    if column.len() <= 1 {
+        return single;
+    }
+
+    // The furthest any of them has code before it on its own line.
+    let mut by_working: HashMap<(usize, usize), Vec<NodeId>> = HashMap::new();
+    for &sibling in &column {
+        by_working
+            .entry(arena.pos_marker(sibling)?.working_loc())
+            .or_default()
+            .push(sibling);
+    }
+    let mut last_code: Option<NodeId> = None;
+    let mut max_pos = 0usize;
+    for &raw in &raws {
+        if let (Some(pm), Some(code)) = (arena.pos_marker(raw), last_code) {
+            for &sibling in by_working.get(&pm.working_loc()).into_iter().flatten() {
+                let end = end_loc(code)?;
+                if end.0 == loc(sibling)?.0 {
+                    max_pos = max_pos.max(match tab {
+                        Some(tab) => visual_end(code, tab)?,
+                        None => end.1,
+                    });
+                }
+            }
+        }
+        if arena.is_code(raw) {
+            last_code = Some(raw);
+        }
+    }
+
+    // Where the code before this whitespace, on its line, ends.
+    let ws_loc = loc(ws)?;
+    let mut code_before: Option<NodeId> = None;
+    for &raw in &raws {
+        let Some(raw_loc) = loc(raw) else {
+            continue;
+        };
+        if raw_loc >= ws_loc {
+            break;
+        }
+        if arena.is_code(raw) && raw_loc.0 == ws_loc.0 {
+            code_before = Some(raw);
+        }
+    }
+    let current = match (code_before, tab) {
+        (Some(code), Some(tab)) if !use_source => visual_end(code, tab)?,
+        (Some(code), _) => end_loc(code)?.1,
+        (None, _) => col(ws)?,
+    };
+    if let Some(tab) = tab {
+        // Tabs to the first tab stop past the widest line.
+        let target = (max_pos / tab + 1) * tab;
+        let (mut at, mut tabs) = (current, 0);
+        while at < target {
+            at = (at / tab + 1) * tab;
+            tabs += 1;
+        }
+        return Some("\t".repeat(tabs));
+    }
+    let pad = (1 + max_pos as i64 - current as i64).max(1);
+    Some(" ".repeat(pad as usize))
+}
+
 fn delete(seg: NodeId, description: &str) -> RespaceResult {
     RespaceResult {
         anchor: seg,
@@ -702,6 +908,7 @@ fn respace_point(
     point: &Point,
     prev: Option<&Block>,
     next: Option<&Block>,
+    tab: Option<usize>,
     results: &mut Vec<RespaceResult>,
 ) -> Option<()> {
     let (pre, post, strip) = determine_constraints(arena, prev, next, false)?;
@@ -797,10 +1004,29 @@ fn respace_point(
             results.push(delete(ws, &description));
             return Some(());
         }
-        if post.starts_with("align") || pre != "single" || post != "single" {
+        let raw = arena.raw(ws);
+        if let (true, Some(n)) = (post.starts_with("align"), next) {
+            let desired = aligned_spacing(arena, ws, n.segment, post, tab)?;
+            if raw != desired {
+                let seg_type = post.split(':').nth(1).unwrap_or("");
+                results.push(RespaceResult {
+                    anchor: ws,
+                    description: format!(
+                        "{} elements are expected to be aligned. Found incorrect whitespace before {}: {}.",
+                        py_repr(seg_type),
+                        pretty_segment_name(arena, n.segment),
+                        py_repr(&raw)
+                    ),
+                    kind: FixKind::Replace,
+                    fix_anchor: ws,
+                    edit: desired,
+                });
+            }
+            return Some(());
+        }
+        if pre != "single" || post != "single" {
             return None;
         }
-        let raw = arena.raw(ws);
         if raw != " " {
             let description = match next {
                 Some(n) => format!(
@@ -825,7 +1051,8 @@ fn respace_point(
     if matches!(pre, "touch" | "any") || matches!(post, "touch" | "any") {
         return Some(());
     }
-    if post.starts_with("align") || pre != "single" || post != "single" {
+    // An aligned element with no space yet gets one: a later pass aligns it.
+    if !post.starts_with("align") && (pre != "single" || post != "single") {
         return None;
     }
     // A neighbour with no position is itself an insertion; Python folds the
@@ -864,7 +1091,14 @@ fn respace_point(
 }
 
 /// `ReflowSequence.respace()`. `None` = a case this doesn't cover.
-pub fn respace(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<RespaceResult>> {
+pub fn respace(
+    arena: &Arena,
+    seq: &ReflowSequence,
+    indent_unit: &str,
+    tab_space_size: usize,
+) -> Option<Vec<RespaceResult>> {
+    // The tab size, when indenting (and so aligning) with tabs.
+    let tab = (indent_unit == "tab" && tab_space_size > 0).then_some(tab_space_size);
     let mut results = Vec::new();
     let block = |i: usize| match seq.elements.get(i) {
         Some(Element::Block(b)) => Some(&**b),
@@ -873,7 +1107,7 @@ pub fn respace(arena: &Arena, seq: &ReflowSequence) -> Option<Vec<RespaceResult>
     for (idx, elem) in seq.elements.iter().enumerate() {
         if let Element::Point(point) = elem {
             let prev = if idx > 0 { block(idx - 1) } else { None };
-            respace_point(arena, point, prev, block(idx + 1), &mut results)?;
+            respace_point(arena, point, prev, block(idx + 1), tab, &mut results)?;
         }
     }
     Some(results)

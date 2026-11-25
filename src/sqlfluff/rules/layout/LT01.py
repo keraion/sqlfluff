@@ -89,13 +89,17 @@ class Rule_LT01(BaseRule):
         )
         if rs_tree is None:
             return None  # pragma: no cover
+        reflow_config = ReflowConfig.from_fluff_config(context.config)
         layout = {
             seg_type: {k: str(v) for k, v in cfg.items() if v is not None}
-            for seg_type, cfg in ReflowConfig.from_fluff_config(
-                context.config
-            )._config_dict.items()
+            for seg_type, cfg in reflow_config._config_dict.items()
         }
-        found = sqlfluffrs.reflow_respace(rs_tree, layout)  # type: ignore[attr-defined]
+        found = sqlfluffrs.reflow_respace(  # type: ignore[attr-defined]
+            rs_tree,
+            layout,
+            str(reflow_config.indent_unit),
+            int(reflow_config.tab_space_size),
+        )
         if found is None:
             return None
         raws = context.segment.raw_segments

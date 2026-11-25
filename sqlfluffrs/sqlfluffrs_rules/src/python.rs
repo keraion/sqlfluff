@@ -126,9 +126,11 @@ fn reflow_build(
 fn reflow_respace(
     tree: &PyTree,
     layout: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    indent_unit: String,
+    tab_space_size: usize,
 ) -> Option<Vec<(usize, String, &'static str, usize, String)>> {
     with_sequence(tree, layout, |arena, _config, seq| {
-        let results = crate::reflow::respace(arena, seq)?;
+        let results = crate::reflow::respace(arena, seq, &indent_unit, tab_space_size)?;
         let leaf: std::collections::HashMap<_, _> = seq
             .depth_map
             .iter()
