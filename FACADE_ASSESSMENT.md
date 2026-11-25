@@ -746,3 +746,70 @@ sqlfluff, and goes away with `:memory:`.
 
 - A dbt project against its real warehouse adapter (this used duckdb in
   place of Snowflake), and one large enough to matter for timing.
+
+## Where the time goes now, and the cheap wins
+
+Measured on the build after the testing section, in process, all Rust paths
+on, min of 3.
+
+| Fix mode | testbed (3.40s) | snowflake (7.79s) | postgres (6.56s) |
+|---|---|---|---|
+| Rule crawls | 49.7% | 41.6% | 40.7% |
+| Parse | 25.8% | 22.0% | 24.5% |
+| Other | 16.2% | 22.9% | 22.1% |
+| Rust apply and validate | 7.1% | 13.1% | 12.4% |
+| Python `apply_fixes` | 0% | 0.2% | 0% |
+
+| Lint mode | testbed (2.23s) | snowflake (3.78s) | postgres (3.29s) |
+|---|---|---|---|
+| Parse | 38.5% | 47.0% | 50.2% |
+| Rule crawls | 43.6% | 36.0% | 33.6% |
+| Other | 16.1% | 16.7% | 15.9% |
+
+In fix mode "Other" includes building the Python tree after a Rust apply
+(about 10 points), which the script times outside the apply call.
+
+Inside the parse stage (snowflake, 1.56s; the other two split the same way):
+building the Python segment tree 28%, rebuilding Rust's result as Python
+objects 17%, the Rust parse itself 14%, building the arena 10%, lexing and
+the rest 30%. About 45% of the stage, a fifth of a lint run, is making the
+Python tree.
+
+Inside the rule crawls (profiler self time, snowflake lint, so call-heavy
+code is overstated): segment tree API 24%, builtins and stdlib under it 25%,
+rule framework 13%, rule bodies 10%, crawlers 8%, analysis helpers 6%, the
+four Rust reflow rules together 4%. No rule stands out; the costliest
+(CP01, CP02, LT01, AL01, AL05, RF01, LT15, CV06) are 2–4% of a run each.
+
+### Cheap wins taken (`e94496d02`)
+
+- **The rule pack is built once, not per file.** It depends only on the
+  rules section and the allow and deny lists, so `Linter.get_rulepack`
+  reuses the last one unless those differ: 0.42ms per file to 0.01ms. The
+  parallel runner already did this; the sequential runner and `lint_string`
+  did not.
+- **One `Path` per file** in `BaseRule.crawl`, not one per rule per file.
+- **Any Rust rule uses the arena a fix leaves** (`_rs_tree_rebuilt`). Main's
+  Rust CP01 read only the parser's arena, so from the second fix pass on it
+  ran in Python.
+
+| snowflake | Before | After |
+|---|---|---|
+| Lint | 3.78s | 3.35s |
+| Fix | 7.79s | 7.28s |
+| CP01 in fix mode | 240ms | 101ms |
+
+Fix mode against Python rules after this: testbed 2.16×, snowflake 2.98×,
+postgres 2.89× (the rule pack change speeds up the Python baseline too).
+Parity and the test suite are unchanged.
+
+### Measured, not taken
+
+- **Main's native AST path** (`SQLFLUFF_RS_NATIVE_AST`, which skips the
+  17% "rebuild as Python objects" step): 1.04× on the testbed, 1.05× on
+  postgres, 1.00× on snowflake, identical violations. Near noise.
+- **The remaining "Other"**, about 11% in both modes: building the noqa
+  mask, a config copy per file, the linter loop. No single cheap win.
+
+What is left is the expensive kind: the Python tree, and the roughly 75
+Python rules which walk it.
