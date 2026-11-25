@@ -88,12 +88,15 @@ def results_from_rust(raws: list[RawSegment], found: list[Any]) -> list[LintResu
                 src_fix = SourceFix(
                     edit, slice(src_start, src_stop), slice(tmpl_start, tmpl_stop)
                 )
-                fixes.append(
-                    LintFix.replace(
-                        target,
-                        [target.edit(source_fixes=[src_fix], source_str=text)],
+                # The arena holds no source fixes, so this is checked here:
+                # the same fix as last time isn't made again.
+                if src_fix not in target.source_fixes:
+                    fixes.append(
+                        LintFix.replace(
+                            target,
+                            [target.edit(source_fixes=[src_fix], source_str=text)],
+                        )
                     )
-                )
             elif kind == "replace_whitespace":
                 fixes.append(LintFix.replace(target, [target.edit(text)]))
             elif kind == "indent_after_newline":

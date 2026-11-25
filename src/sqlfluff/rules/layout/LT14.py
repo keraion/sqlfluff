@@ -71,14 +71,6 @@ class Rule_LT14(BaseRule):
         )
         if rs_tree is None:
             return None  # pragma: no cover
-        # Source fixes from an earlier pass aren't in the arena.
-        templated_file = context.templated_file
-        if (
-            templated_file
-            and templated_file.source_str != templated_file.templated_str
-            and context.segment.source_fixes
-        ):
-            return None
         layout = {
             seg_type: {k: str(v) for k, v in cfg.items() if v is not None}
             for seg_type, cfg in ReflowConfig.from_fluff_config(

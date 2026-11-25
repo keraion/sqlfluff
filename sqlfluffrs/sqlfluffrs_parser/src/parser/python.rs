@@ -658,6 +658,7 @@ impl PyParser {
         fixes: Vec<(String, usize, Vec<usize>)>,
         new_leaves: Vec<(String, String, Vec<String>, Vec<String>, String, usize)>,
         new_positions: Vec<i64>,
+        new_origins: Vec<i64>,
         fix_even_unparsable: bool,
         loose_ends: std::collections::HashSet<String>,
     ) -> Option<(
@@ -712,6 +713,7 @@ impl PyParser {
                 loose_ends: &loose_ends,
                 new_leaves: &new_leaves,
                 new_pos: &new_positions,
+                new_origin: &new_origins,
                 visit_all: templated_file.source_str != templated_file.templated_str,
                 templated_file,
                 validate: &mut validate,

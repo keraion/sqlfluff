@@ -56,6 +56,7 @@ pub(crate) struct Fix {
 pub(crate) type NewLeaf = (String, String, Vec<String>, Vec<String>, String, usize);
 
 /// A node of the tree being built.
+#[derive(Clone)]
 enum W {
     /// An unchanged subtree of the old arena.
     Old(NodeId),
@@ -81,6 +82,27 @@ enum W {
     },
     /// An old container with new children.
     Cont { from: NodeId, children: Vec<W> },
+}
+
+/// The one segment class with no grammar to validate against. Python then
+/// reports whatever its last child reported (a variable left over from the
+/// loop over them), so a fix straight inside brackets goes unvalidated
+/// unless that last child failed.
+const NO_GRAMMAR: &str = "BracketedSegment";
+
+/// What a fix is told of its anchor.
+struct Anchor {
+    /// What goes in the buffer when the anchor itself stays.
+    keep: W,
+    raw: String,
+    is_leaf: bool,
+    class: Option<String>,
+    inst: Vec<String>,
+    class_types: Vec<String>,
+    is_placeholder: bool,
+    slices: Option<(Slice, Slice)>,
+    /// The old node, when the anchor is one.
+    old: Option<NodeId>,
 }
 
 /// What Python needs to build its tree. `ops` holds five values per node, in
@@ -118,6 +140,8 @@ pub(crate) struct Fixer<'a> {
     /// location if it had a position (a segment moved from the old tree),
     /// else -1s.
     pub new_pos: &'a [i64],
+    /// For each new segment, the old node it is a copy of (same uuid), or -1.
+    pub new_origin: &'a [i64],
     pub templated_file: Arc<TemplatedFile>,
     /// Re-match a class's grammar over tokens: `Some(valid)`, or `None` if
     /// that can't be answered here.
@@ -163,6 +187,15 @@ impl<'a> Fixer<'a> {
     /// just like it.
     fn has_source_fixes(&self, node: usize) -> bool {
         self.new_pos.get(node * 6) == Some(&-2)
+    }
+
+    /// The working location a new segment had before: its own, or that of
+    /// the anchor whose place it took.
+    fn old_loc(&self, node: usize) -> Option<(usize, usize)> {
+        match self.takes_pos.get(&node) {
+            Some(anchor) => self.arena.pos_ref(*anchor).map(|p| p.working_loc()),
+            None => self.preset(node).map(|p| p.1),
+        }
     }
 
     /// The position a new segment came with: its slices and working location.
@@ -258,18 +291,6 @@ impl<'a> Fixer<'a> {
             }
             W::NewCont { children, .. } => self.first_preset_leaf(children.first()?),
             _ => None,
-        }
-    }
-
-    fn mark_revisited(w: &mut W) {
-        if let W::NewCont {
-            revisited,
-            children,
-            ..
-        } = w
-        {
-            *revisited = true;
-            children.iter_mut().for_each(Self::mark_revisited);
         }
     }
 
@@ -499,8 +520,11 @@ impl<'a> Fixer<'a> {
 
     /// `validate_segment_with_reparse` for a rebuilt container.
     fn validate_cont(&mut self, w: &W) -> Option<bool> {
-        let W::Cont { from, .. } = w else { return None };
-        let name = self.arena.segment_class(*from)?;
+        let name = match w {
+            W::Cont { from, .. } => self.arena.segment_class(*from)?,
+            W::NewCont { node, .. } => self.new_leaves[*node].0.clone(),
+            _ => return None,
+        };
         let mut leaves = Vec::new();
         self.leaves(w, &mut leaves);
         let is_meta = |l: &LeafRef| match l {
@@ -530,6 +554,286 @@ impl<'a> Fixer<'a> {
         out
     }
 
+    /// What a fix needs to know of its anchor, which is either an old node
+    /// or (inside a segment a fix brought) a new one.
+    fn anchor_old(&self, child: NodeId) -> Anchor {
+        let arena = self.arena;
+        Anchor {
+            keep: W::Old(child),
+            raw: arena.raw(child),
+            is_leaf: arena.children(child).is_empty(),
+            class: arena.segment_class(child),
+            inst: arena.instance_types_arc(child).as_ref().clone(),
+            class_types: arena.class_types(child).as_ref().clone(),
+            is_placeholder: arena.is_type(child, "placeholder"),
+            slices: arena
+                .pos_ref(child)
+                .map(|p| (p.source_slice, p.templated_slice)),
+            old: Some(child),
+        }
+    }
+
+    fn anchor_new(&self, w: &W) -> Option<Anchor> {
+        let (node, is_leaf) = match w {
+            W::New { leaf, .. } => (*leaf, true),
+            W::NewCont { node, .. } => (*node, false),
+            _ => return None,
+        };
+        let new = &self.new_leaves[node];
+        let mut raw = String::new();
+        self.new_raw(w, &mut raw);
+        let class_types = if is_leaf {
+            let one = Arena::from_node(&self.new_node(node, None));
+            one.class_types(one.root()).as_ref().clone()
+        } else {
+            new.2.clone()
+        };
+        Some(Anchor {
+            keep: w.clone(),
+            raw,
+            is_leaf,
+            class: Some(new.0.clone()),
+            inst: new.3.clone(),
+            class_types,
+            is_placeholder: false,
+            slices: self.slices(w),
+            old: None,
+        })
+    }
+
+    /// The loop of `apply_fixes` over the fixes for one anchor: what goes
+    /// into the parent's buffer in its place.
+    fn apply_at(
+        &mut self,
+        anchor: &Anchor,
+        mut fixes: Vec<Fix>,
+        buf: &mut Vec<W>,
+        requires_validate: &mut bool,
+    ) -> Option<()> {
+        let single = fixes.len() == 1;
+        if fixes.len() == 2 && fixes[0].edit_type == EditType::CreateAfter {
+            fixes.reverse();
+        }
+        for fix in &fixes {
+            if fix.edit_type == EditType::Delete {
+                *requires_validate = true;
+                continue;
+            }
+            if fix.edit_type == EditType::CreateAfter && single {
+                buf.push(anchor.keep.clone());
+            }
+            let mut consumed_pos = false;
+            for &leaf in &fix.edits {
+                let new = &self.new_leaves[leaf];
+                if new.1 == "placeholder" {
+                    // A placeholder's source edited: the same segment with a
+                    // source fix.
+                    let (true, true, true, Some(old)) = (
+                        fix.edit_type == EditType::Replace,
+                        fix.edits.len() == 1,
+                        anchor.is_placeholder,
+                        anchor.old,
+                    ) else {
+                        return decline("placeholder edit which isn't a replace of one");
+                    };
+                    buf.push(W::Swap { old, leaf });
+                    continue;
+                }
+                if new.5 != 0 {
+                    let Some(mut w) = self.new_w(&mut { leaf }) else {
+                        return decline("malformed edit");
+                    };
+                    let mut raw = String::new();
+                    self.new_raw(&w, &mut raw);
+                    if fix.edit_type == EditType::Replace && !consumed_pos && raw == anchor.raw {
+                        // In the anchor's place. What is inside has to have
+                        // come with positions: Python only places it if the
+                        // working location changes.
+                        consumed_pos = true;
+                        let (Some(p), Some(old), W::NewCont { pos, children, .. }) =
+                            (anchor.slices, anchor.old, &mut w)
+                        else {
+                            return decline("replacement keeps the anchor's position");
+                        };
+                        if children.iter().any(Self::needs_placing) {
+                            return decline("replacement keeps the anchor's position");
+                        }
+                        *pos = Some(p);
+                        self.takes_pos.insert(leaf, old);
+                    }
+                    buf.push(w);
+                    continue;
+                }
+                // The first edit of a replace with the anchor's raw takes its
+                // position.
+                if fix.edit_type == EditType::Replace && !consumed_pos && new.4 == anchor.raw {
+                    consumed_pos = true;
+                    // Only an anchor replaced by its own like is the same
+                    // node as before.
+                    if anchor.is_leaf
+                        && anchor.class.as_deref() == Some(new.0.as_str())
+                        && anchor.inst == new.3
+                    {
+                        if !self.has_source_fixes(leaf) {
+                            buf.push(anchor.keep.clone());
+                            continue;
+                        }
+                        let Some(old) = anchor.old else {
+                            return decline("source fix inside a moved copy");
+                        };
+                        buf.push(W::Swap { old, leaf });
+                        continue;
+                    }
+                    if self.has_source_fixes(leaf) {
+                        return decline("source fix on another kind of segment");
+                    }
+                    // Another kind of leaf, in the anchor's place.
+                    let (Some(p), Some(old)) = (anchor.slices, anchor.old) else {
+                        return decline("replacement keeps the anchor's position");
+                    };
+                    self.takes_pos.insert(leaf, old);
+                    buf.push(W::New { leaf, pos: Some(p) });
+                    continue;
+                }
+                if self.has_source_fixes(leaf) {
+                    return decline("source fix on another kind of segment");
+                }
+                buf.push(W::New { leaf, pos: None });
+            }
+            // A like-for-like edit needs no validating; anything else does.
+            let same_types = || {
+                let old = &anchor.class_types;
+                let first = &self.new_leaves[fix.edits[0]];
+                if first.1 == "placeholder" {
+                    return true;
+                }
+                if first.5 != 0 {
+                    return old.len() == first.2.len() && old.iter().all(|t| first.2.contains(t));
+                }
+                let one = Arena::from_node(&self.new_node(fix.edits[0], None));
+                let new = one.class_types(one.root());
+                old.len() == new.len() && old.iter().all(|t| new.contains(t))
+            };
+            if !(fix.edit_type == EditType::Replace && fix.edits.len() == 1 && same_types()) {
+                *requires_validate = true;
+            }
+            if fix.edit_type == EditType::CreateBefore {
+                buf.push(anchor.keep.clone());
+            }
+        }
+        Some(())
+    }
+
+    /// Move non-code at either end of a segment's children out, unless its
+    /// class may start or end with it.
+    fn trim_ends(&self, class: &str, buf: &mut Vec<W>) -> (Vec<W>, Vec<W>) {
+        if self.loose_ends.contains(class) {
+            return (Vec::new(), Vec::new());
+        }
+        let start = buf
+            .iter()
+            .position(|w| self.is_code_or_meta(w))
+            .unwrap_or(buf.len());
+        let before = buf.drain(..start).collect();
+        let end = buf
+            .iter()
+            .rposition(|w| self.is_code_or_meta(w))
+            .map_or(0, |i| i + 1);
+        let after = buf.drain(end..).collect();
+        (before, after)
+    }
+
+    /// `apply_fixes` for a container a fix brought, which Python walks back
+    /// through while fixes are left to apply. A copy keeps its uuid, so a fix
+    /// anchored on what it is a copy of lands on whichever is met first.
+    fn apply_new(&mut self, cont: W, at: (usize, usize)) -> Option<(W, Vec<W>, Vec<W>, bool)> {
+        let W::NewCont {
+            node,
+            children,
+            pos,
+            ..
+        } = cont
+        else {
+            return Some((cont, Vec::new(), Vec::new(), true));
+        };
+        let mut buf: Vec<W> = Vec::with_capacity(children.len() + 2);
+        let mut requires_validate = false;
+        let mut applied = false;
+        for child in children {
+            let origin = match &child {
+                W::New { leaf: n, .. } | W::NewCont { node: n, .. } => self
+                    .new_origin
+                    .get(*n)
+                    .filter(|o| **o >= 0)
+                    .map(|o| NodeId::from_index(*o as usize)),
+                _ => None,
+            };
+            let Some(fixes) = origin.and_then(|o| self.fixes.remove(&o)) else {
+                buf.push(child);
+                continue;
+            };
+            applied = true;
+            let anchor = self.anchor_new(&child)?;
+            self.apply_at(&anchor, fixes, &mut buf, &mut requires_validate)?;
+        }
+        if applied {
+            let Some(p) = pos else {
+                return decline("could not position a new segment");
+            };
+            if self
+                .position_new((p.0.start, p.1.start), at, &HashMap::new(), &mut buf)
+                .is_none()
+            {
+                return decline("could not position a new segment");
+            }
+        }
+        let queue = std::mem::take(&mut buf);
+        let mut loc = at;
+        let mut last_validated = true;
+        for w in queue {
+            let here = loc;
+            let mut raw = String::new();
+            self.new_raw(&w, &mut raw);
+            advance(&mut loc, &raw);
+            last_validated = true;
+            if self.fixes.is_empty() || !matches!(w, W::NewCont { .. }) {
+                buf.push(w);
+                continue;
+            }
+            let (child, before, after, validated) = self.apply_new(w, here)?;
+            buf.extend(before);
+            buf.push(child);
+            buf.extend(after);
+            requires_validate |= !validated;
+            last_validated = validated;
+        }
+        let class = self.new_leaves[node].0.clone();
+        let (before, after) = self.trim_ends(&class, &mut buf);
+        if buf.is_empty() {
+            return decline("segment left empty");
+        }
+        let rebuilt = W::NewCont {
+            node,
+            children: buf,
+            pos,
+            revisited: true,
+        };
+        let mut validated = true;
+        if requires_validate {
+            if self.new_leaves[node].1 == "unparsable" {
+                return decline("fix inside an unparsable moved copy");
+            }
+            if class == NO_GRAMMAR {
+                return Some((rebuilt, before, after, last_validated));
+            }
+            validated = match self.validate_cont(&rebuilt) {
+                Some(valid) => valid,
+                None => return decline("segment could not be re-matched in Rust"),
+            };
+        }
+        Some((rebuilt, before, after, validated))
+    }
+
     /// `apply_fixes` for the container `id`. Returns the rebuilt node, any
     /// non-code pushed out before and after it, and whether it's validated.
     ///
@@ -541,112 +845,13 @@ impl<'a> Fixer<'a> {
         let mut requires_validate = false;
         let mut applied = false;
         for &child in arena.children(id) {
-            let Some(mut fixes) = self.fixes.remove(&child) else {
+            let Some(fixes) = self.fixes.remove(&child) else {
                 buf.push(W::Old(child));
                 continue;
             };
             applied = true;
-            let single = fixes.len() == 1;
-            if fixes.len() == 2 && fixes[0].edit_type == EditType::CreateAfter {
-                fixes.reverse();
-            }
-            for fix in &fixes {
-                if fix.edit_type == EditType::Delete {
-                    requires_validate = true;
-                    continue;
-                }
-                if fix.edit_type == EditType::CreateAfter && single {
-                    buf.push(W::Old(child));
-                }
-                let mut consumed_pos = false;
-                for &leaf in &fix.edits {
-                    let new = &self.new_leaves[leaf];
-                    if new.1 == "placeholder" {
-                        // A placeholder's source edited: the same segment
-                        // with a source fix.
-                        if fix.edit_type != EditType::Replace
-                            || fix.edits.len() != 1
-                            || !arena.is_type(child, "placeholder")
-                        {
-                            return decline("placeholder edit which isn't a replace of one");
-                        }
-                        buf.push(W::Swap { old: child, leaf });
-                        continue;
-                    }
-                    if new.5 != 0 {
-                        let Some(w) = self.new_w(&mut { leaf }) else {
-                            return decline("malformed edit");
-                        };
-                        let mut raw = String::new();
-                        self.new_raw(&w, &mut raw);
-                        if fix.edit_type == EditType::Replace
-                            && !consumed_pos
-                            && raw == arena.raw(child)
-                        {
-                            return decline("replacement keeps the anchor's position");
-                        }
-                        buf.push(w);
-                        continue;
-                    }
-                    // The first edit of a replace with the anchor's raw takes
-                    // its position.
-                    if fix.edit_type == EditType::Replace
-                        && !consumed_pos
-                        && new.4 == arena.raw(child)
-                    {
-                        consumed_pos = true;
-                        // Only an anchor replaced by its own like is the same
-                        // node as before.
-                        if arena.children(child).is_empty()
-                            && arena.segment_class(child).as_deref() == Some(new.0.as_str())
-                            && *arena.instance_types_arc(child) == new.3
-                        {
-                            buf.push(if self.has_source_fixes(leaf) {
-                                W::Swap { old: child, leaf }
-                            } else {
-                                W::Old(child)
-                            });
-                            continue;
-                        }
-                        if self.has_source_fixes(leaf) {
-                            return decline("source fix on another kind of segment");
-                        }
-                        // Another kind of leaf, in the anchor's place.
-                        let Some(p) = arena.pos_ref(child) else {
-                            return decline("replacement keeps the anchor's position");
-                        };
-                        self.takes_pos.insert(leaf, child);
-                        buf.push(W::New {
-                            leaf,
-                            pos: Some((p.source_slice, p.templated_slice)),
-                        });
-                        continue;
-                    }
-                    if self.has_source_fixes(leaf) {
-                        return decline("source fix on another kind of segment");
-                    }
-                    buf.push(W::New { leaf, pos: None });
-                }
-                // A like-for-like edit needs no validating; anything else does.
-                let same_types = || {
-                    let old = arena.class_types(child);
-                    if self.new_leaves[fix.edits[0]].1 == "placeholder" {
-                        return true;
-                    }
-                    if self.new_leaves[fix.edits[0]].5 != 0 {
-                        return false;
-                    }
-                    let one = Arena::from_node(&self.new_node(fix.edits[0], None));
-                    let new = one.class_types(one.root());
-                    old.len() == new.len() && old.iter().all(|t| new.contains(t))
-                };
-                if !(fix.edit_type == EditType::Replace && fix.edits.len() == 1 && same_types()) {
-                    requires_validate = true;
-                }
-                if fix.edit_type == EditType::CreateBefore {
-                    buf.push(W::Old(child));
-                }
-            }
+            let anchor = self.anchor_old(child);
+            self.apply_at(&anchor, fixes, &mut buf, &mut requires_validate)?;
         }
         if applied {
             let mut child_loc = HashMap::new();
@@ -670,7 +875,9 @@ impl<'a> Fixer<'a> {
         // Recurse into the children which have fixes beneath them.
         let queue = std::mem::take(&mut buf);
         let mut loc = at;
+        let mut last_validated = true;
         for w in queue {
+            last_validated = true;
             match w {
                 W::Old(child) => {
                     let child_at = loc;
@@ -685,39 +892,36 @@ impl<'a> Fixer<'a> {
                         buf.push(new_child);
                         buf.extend(after);
                         requires_validate |= !validated;
+                        last_validated = validated;
                     } else {
                         buf.push(W::Old(child));
                     }
                 }
-                mut other => {
+                other => {
+                    let here = loc;
                     let mut raw = String::new();
                     self.new_raw(&other, &mut raw);
                     advance(&mut loc, &raw);
-                    if !self.fixes.is_empty() {
-                        Self::mark_revisited(&mut other);
+                    if self.fixes.is_empty() || !matches!(other, W::NewCont { .. }) {
+                        buf.push(other);
+                        continue;
                     }
-                    buf.push(other);
+                    // Python walks back through what it just put in.
+                    let (child, before, after, validated) = self.apply_new(other, here)?;
+                    buf.extend(before);
+                    buf.push(child);
+                    buf.extend(after);
+                    requires_validate |= !validated;
+                    last_validated = validated;
                 }
             }
         }
 
         // Non-code left at either end moves up to the parent.
-        let (mut before, mut after) = (Vec::new(), Vec::new());
         let class = arena
             .segment_class(id)
             .unwrap_or_else(|| "UnparsableSegment".to_string());
-        if !self.loose_ends.contains(&class) {
-            let start = buf
-                .iter()
-                .position(|w| self.is_code_or_meta(w))
-                .unwrap_or(buf.len());
-            before = buf.drain(..start).collect();
-            let end = buf
-                .iter()
-                .rposition(|w| self.is_code_or_meta(w))
-                .map_or(0, |i| i + 1);
-            after = buf.drain(end..).collect();
-        }
+        let (before, after) = self.trim_ends(&class, &mut buf);
         if buf.is_empty() {
             return decline("segment left empty");
         }
@@ -738,6 +942,9 @@ impl<'a> Fixer<'a> {
                 // Fixed regardless, and not for validating.
                 return Some((rebuilt, before, after, true));
             }
+            if class == NO_GRAMMAR {
+                return Some((rebuilt, before, after, last_validated));
+            }
             validated = match self.validate_cont(&rebuilt) {
                 Some(valid) => valid,
                 None => return decline("segment could not be re-matched in Rust"),
@@ -752,7 +959,7 @@ impl<'a> Fixer<'a> {
         let arena = self.arena;
         let at = match w {
             W::New { leaf: n, .. } | W::NewCont { node: n, .. } if self.stale > 0 => {
-                self.preset(*n).map_or(*loc, |p| p.1)
+                self.old_loc(*n).unwrap_or(*loc)
             }
             _ => *loc,
         };
@@ -862,8 +1069,7 @@ impl<'a> Fixer<'a> {
                     Some(at.1),
                 );
                 let (name, class_type, class_types, ..) = &self.new_leaves[*node];
-                let keeps = !*revisited
-                    && (self.stale > 0 || self.preset(*node).is_some_and(|p| p.1 == at));
+                let keeps = !*revisited && (self.stale > 0 || self.old_loc(*node) == Some(at));
                 self.stale += usize::from(keeps);
                 let kids: Option<Vec<Node>> = children.iter().map(|c| self.build(c, loc)).collect();
                 self.stale -= usize::from(keeps);

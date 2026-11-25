@@ -195,8 +195,9 @@ def apply_fixes_rust(
         return None
     index = {seg.uuid: i for i, seg in enumerate(segs)}
     specs = []
-    # The uuids of the segments inside edits: copies keep their uuid.
-    edit_uuids: set[int] = set()
+    # For each new segment, the old one it is a copy of (a copy keeps its
+    # uuid), as its pre-order position, or -1.
+    new_origins: list[int] = []
     leaves: list[BaseSegment] = []
     new_leaves: list[tuple[str, str, list[str], list[str], str, int]] = []
     # Six per new segment: the position it came with (see `_NO_POSITION`).
@@ -213,6 +214,7 @@ def apply_fixes_rust(
                 seg = todo.pop()
                 children = seg.segments
                 marker = seg.pos_marker if seg is not edit else None
+                new_origins.append(index.get(seg.uuid, -1))
                 if seg is edit and seg.source_fixes and not children:
                     # -2: a leaf with source fixes, to go in place of its like.
                     new_positions.extend((-2, -1, -1, -1, -1, -1))
@@ -249,22 +251,12 @@ def apply_fixes_rust(
                     (seg.is_meta and not is_indent)
                     or (seg.source_fixes and (seg is not edit or children))
                     or not (children or is_indent or seg.is_type("raw"))
-                    # Non-code at either end of a new segment may be moved out
-                    # of it: leave that to Python.
-                    or (
-                        children
-                        and not all(
-                            c.is_code or c.is_meta for c in (children[0], children[-1])
-                        )
-                    )
                 ):
                     APPLY_STATS["declined"] += 1
                     APPLY_STATS["declined: edit is not a plain new segment"] += 1
                     return None
                 cls = type(seg)
                 leaves.append(seg)
-                if seg is not edit:
-                    edit_uuids.add(seg.uuid)
                 if is_indent:
                     new_leaves.append(
                         (
@@ -289,12 +281,6 @@ def apply_fixes_rust(
                 )
                 todo.extend(reversed(children))
         specs.append((fix.edit_type, anchor, edits))
-    if any(fix.anchor.uuid in edit_uuids for fix in fixes):
-        # Another fix is anchored inside a segment this pass moves. Python
-        # applies it inside the moved copy: leave that to it.
-        APPLY_STATS["declined"] += 1
-        APPLY_STATS["declined: fix anchored inside a moved segment"] += 1
-        return None
     key = (config.get("dialect"), config.get("max_parse_depth"))
     parser = _APPLY_PARSERS.get(key)
     if parser is None:
@@ -308,6 +294,7 @@ def apply_fixes_rust(
             specs,
             new_leaves,
             new_positions,
+            new_origins,
             bool(config.get("fix_even_unparsable")),
             # "Root" is what the parser's own arena calls the file segment.
             {type(tree).__name__, "Root", "UnparsableSegment"},
@@ -330,7 +317,8 @@ def apply_fixes_rust(
         started = time.perf_counter()
         # Markers in one tree must all share one templated file object.
         marker_file = tree.pos_marker.templated_file  # type: ignore[union-attr]
-        # Open containers: [segment it's made like, marker, children, still to come].
+        # Open containers: [segment it's made like, marker, children, still to
+        # come, whether it is one a fix brought].
         stack: list[list[Any]] = []
         result: Optional[BaseSegment] = None
         slice_idx = 0
@@ -347,6 +335,7 @@ def apply_fixes_rust(
                         old.pos_marker.with_working_position(line_no, line_pos),
                         [],
                         b,
+                        False,
                     ]
                 )
                 continue
@@ -362,7 +351,7 @@ def apply_fixes_rust(
                     slice(s0, s1), slice(t0, t1), marker_file, line_no, line_pos
                 )
                 if kind == 8:
-                    stack.append([leaves[a], pos, [], b])
+                    stack.append([leaves[a], pos, [], b, True])
                     continue
                 new = leaves[a].copy()
                 new.pos_marker = pos
@@ -375,11 +364,17 @@ def apply_fixes_rust(
                     break
                 stack.pop()
                 old = top[0]
-                new = old.__class__(
-                    segments=tuple(top[2]),
-                    pos_marker=top[1],
-                    **{k: getattr(old, k) for k in old.additional_kwargs},
-                )
+                if top[4]:
+                    # A segment a fix brought is kept as the rule made it,
+                    # not built anew (which would check it over again).
+                    new = old.copy(segments=tuple(top[2]))
+                    new.pos_marker = top[1]
+                else:
+                    new = old.__class__(
+                        segments=tuple(top[2]),
+                        pos_marker=top[1],
+                        **{k: getattr(old, k) for k in old.additional_kwargs},
+                    )
             else:
                 result = new
         if result is not None:
