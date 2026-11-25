@@ -66,9 +66,10 @@ descriptions and fix specs; Python builds the `LintResult`/`LintFix`
 across the four rules through a thread-local cache keyed on root uuid and
 layout config.
 
-Rust returns `None`, and Python runs as before, for anything not covered:
-alignment, `implicit_indents = require`, LT05
-`ignore_comment_lines` / `ignore_comment_clauses`.
+Rust returns `None`, and Python runs as before, for anything not covered.
+At this point that was templated files, alignment, `implicit_indents =
+require` and the LT05 comment options; all of those are covered now (see the
+last sections).
 
 Results, untemplated files, lint and fix output identical on 629 rule
 fixtures and 1,765 files:
@@ -193,8 +194,8 @@ Goal: no Python in lint/fix except legacy plugin rules.
    the remaining rule bodies.
 2. Rule framework in Rust: crawl, noqa, ignore masks, result assembly.
 3. Fix loop on the arena, with Rust validation: done for untemplated files
-   (section 6), for templated files and for moved subtrees (last two
-   sections). Left: unparsable sections, moved subtrees on templated files.
+   (section 6) and for the cases added since (last sections). Left: a fix
+   anchored inside a segment the same pass moves, and two rare edit shapes.
 4. Reporting straight from Rust results.
 5. Plugin bridge: build the Python tree on demand, only when a Python rule
    is loaded.
@@ -545,3 +546,77 @@ inside unparsable sections 51; edits not taken 40 (moved subtrees on
 templated files, fresh edits with non-code at their ends); anchor not in the
 tree 17; a replacement which keeps its anchor's position but changes class
 11; validation failed, which Python rejects too, 7.
+
+## Closing the fall-backs
+
+Three commits which remove most of the cases where the Rust path handed a
+file or a pass back to Python: `03d93b4a3` (apply), `6a798ca8c` and
+`96bdfbc7a` (reflow).
+
+### Apply
+
+Now handled on the arena:
+
+- **Unparsable sections.** A fix which would need validating inside a section
+  which was already unparsable is skipped and the section left as it was, as
+  in Python. With `fix_even_unparsable` it is applied without validating.
+- **A replacement by another kind of leaf with the same text,** which takes
+  its anchor's position.
+- **Moved subtrees on templated files.** What differs there is that Python
+  walks back through a new subtree while fixes are left to apply, and
+  re-positions everything inside it; that is modelled now.
+- **Source fixes on ordinary segments** (CP02 and JJ01 on templated
+  identifiers), not only on placeholders.
+- **A fix whose anchor is never reached** (the root, or inside something
+  another fix removed) is dropped, as in Python, where before the whole pass
+  was handed back.
+
+### Reflow
+
+- **Indent alignment** (`leading:align-following`): a line led by an aligning
+  comma or operator gives up that much of its indent.
+- **`implicit_indents = require`:** one new result kind, collapsing the line
+  break after an implicit indent to a space.
+- **LT05 `ignore_comment_lines` / `ignore_comment_clauses`:** these filter
+  results after the fact, so the Rust results go through the same filter.
+- **Aligned spacing in LT01** (`align:...` constraints): finding the group
+  to align within, choosing source or rendered coordinates, and padding to
+  the widest column; with tabs, in visual columns to the next tab stop.
+
+### Results
+
+How often Rust steps aside, on the final build:
+
+| Where | Now | Before |
+|---|---|---|
+| Apply passes handed back to Python | 33 of 5,300 | 126 |
+| LT01 on reflow fixture runs | 0 of 645 | 30 |
+| LT02 | 0 of 645 | fell back on alignment and required implicit indents |
+| LT05 | 0 of 645 | fell back on the comment options |
+| LT14 | 0 of 645 | 0 |
+
+Parity: lint results and fixed text identical on all 629 reflow fixture
+cases, the templated corpora and the 1,765 untemplated files; each of 5,267
+Rust apply passes matches Python's `apply_fixes` node by node; final fixed
+output identical on 2,944 fixture cases and 1,892 files.
+
+Fix mode against Python rules, in process, min of 3: testbed 2.02×,
+snowflake 2.91×, postgres 2.75×, templated repo files 1.85×. Within noise of
+the previous step: this widened coverage, it did not speed up the common
+path.
+
+### Where Rust still steps aside
+
+- **A fix anchored inside a segment the same pass moves** (21 apply passes).
+  Python applies it inside the moved copy. Letting Rust drop it gave the one
+  real output difference seen (an ST05 case), so it is handed back on
+  purpose.
+- **A container replacement which keeps its anchor's position** (4, CV03) and
+  **a fresh edit ending in a comment** (1, TQ04).
+- **Detection on a tree which already carries source fixes:** LT02, LT05 and
+  LT14 detect in Python for that pass, since the arena holds no source fixes.
+- The other 7 handed-back passes fail validation, which Python does too.
+
+Still untested: the dbt, python and placeholder templaters; a real dbt
+project; `test/dialects` and the CLI tests; parallel runs; plugin rules
+alongside the Rust paths.
